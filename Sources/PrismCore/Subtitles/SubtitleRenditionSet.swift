@@ -247,6 +247,16 @@ final class SubtitleRenditionSet: @unchecked Sendable {
         var built: [Track] = []
         var descriptions: [MasterPlaylistBuilder.SubtitleRendition] = []
 
+        // How many subtitle streams share each language — `isForcedRendition` needs to know
+        // whether a forced track has a full sibling before it may be hidden as forced.
+        var languageCounts: [String: Int] = [:]
+        for index in 0..<Int32(input.pointee.nb_streams) {
+            guard let stream = input.pointee.streams[Int(index)],
+                  stream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE
+            else { continue }
+            languageCounts[avMetadataValue(stream.pointee.metadata, "language") ?? "", default: 0] += 1
+        }
+
         for index in 0..<Int32(input.pointee.nb_streams) {
             guard let stream = input.pointee.streams[Int(index)] else { continue }
             let par = stream.pointee.codecpar.pointee
@@ -289,7 +299,10 @@ final class SubtitleRenditionSet: @unchecked Sendable {
                         ?? "Subtitles \(ordinal + 1)",
                     language: language,
                     uri: "\(Self.directoryName(ordinal))/index.m3u8",
-                    isForced: stream.pointee.disposition & AV_DISPOSITION_FORCED != 0
+                    isForced: Self.isForcedRendition(
+                        disposition: stream.pointee.disposition,
+                        sameLanguageTracks: languageCounts[language ?? ""] ?? 1
+                    )
                 )
             )
         }
@@ -340,6 +353,20 @@ final class SubtitleRenditionSet: @unchecked Sendable {
     /// `eng`, and the forced one lost. It was invisible from the playlist text,
     /// which listed both lines correctly, `FORCED=YES` and all.
     ///
+    /// Whether a subtitle stream should be declared `FORCED=YES`.
+    ///
+    /// AVKit never lists a forced rendition in its subtitle menu — it shows one only on its own
+    /// initiative, for foreign dialogue. That is right for a disc rip's forced track, which sits
+    /// beside a full track of the same language. It is wrong for the common release whose only
+    /// text track is flagged both default and forced (YTS does this to every SRT it muxes): passed
+    /// through, the film's one set of subtitles becomes unreachable from the player. So a forced
+    /// flag is honoured only when the track has a same-language sibling to be the full version;
+    /// alone, it is the full version, whatever the flag says.
+    static func isForcedRendition(disposition: Int32, sameLanguageTracks: Int) -> Bool {
+        guard disposition & AV_DISPOSITION_FORCED != 0 else { return false }
+        return sameLanguageTracks > 1
+    }
+
     /// The disambiguator is a bare ordinal rather than something descriptive
     /// like "Forced": AVFoundation already appends "Forced" to the *display*
     /// name of a `FORCED=YES` rendition, so naming one "English (Forced)"

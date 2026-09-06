@@ -1,4 +1,7 @@
 import Testing
+import Libavutil
+import Libavcodec
+import Libavformat
 import Foundation
 import AVFoundation
 @testable import PrismCore
@@ -336,6 +339,30 @@ struct ForcedSubtitleRenditionTests {
         for rendition in renditions {
             #expect(master.contains("NAME=\"\(rendition.name)\""))
         }
+    }
+
+    /// The release's only text track, flagged default+forced the way YTS muxes every SRT. Passed
+    /// through as FORCED=YES it vanishes from AVKit's menu (seen on a Vision Pro, 2026-09-06).
+    @Test("A lone default+forced track is offered as a normal rendition")
+    func loneForcedTrackStaysReachable() async throws {
+        let session = try PrismCoreSession(url: try fixture("h264_aac_lone_forced_srt.mkv"))
+        let playlistURL = try await session.start()
+        defer { Task { await session.stop() } }
+
+        let renditions = await session.subtitleRenditions
+        try #require(renditions.count == 1)
+        #expect(!renditions[0].isForced)
+
+        let (data, _) = try await URLSession.shared.data(from: playlistURL)
+        #expect(!String(decoding: data, as: UTF8.self).contains("FORCED=YES"))
+    }
+
+    @Test("Forced is honoured only beside a same-language full track")
+    func forcedNeedsASibling() {
+        let forced = AV_DISPOSITION_FORCED | AV_DISPOSITION_DEFAULT
+        #expect(SubtitleRenditionSet.isForcedRendition(disposition: forced, sameLanguageTracks: 2))
+        #expect(!SubtitleRenditionSet.isForcedRendition(disposition: forced, sameLanguageTracks: 1))
+        #expect(!SubtitleRenditionSet.isForcedRendition(disposition: AV_DISPOSITION_DEFAULT, sameLanguageTracks: 2))
     }
 
     @Test("AVFoundation keeps both options, and knows which one is forced")

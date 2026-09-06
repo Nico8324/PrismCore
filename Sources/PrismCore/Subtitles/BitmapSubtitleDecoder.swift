@@ -98,15 +98,28 @@ final class BitmapSubtitleDecoder {
             return []
         }
         let start = base + Double(subtitle.start_display_time) / 1000
-        let end = subtitle.end_display_time > subtitle.start_display_time
-            ? base + Double(subtitle.end_display_time) / 1000
-            : nil
+        let end = Self.explicitEndMilliseconds(
+            start: subtitle.start_display_time, end: subtitle.end_display_time
+        ).map { base + Double($0) / 1000 }
 
         guard subtitle.num_rects > 0 else {
             return [Event(startSeconds: start, endSeconds: nil, image: nil)]
         }
         guard let image = Self.compose(subtitle) else { return [] }
         return [Event(startSeconds: start, endSeconds: end, image: image)]
+    }
+
+    /// The codec's end display time, or `nil` when it is only saying "until told otherwise".
+    ///
+    /// FFmpeg's PGS decoder reports every composition with `end_display_time` of
+    /// `UINT32_MAX`: not an end, its marker for "the clear will say". Taken at face value
+    /// that is a cue 49 days long, closed on the spot, which the writer then clamps to every
+    /// segment boundary and repeats into every later segment — and the clear, when it comes,
+    /// finds nothing pending to close. Observed on a Vision Pro as captions piling up on top
+    /// of one another (2026-09-06). DVD subtitles carry a real end; those are kept.
+    static func explicitEndMilliseconds(start: UInt32, end: UInt32) -> UInt32? {
+        guard end != UInt32.max, end > start else { return nil }
+        return end
     }
 
     // MARK: - Pixels

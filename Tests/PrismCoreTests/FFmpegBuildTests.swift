@@ -78,9 +78,14 @@ struct FFmpegBuildTests {
         #expect(capabilities.isAV1HardwareSupported == HardwareDecodeSupport.isAV1Supported)
         #expect(capabilities.hasDialogueBoost == PrismCoreSession.isDialogueBoostAvailable)
         #expect(capabilities.gpuDeinterlacer == SoftwareVideoDecoder.gpuDeinterlaceName)
+        // The bridge takes eac3 when the build has it and aac otherwise — the
+        // answer is FFmpeg's, not the configure line's.
+        let expectedBridge = avcodec_find_encoder(AV_CODEC_ID_EAC3) != nil ? "eac3"
+            : avcodec_find_encoder(AV_CODEC_ID_AAC) != nil ? "aac" : nil
+        #expect(capabilities.audioBridgeEncoder == expectedBridge)
         // Dialogue boost needs the encoder the bridge needs, and one filter
         // more — it can never be the wider answer of the two.
-        #expect(!(capabilities.hasDialogueBoost && !capabilities.hasEAC3Encoder))
+        #expect(!(capabilities.hasDialogueBoost && capabilities.audioBridgeEncoder == nil))
     }
 
     /// The summary is what a host pastes into a bug report, so its content is

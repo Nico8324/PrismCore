@@ -316,7 +316,11 @@ struct DialogueBoostDeclarationTests {
             let rendition = writer.rendition(groupID: "aud", isDefault: false)
             #expect(rendition.name == suffix)
             #expect(rendition.characteristics == [dialogueBoostCharacteristic])
-            #expect(rendition.codecString == "ec-3")
+            // Whatever the build's bridge encodes to: EAC3 where the
+            // encoder exists, AAC otherwise.
+            #expect(rendition.codecString == MasterPlaylistBuilder.audioCodecString(
+                forCodecName: AudioBridge.defaultTargetCodecName
+            ))
             #expect(writer.dialogueBoostInfo == DialogueBoostRendition(level: level, name: suffix))
         }
         // The base rendition stays clean of all of it.

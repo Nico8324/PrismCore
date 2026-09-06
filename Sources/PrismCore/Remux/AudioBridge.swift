@@ -75,7 +75,7 @@ final class AudioBridge {
         var description: String {
             switch self {
             case .encoderUnavailable:
-                return "FFmpeg build has no eac3 encoder (configure with --enable-encoder=eac3)"
+                return "FFmpeg build has neither an eac3 nor an aac encoder"
             case .decoderUnavailable(let name):
                 return "FFmpeg build has no decoder for \(name)"
             case .channelLayoutUnsupported(let count):
@@ -129,12 +129,27 @@ final class AudioBridge {
         findEncoder(defaultTargetCodec) != nil
     }
 
-    /// What the bridge re-encodes to. EAC3 for the reasons in the type's docs;
-    /// it is a parameter rather than a constant for two honest uses — tests can
-    /// drive the whole decode/resample/FIFO/encode chain with an encoder the
-    /// linked FFmpeg actually has, and a later phase can offer the lossless
-    /// FLAC alternative without restructuring anything.
-    static let defaultTargetCodec = AV_CODEC_ID_EAC3
+    /// What the bridge re-encodes to: EAC3 when the build has that encoder, for
+    /// the reasons in the type's docs, otherwise AAC, which every FFmpeg build
+    /// carries because it is FFmpeg's own code.
+    ///
+    /// Stock MPVKit ships no `eac3` encoder, and with EAC3 as the only target
+    /// every DTS or TrueHD source left the remux path for the software renderer
+    /// — which draws its own frames, so on visionOS the film lost docking, the
+    /// picker and the theater (Cinema, 2026-09-06). AAC 5.1 keeps the source on
+    /// `AVPlayer`: no bitstream passthrough to an AVR, which the headset and
+    /// the phone never had, and a bed mix either way. The encoder is asked
+    /// through the same negotiation as EAC3 (layouts, rates, FLTP, 1024-sample
+    /// frames), so nothing below this line knows which one answered.
+    static var defaultTargetCodec: AVCodecID {
+        findEncoder(AV_CODEC_ID_EAC3) != nil ? AV_CODEC_ID_EAC3 : AV_CODEC_ID_AAC
+    }
+
+    /// FFmpeg's name for `defaultTargetCodec` — what the master playlist's
+    /// `CODECS` attribute is derived from before a bridge exists.
+    static var defaultTargetCodecName: String {
+        avcodec_get_name(defaultTargetCodec).map { String(cString: $0) } ?? "aac"
+    }
 
     private static func findEncoder(_ codecID: AVCodecID) -> UnsafePointer<AVCodec>? {
         avcodec_find_encoder(codecID)
@@ -411,6 +426,13 @@ final class AudioBridge {
     /// Time base of the packets `feed`/`flush` emit (1/sample_rate).
     var timeBase: AVRational {
         encoderCtx?.pointee.time_base ?? AVRational(num: 1, den: 48_000)
+    }
+
+    /// FFmpeg's name for the codec this bridge emits (`eac3` or `aac`) — the
+    /// honest source of the rendition's `CODECS` tag.
+    var outputCodecName: String? {
+        guard let encoderCtx else { return nil }
+        return avcodec_get_name(encoderCtx.pointee.codec_id).map { String(cString: $0) }
     }
 
     /// Channels the encoder actually emits — the negotiated layout, not the

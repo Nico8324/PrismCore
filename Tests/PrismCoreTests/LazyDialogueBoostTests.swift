@@ -274,7 +274,10 @@ struct LazyDialogueBoostTests {
             from: base.appendingPathComponent("audio1/init.mp4")
         )
         #expect((initResponse as? HTTPURLResponse)?.statusCode == 200)
-        #expect(boostInit.range(of: Data("dec3".utf8)) != nil, "boost init must describe EAC3")
+        // The sample entry's codec box follows the build's bridge encoder:
+        // `dec3` for EAC3, `esds` for AAC.
+        let bridgeBox = AudioBridge.defaultTargetCodecName == "eac3" ? "dec3" : "esds"
+        #expect(boostInit.range(of: Data(bridgeBox.utf8)) != nil, "boost init must describe the bridge codec")
         // The other level was not asked for and stays dormant.
         #expect(files(in: work.appendingPathComponent("audio2")) == ["index.m3u8"])
 

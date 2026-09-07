@@ -61,6 +61,15 @@ struct BitmapSubtitleTests {
 
     // MARK: - OCR
 
+    /// FFmpeg's PGS decoder ends every composition at `UINT32_MAX` ms — "until the clear", not
+    /// a time. Believed, that made each caption a 49-day cue repeated into every later segment.
+    @Test("The PGS until-the-clear sentinel is not an end time")
+    func pgsSentinelIsNotAnEnd() {
+        #expect(BitmapSubtitleDecoder.explicitEndMilliseconds(start: 0, end: UInt32.max) == nil)
+        #expect(BitmapSubtitleDecoder.explicitEndMilliseconds(start: 0, end: 0) == nil)
+        #expect(BitmapSubtitleDecoder.explicitEndMilliseconds(start: 0, end: 2500) == 2500)
+    }
+
     @Test("Vision reads a clean subtitle composition back")
     func ocrReadsRenderedText() throws {
         let image = try renderedComposition("Hello there, subtitle")

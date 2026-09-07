@@ -93,6 +93,28 @@ final class HLSRemuxer: @unchecked Sendable {
     struct AudioCandidate: Equatable {
         let index: Int32
         let codecID: AVCodecID
+        /// The container's own claim that this track is the film's original
+        /// soundtrack (`AV_DISPOSITION_ORIGINAL`).
+        ///
+        /// Rarely set, and worth a great deal when it is: it is a statement
+        /// about the film rather than about the encode, and it is the only
+        /// language signal a library can read without asking a metadata
+        /// service what language the picture was shot in.
+        var isOriginal: Bool = false
+        /// The container's own default flag (`AV_DISPOSITION_DEFAULT`).
+        ///
+        /// Weaker than it looks, which is why it sits low in `chooseAudio`'s
+        /// order: a market-specific disc puts its dub first and flags it
+        /// default, so trusting this above all else is what opens an English
+        /// film in Russian.
+        var isDefault: Bool = false
+
+        init(index: Int32, codecID: AVCodecID, isOriginal: Bool = false, isDefault: Bool = false) {
+            self.index = index
+            self.codecID = codecID
+            self.isOriginal = isOriginal
+            self.isDefault = isDefault
+        }
     }
 
     /// What the produced presentation looks like — decided once, before the
@@ -1413,7 +1435,13 @@ final class HLSRemuxer: @unchecked Sendable {
         for index in 0..<Int(input.pointee.nb_streams) {
             let par = input.pointee.streams[index]!.pointee.codecpar.pointee
             guard par.codec_type == AVMEDIA_TYPE_AUDIO else { continue }
-            candidates.append(AudioCandidate(index: Int32(index), codecID: par.codec_id))
+            let disposition = input.pointee.streams[index]!.pointee.disposition
+            candidates.append(AudioCandidate(
+                index: Int32(index),
+                codecID: par.codec_id,
+                isOriginal: disposition & AV_DISPOSITION_ORIGINAL != 0,
+                isDefault: disposition & AV_DISPOSITION_DEFAULT != 0
+            ))
         }
         return candidates
     }
@@ -1489,6 +1517,14 @@ final class HLSRemuxer: @unchecked Sendable {
     ///
     /// Order of preference, and the reasoning:
     ///
+    /// 0. A track the container marks as the film's **original** soundtrack.
+    ///    Everything below this line ranks by what the audio *is* — codec,
+    ///    channels, whether the bits can pass through untouched — and none of
+    ///    that has any bearing on which language a film is meant to be heard
+    ///    in. A dual-audio release whose dub is the richer encode used to win
+    ///    on those grounds alone, so the film opened in the dub. Where the
+    ///    source says which track is the original, that answers a different and
+    ///    better question, and it goes first.
     /// 1. The demuxer's *best* stream when it is stream-copyable — untouched
     ///    bits beat anything we could re-encode, and this is the case that keeps
     ///    Atmos alive.
@@ -1496,11 +1532,24 @@ final class HLSRemuxer: @unchecked Sendable {
     ///    to a lesser copyable track, which meant a DTS-HD MA 7.1 main track
     ///    lost to an AC3 2.0 compatibility track — the bridge makes the main
     ///    track the better answer even at a re-encode's cost.
-    /// 3. Any copyable stream, for sources whose best track can't be bridged
+    /// 3. The container's own **default** flag. Below the two above on purpose:
+    ///    a market-specific disc flags its dub default, so this is a hint about
+    ///    the release rather than about the film. It still beats container
+    ///    order, which is what the two rungs below fall back to.
+    /// 4. Any copyable stream, for sources whose best track can't be bridged
     ///    either (no decoder in this build, or no EAC3 encoder — see
     ///    `AudioBridge.isEncoderAvailable`). This is v0's behaviour, preserved
     ///    as the fallback rather than removed.
-    /// 4. Any bridgeable stream at all.
+    /// 5. Any bridgeable stream at all.
+    ///
+    /// Rungs 0 and 3 are additive: a source that marks neither gets exactly the
+    /// order it got before, which is why adding them cannot cost an Atmos track.
+    ///
+    /// What this still cannot do is prefer a *language*. That needs to know what
+    /// the picture was shot in, which is a fact about the film that no container
+    /// reliably carries — a host that knows it (from a metadata service, or from
+    /// the person) is better placed, and can select over the top of the
+    /// `DEFAULT` this produces.
     ///
     /// `canBridge` is injected so the decision can be exercised as a pure
     /// function in tests, independent of what the linked FFmpeg supports.
@@ -1509,6 +1558,20 @@ final class HLSRemuxer: @unchecked Sendable {
         best: Int32?,
         canBridge: (AVCodecID) -> Bool = { AudioBridge.canBridge(codecID: $0) }
     ) -> AudioRoute? {
+        /// How this track would be carried, or `nil` when it cannot be.
+        func route(_ candidate: AudioCandidate) -> AudioRoute? {
+            if copyableAudio.contains(candidate.codecID) {
+                return AudioRoute(index: candidate.index, mode: .streamCopy)
+            }
+            if canBridge(candidate.codecID) {
+                return AudioRoute(index: candidate.index, mode: .bridge)
+            }
+            return nil
+        }
+
+        if let original = candidates.first(where: \.isOriginal), let route = route(original) {
+            return route
+        }
         if let best, let bestCandidate = candidates.first(where: { $0.index == best }) {
             if copyableAudio.contains(bestCandidate.codecID) {
                 return AudioRoute(index: best, mode: .streamCopy)
@@ -1516,6 +1579,9 @@ final class HLSRemuxer: @unchecked Sendable {
             if canBridge(bestCandidate.codecID) {
                 return AudioRoute(index: best, mode: .bridge)
             }
+        }
+        if let flagged = candidates.first(where: \.isDefault), let route = route(flagged) {
+            return route
         }
         if let copyable = candidates.first(where: { copyableAudio.contains($0.codecID) }) {
             return AudioRoute(index: copyable.index, mode: .streamCopy)

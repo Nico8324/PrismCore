@@ -184,6 +184,71 @@ struct AudioRoutingTests {
         #expect(route == HLSRemuxer.AudioRoute(index: 3, mode: .bridge))
     }
 
+    @Test("A track the source calls the original wins over the richer encode")
+    func originalDispositionBeatsCodecQuality() {
+        // The dual-audio case: index 2 is the dub and the better encode, and the
+        // demuxer duly ranks it best. Ranking by what the audio *is* has nothing
+        // to say about which language the film is meant to be heard in, so the
+        // film opened in the dub.
+        let candidates = [
+            HLSRemuxer.AudioCandidate(index: 1, codecID: AV_CODEC_ID_AAC, isOriginal: true),
+            HLSRemuxer.AudioCandidate(index: 2, codecID: AV_CODEC_ID_EAC3),
+        ]
+        let route = HLSRemuxer.chooseAudio(candidates: candidates, best: 2, canBridge: bridgeEverything)
+        #expect(route == HLSRemuxer.AudioRoute(index: 1, mode: .streamCopy))
+    }
+
+    @Test("An original track that cannot be carried does not win")
+    func unplayableOriginalIsSkipped() {
+        // Marked original, but nothing here can carry it — a rendition AVPlayer
+        // can't play is worse than the wrong language.
+        let candidates = [
+            HLSRemuxer.AudioCandidate(index: 1, codecID: AV_CODEC_ID_TRUEHD, isOriginal: true),
+            HLSRemuxer.AudioCandidate(index: 2, codecID: AV_CODEC_ID_EAC3),
+        ]
+        let route = HLSRemuxer.chooseAudio(candidates: candidates, best: 2, canBridge: bridgeNothing)
+        #expect(route == HLSRemuxer.AudioRoute(index: 2, mode: .streamCopy))
+    }
+
+    @Test("The container's default flag ranks below the best track, not above it")
+    func defaultDispositionDoesNotDisplaceAtmos() {
+        // A market-specific disc flags its dub default. Trusting that above
+        // everything is what opens an English film in Russian — so the best
+        // copyable track, which is what keeps Atmos alive, still wins.
+        let candidates = [
+            HLSRemuxer.AudioCandidate(index: 1, codecID: AV_CODEC_ID_AC3, isDefault: true),
+            HLSRemuxer.AudioCandidate(index: 2, codecID: AV_CODEC_ID_EAC3),
+        ]
+        let route = HLSRemuxer.chooseAudio(candidates: candidates, best: 2, canBridge: bridgeEverything)
+        #expect(route == HLSRemuxer.AudioRoute(index: 2, mode: .streamCopy))
+    }
+
+    @Test("The default flag still beats container order")
+    func defaultDispositionBeatsFirstInFile() {
+        // Nothing is ranked best, so the fallback used to take whatever came
+        // first in the file. The source's own flag is a better answer than that.
+        let candidates = [
+            HLSRemuxer.AudioCandidate(index: 1, codecID: AV_CODEC_ID_AC3),
+            HLSRemuxer.AudioCandidate(index: 2, codecID: AV_CODEC_ID_AC3, isDefault: true),
+        ]
+        let route = HLSRemuxer.chooseAudio(candidates: candidates, best: nil, canBridge: bridgeEverything)
+        #expect(route == HLSRemuxer.AudioRoute(index: 2, mode: .streamCopy))
+    }
+
+    @Test("A source marking neither gets exactly the order it always got")
+    func unmarkedSourcesAreUnchanged() {
+        // The additive claim, asserted rather than assumed: with no dispositions
+        // set, every rung below behaves as it did before they existed.
+        let candidates = [
+            HLSRemuxer.AudioCandidate(index: 1, codecID: AV_CODEC_ID_DTS),
+            HLSRemuxer.AudioCandidate(index: 2, codecID: AV_CODEC_ID_AC3),
+        ]
+        #expect(HLSRemuxer.chooseAudio(candidates: candidates, best: 1, canBridge: bridgeEverything)
+                == HLSRemuxer.AudioRoute(index: 1, mode: .bridge))
+        #expect(HLSRemuxer.chooseAudio(candidates: candidates, best: 1, canBridge: bridgeNothing)
+                == HLSRemuxer.AudioRoute(index: 2, mode: .streamCopy))
+    }
+
     @Test("A source with no usable audio at all selects none")
     func noAudioRoute() {
         let candidates = [

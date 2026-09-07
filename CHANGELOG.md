@@ -8,6 +8,24 @@ source-compatible.)
 
 ## [Unreleased]
 
+## [2.1.1] — 2026-09-07
+
+Subtitle fixes from #82 and #83.
+
+### Fixed
+
+- **PGS captions end at the clear, not 49 days after they start.** FFmpeg's
+  PGS decoder reports every composition with `end_display_time` of
+  `UINT32_MAX` — a sentinel for "the clear will say", not a real end.
+  Treating it as an end made every cue ~49 days long; the segment writer
+  clamped and repeated it, and the clear found nothing pending. The sentinel
+  now means open-until-clear. DVD subtitles keep real ends (#82).
+- **A lone forced subtitle track stays reachable from the menu.** AVKit never
+  lists a `FORCED=YES` rendition; that is correct beside a full same-language
+  track, but wrong when the only text track is flagged default+forced (common
+  on YTS muxes). Forced is honoured only when a same-language sibling exists
+  (#83).
+
 ## [2.1.0] — 2026-09-05
 
 Playback observability for hosts: what is resident on disk, how each audio

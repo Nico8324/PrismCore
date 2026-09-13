@@ -11,15 +11,16 @@ import Foundation
 /// tracks (Aether#1533), so "ask the server for the text" is not a route — the
 /// demux this engine already runs is the one honest source of embedded cues.
 ///
-/// Times are **seconds on the played timeline**: the source's presentation
-/// origin (first video PTS) is already subtracted, so a host can compare them
-/// directly against `AVPlayerItem.currentTime()` of the played playlist.
+/// Times are **seconds on the producer's playback clock**. Remux callbacks
+/// subtract the source's presentation origin for comparison with
+/// `AVPlayerItem.currentTime()`. `SoftwarePlaybackPipeline.activeSubtitleCues`
+/// keeps source timestamps, matching that pipeline's `currentTime`.
 public struct TimedTextCue: Sendable, Equatable {
     /// The source stream this cue came from — the same index
     /// `SubtitleTrackInfo.streamIndex` reports, so a host can route cues to
     /// the track the viewer selected.
     public let streamIndex: Int32
-    /// Seconds from the start of the played item (origin-rebased).
+    /// Seconds on the producing pipeline's playback clock (see above).
     public let start: Double
     public let end: Double
     /// Cue payload as the converter produced it — WebVTT-safe plain text,

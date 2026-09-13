@@ -123,6 +123,58 @@ opaque: the shape is a property of the source, not of the API.
 path a source would take — and unit-test its own routing — without standing up
 either engine.
 
+### Software track menus and captions
+
+`SoftwarePlaybackPipeline` publishes the probe's metadata on the live player.
+Audio selection works while playing or paused; the decoder is opened before
+replacing the current one, the audio renderer is flushed, and the clock and
+video renderer stay in place. The bounded rewind uses the playhead and the
+configured audio delay. A refused rewind joins at the demux read position;
+network and decoder latency can leave an audible gap. No gapless claim is made.
+
+```swift
+let audioTracks = pipeline.selectableAudioTracks   // language, title, channelCount
+let subtitleTracks = pipeline.selectableSubtitleTracks // embedded text only
+let audioSelection = pipeline.selectedAudioStreamIndex
+let subtitleSelection = pipeline.selectedSubtitleStreamIndex // nil = Off
+
+if let track = audioTracks.first {
+    pipeline.selectAudioTrack(streamIndex: track.streamIndex) { accepted in
+        // Completion is on the feed queue. Dispatch UI work to the main queue.
+    }
+}
+pipeline.selectSubtitleTrack(streamIndex: subtitleTracks.first?.streamIndex)
+pipeline.selectSubtitleTrack(streamIndex: nil)     // Off
+
+// In the host's periodic UI update, replace the overlay with this snapshot.
+// An empty array means clear it; overlapping cues can produce several entries.
+let captions = pipeline.activeSubtitleCues
+```
+
+Use source **stream indices**, not positions in the menu array. Read the settled
+selection after completion. A same-track selection succeeds without a flush;
+invalid indices and calls outside paused/playing state are refused. An audio
+open failure preserves the current track. A later read/decode failure reports
+`false` and `.failed`; inspect `failureError`. Do not call synchronous `stop()`
+or `load()` from feed-queue callbacks.
+
+Text starts Off, including forced tracks: the host chooses its language policy.
+All supported text packets use the existing HLS text converter and are retained
+in a bounded look-ahead cache, so selecting an already-read caption (or Off)
+does not seek, flush A/V, or start a paused clock. `TimedTextCue` timestamps here
+use the **source axis**, matching `pipeline.currentTime`; remux cue callbacks
+use the origin-rebased AVPlayer axis. Cue payloads can contain WebVTT inline tags
+and entities; the host supplies rendering. Polling clears expired cues even at
+EOF or while the demuxer is waiting for data.
+
+The cache holds at most 1,024 cues / 1 MiB of UTF-8 text across all tracks;
+expired cues are removed and excess incoming cues are dropped. Cues need valid
+PTS and positive duration. Seeking clears the cache and repopulates from the
+landing keyframe: a long caption whose packet precedes that keyframe may be
+missing until the next cue. Bitmap/OCR and external subtitle selection remain
+outside this software surface. Original ASS positioning and advanced styling
+are not preserved by the text converter.
+
 ### Host setup on tvOS
 
 Over HDMI the panel's mode has to be programmed **before** AVPlayer sees the
@@ -412,8 +464,10 @@ stand-ins, including the case where a stalled video renderer must not starve aud
 Audio track switching is proven the same way: the multi-audio fixture's tracks differ
 in channel count (AAC stereo vs AC-3 5.1), so the renderer-side buffers *show* which
 track is playing, and the video assertions show the switch never touched the picture.
-What no headless test can assert is that a frame reached a display. Still open there:
-subtitles (rendering and, with it, subtitle track selection) and frame-accurate seek.
+Text selection is tested against embedded full/forced subtitle tracks, including
+paused switching, Off, expiry and a backward seek. What no headless test can
+assert is that a frame reached a display or an audio switch was inaudible on a
+device. Caption rendering belongs to the host; frame-accurate seek remains open.
 
 ## Cache, audio diagnostics and HTTP policy
 

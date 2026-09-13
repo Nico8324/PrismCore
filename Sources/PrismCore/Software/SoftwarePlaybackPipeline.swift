@@ -57,10 +57,9 @@ import Libavutil
 ///
 /// ## Not here yet
 ///
-/// Integration with `PrismCoreSession` and the loopback (deliberately out of
-/// scope for this skeleton), deinterlacing for interlaced H.264, subtitle
-/// rendering, subtitle track selection (nothing renders them here yet — see
-/// `sourceInfo` for what exists to select). `.ended` fires from a synchronizer
+/// Subtitle rendering belongs to the host: poll `activeSubtitleCues` for an
+/// overlay. Bitmap subtitles and external subtitle files are not selected here.
+/// `.ended` fires from a synchronizer
 /// boundary at the last presentation end — when the speaker has finished the
 /// last buffer, not when it was enqueued.
 public final class SoftwarePlaybackPipeline: @unchecked Sendable {
@@ -201,6 +200,42 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
         }
     }
 
+    /// Embedded text tracks supported by the same converter as HLS. Bitmap
+    /// tracks remain in `sourceInfo` but are not selectable on this surface.
+    public var selectableSubtitleTracks: [SubtitleTrackInfo] {
+        stateLock.withLock { storedSourceInfo?.textSubtitleTracks ?? [] }
+    }
+
+    /// `nil` means Off, including initially. Stream indices belong to the source.
+    public var selectedSubtitleStreamIndex: Int? {
+        stateLock.withLock { storedSelectedSubtitleStreamIndex }
+    }
+
+    /// Poll alongside `currentTime` to draw (or clear) a host subtitle overlay.
+    /// Times use the source axis, like this pipeline's clock. Text is WebVTT
+    /// payload with optional inline tags, not an attributed string. Reading this
+    /// never waits for demux I/O. Cues expire even when no more packets arrive.
+    public var activeSubtitleCues: [TimedTextCue] {
+        guard let index = selectedSubtitleStreamIndex else { return [] }
+        return subtitleCues.active(streamIndex: index, at: CMTimeGetSeconds(currentTime))
+    }
+
+    /// Select embedded text or `nil` for Off. Conversion runs as packets arrive
+    /// for every supported text track, so switching needs no A/V flush or seek,
+    /// including while paused. Completion runs on the feed queue; dispatch to
+    /// the main queue for UI work and do not call synchronous load/stop from it.
+    public func selectSubtitleTrack(
+        streamIndex: Int?, completion: (@Sendable (Bool) -> Void)? = nil
+    ) {
+        feedQueue.async { [self] in
+            guard !stopped, storedStateIsResumable,
+                  streamIndex == nil || selectableSubtitleTracks.contains(where: { $0.streamIndex == streamIndex })
+            else { completion?(false); return }
+            stateLock.withLock { storedSelectedSubtitleStreamIndex = streamIndex }
+            completion?(true)
+        }
+    }
+
     // MARK: - Collaborators
 
     private let videoSink: VideoSampleSink
@@ -222,6 +257,8 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
     private var storedState: State = .idle
     private var storedDurationSeconds: Double?
     private var storedSourceInfo: SourceInfo?
+    private let subtitleCues = SoftwareSubtitleCueStore()
+    private var storedSelectedSubtitleStreamIndex: Int?
     private var storedSelectableAudioTracks: [AudioTrackInfo] = []
     /// Mirror of `audioStreamIndex` (feed-queue state) for cross-thread reads.
     private var storedSelectedAudioStreamIndex: Int32 = -1
@@ -267,6 +304,7 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
     /// The synchronizer boundary that turns "last buffer enqueued" into
     /// "last buffer played" — `.ended` fires from it, not from the enqueue.
     private var endObserver: Any?
+    private var endGeneration: UInt64 = 0
     /// End (PTS + duration) of the newest audio buffer handed to the sink,
     /// and of the newest video frame — the later of the two is where the
     /// presentation actually ends.
@@ -337,6 +375,9 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
         )
     }
 
+    // Injecting the FFmpeg call lets tests refuse a seek without network timing.
+    private let demuxSeek: (UnsafeMutablePointer<AVFormatContext>, Int64) -> Int32
+
     /// Injected seam — the constructor tests use. See `SampleBufferSinks.swift`
     /// for why the boundary sits here.
     init(
@@ -345,8 +386,12 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
         timeline: RenderTimeline,
         pacing: Pacing = Pacing(),
         allowHardwareDecode: Bool = true,
-        audioDelaySeconds: Double = 0
+        audioDelaySeconds: Double = 0,
+        demuxSeek: @escaping (UnsafeMutablePointer<AVFormatContext>, Int64) -> Int32 = { input, target in
+            avformat_seek_file(input, -1, Int64.min, target, target, AVSEEK_FLAG_BACKWARD)
+        }
     ) {
+        self.demuxSeek = demuxSeek
         self.videoSink = videoSink
         self.audioSink = audioSink
         self.timeline = timeline
@@ -522,6 +567,7 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
             lastEnqueuedVideoPTS = .invalid
             lastEnqueuedVideoEnd = .invalid
             lastEnqueuedAudioEnd = .invalid
+            subtitleCues.reset()
             beginDiscarding(upTo: time)
 
             do {
@@ -561,14 +607,15 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
     /// expiry the seek fails like a refused one, and the latched
     /// `AVERROR_EXIT` is cleared so the context can read again.
     private func seekDemuxer(_ input: UnsafeMutablePointer<AVFormatContext>, to time: CMTime) -> Bool {
-        let target = max(0, Int64(CMTimeGetSeconds(time) * Double(AV_TIME_BASE)))
+        let seconds = CMTimeGetSeconds(time)
+        guard seconds.isFinite, seconds < Double(Int64.max) / Double(AV_TIME_BASE) else { return false }
+        let target = Int64(max(0, seconds) * Double(AV_TIME_BASE))
         let readGuard = stateLock.withLock { interruptGuard }
         readGuard?.arm(budget: Self.seekBudget)
-        let result = avformat_seek_file(input, -1, Int64.min, target, target, AVSEEK_FLAG_BACKWARD)
-        // `stop()` arms the guard with a zero budget to break a blocked read;
-        // disarming here would re-open that window, so only a seek that was
-        // not stopped disarms.
-        if !stopped { readGuard?.disarm() }
+        let result = demuxSeek(input, target)
+        // Cancellation is permanent: disarming a seek must not undo a stop
+        // that arrived while FFmpeg was blocked inside it.
+        readGuard?.disarm()
         if let pb = input.pointee.pb, pb.pointee.error < 0 {
             pb.pointee.error = 0
         }
@@ -633,9 +680,9 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
     /// playing, because the old decoder is only torn down *after* the new one
     /// stands.
     ///
-    /// The audible gap is the seek + decode-to-playhead time, tens of
-    /// milliseconds on a local source; the clock never stops, so A/V sync and
-    /// the picture are unaffected. Works identically while paused — the new
+    /// The audible gap depends on transport and decode-to-playhead time. The
+    /// clock continues running and the video renderer keeps its queued frames.
+    /// Works identically while paused — the new
     /// track is primed at the paused position and plays on `play()`.
     ///
     /// - Parameter completion: called on the feed queue with whether the
@@ -650,7 +697,7 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
                 completion?(false)
                 return
             }
-            guard Int32(streamIndex) != audioStreamIndex else {
+            if audioStreamIndex >= 0, streamIndex == Int(audioStreamIndex) {
                 completion?(true)
                 return
             }
@@ -680,14 +727,10 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
             // ahead to. `.invalid` clock (never anchored) means nothing has
             // played yet — the read position IS the present, skip the seek.
             let now = timeline.currentTime
-            var rewound = false
-            if now.isValid {
-                let target = max(0, Int64(CMTimeGetSeconds(now) * Double(AV_TIME_BASE)))
-                rewound = av_seek_frame(input, -1, target, AVSEEK_FLAG_BACKWARD) >= 0
-                // A source with no index can refuse — the new track then joins
-                // at the read position, a gap of the queue's look-ahead. Worse
-                // than seamless, better than refusing the switch.
-            }
+            // Positive output delay means the source audio we need is earlier
+            // than the playhead; negative delay needs later source samples.
+            let audioTarget = now - CMTime(seconds: audioDelaySeconds, preferredTimescale: 1_000_000)
+            let rewound = now.isNumeric && seekDemuxer(input, to: min(now, audioTarget))
 
             let hadAudio = audioDecoder != nil
             audioDecoder?.close()
@@ -696,8 +739,13 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
             stateLock.withLock { storedSelectedAudioStreamIndex = Int32(streamIndex) }
             pendingAudio.removeAll()
             audioSink.flush()
+            cancelEndObserver()
+            discardAudioBefore = audioTarget
 
             if rewound {
+                // A refused rewind at EOF cannot enqueue a new audio boundary;
+                // keep the old horizon so audio-only playback does not end now.
+                lastEnqueuedAudioEnd = .invalid
                 // The rewind re-reads video the renderer already holds: flush
                 // the decoder (its reference chain broke with the seek) and
                 // drop re-decoded frames up to the renderer's horizon, so the
@@ -709,7 +757,6 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
                 // The rewind lands on a keyframe before the present; audio
                 // from that gap is late (playing) or a stale burst on resume
                 // (paused) — drop it here rather than trusting the renderer.
-                discardAudioBefore = now
                 reachedEOF = false
                 videoTailPending = false
             }
@@ -725,7 +772,7 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
             }
 
             pump()
-            completion?(true)
+            completion?(state != .failed)
         }
     }
 
@@ -735,10 +782,9 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
         // may be blocked inside `av_read_frame` against a server that stopped
         // answering, and `feedQueue.sync` would wait on exactly that read.
         // With the guard tripped the read aborts (`AVERROR_EXIT`), the loop
-        // fails out, and the sync below gets its turn. A zero budget is
-        // "interrupt now"; the context is closed right after, so the latch
-        // never has to be cleared.
-        stateLock.withLock { interruptGuard }?.arm(budget: .zero)
+        // fails out, and the sync below gets its turn. Permanent cancellation
+        // survives a concurrently finishing seek disarming its deadline.
+        stateLock.withLock { interruptGuard }?.cancel()
         feedQueue.sync {
             guard !stopped else { return }
             stopped = true
@@ -1088,8 +1134,9 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
             setState(.ended)
             return
         }
+        let generation = endGeneration
         endObserver = timeline.observeBoundary(end, on: feedQueue) { [weak self, end] in
-            guard let self, !self.stopped else { return }
+            guard let self, !self.stopped, self.endGeneration == generation else { return }
             self.endObserver = nil
             // A seek in between cancelled the observer, so reaching here
             // means the same run reached its end.
@@ -1099,6 +1146,7 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
     }
 
     private func cancelEndObserver() {
+        endGeneration &+= 1
         if let endObserver {
             timeline.cancelBoundaryObserver(endObserver)
         }
@@ -1202,6 +1250,12 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
             }
         }
 
+        if let stream = input.pointee.streams[Int(packet.pointee.stream_index)],
+           let kind = SubtitleRenditionSet.kind(for: stream.pointee.codecpar.pointee.codec_id) {
+            subtitleCues.ingest(packet, timeBase: stream.pointee.time_base, kind: kind,
+                                currentTime: clockAnchored ? CMTimeGetSeconds(timeline.currentTime) : .nan)
+        }
+
         switch Int32(packet.pointee.stream_index) {
         case videoStreamIndex:
             try videoDecoder?.decode(packet, emit: acceptVideo)
@@ -1300,6 +1354,8 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
 
     private func teardown() {
         cancelEndObserver()
+        subtitleCues.reset()
+        stateLock.withLock { storedSelectedSubtitleStreamIndex = nil }
         memoryPressureSource?.cancel()
         memoryPressureSource = nil
         videoDecoder?.close()

@@ -104,8 +104,10 @@ final class RecordingTimeline: RenderTimeline {
 
     var currentTime: CMTime { storedTime }
     var rate: Float { storedRate }
+    var beforeSetRate: ((Float, CMTime) -> Void)?
 
     func setRate(_ rate: Float, time: CMTime) {
+        beforeSetRate?(rate, time)
         storedRate = rate
         storedTime = time
         rateChanges.append((rate, time))

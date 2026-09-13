@@ -6,7 +6,7 @@ All notable changes to PrismCore. The format follows
 usual pre-1.0 caveat: **minor** bumps could break API, **patch** bumps stayed
 source-compatible.)
 
-## [2.2.0] — Unreleased
+## [2.2.0] — 2026-09-13
 
 ### Added
 
@@ -1422,7 +1422,7 @@ HTTP server, with:
 - **Software path** — libavcodec into `AVSampleBufferDisplayLayer` for the video
   AVPlayer cannot decode at all.
 
-[2.2.0]: https://github.com/Wenzlik/PrismCore/compare/2.1.1...main
+[2.2.0]: https://github.com/Wenzlik/PrismCore/compare/2.1.1...2.2.0
 [2.1.1]: https://github.com/Wenzlik/PrismCore/compare/2.1.0...2.1.1
 [2.1.0]: https://github.com/Wenzlik/PrismCore/compare/2.0.2...2.1.0
 [2.0.2]: https://github.com/Wenzlik/PrismCore/compare/2.0.1...2.0.2

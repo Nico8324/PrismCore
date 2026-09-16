@@ -8,6 +8,48 @@ source-compatible.)
 
 ## [Unreleased]
 
+### Added
+
+- **An opt-in LAN-reachable server, so a session can be AirPlayed to a real
+  receiver.** The loopback bind is correct for on-device playback and fatal for
+  AirPlay: an Apple TV or AirPlay 2 TV fetches the playlist and every segment
+  itself, and `127.0.0.1` resolves to the receiver — which took the whole
+  master playlist, native WebVTT renditions included, off the table.
+  `PrismCoreSession(… reachability: .localNetworkUnencryptedForAirPlay)` binds
+  a LAN IPv4 interface instead and returns
+  `http://<address>:<port>/<token>/master.m3u8`; the token is the first path
+  component, so every relative reference inside the playlists inherits it
+  without the playlist writers knowing it exists. Default is
+  `.loopbackOnly` and byte-identical to before.
+  - Interface choice is deliberate: `getifaddrs`, up *and* running, no
+    loopback or point-to-point links, tunnels / peer-to-peer radios /
+    `anpi` / self-assigned `169.254` addresses excluded, `en` preferred over
+    unknown over `bridge`, ties broken on the interface number. One address is
+    bound rather than `0.0.0.0`, so a VPN or an Internet Sharing bridge is
+    never exposed. No interface at all throws `NoLocalNetworkInterface` rather
+    than publishing a URL nobody can reach.
+  - IPv6 is explicitly out of scope (bracketed literals, `%zone` on
+    link-local, and rotating privacy addresses that would make a mid-session
+    address change routine).
+  - Every request is gated on a 192-bit CSPRNG token, in the path or in
+    `X-PrismCore-Token`, compared in constant time and refused with `404` —
+    not `403`, so a wrong token looks exactly like a wrong path. The gate runs
+    ahead of the method check; every existing hardening guarantee (traversal,
+    `GET`/`HEAD` only, request-line and header caps, per-connection budget,
+    idle timeout, slow-serve framing) is now covered by the same tests in both
+    modes.
+  - An address that moves under a running session (Wi-Fi to Ethernet, DHCP
+    change) is caught by `NWPathMonitor`: the server does not re-bind — the URL
+    is already inside the `AVPlayerItem` — it answers `503` and reports
+    `session.serviceAddress == .addressLost(…)`, so a host can stop and start a
+    new session instead of waiting on a dead URL. An address that returns
+    resumes serving.
+  - **Residual risk, recorded in the README and in the API documentation: this
+    is cleartext HTTP on the local network.** Anyone on that LAN who observes
+    the traffic sees the token, the playlist and the media bytes, and anyone
+    holding the token can fetch the session's segments while it runs. The token
+    makes the server unguessable, not private.
+
 ## [2.3.0] — 2026-09-16
 
 ### Added

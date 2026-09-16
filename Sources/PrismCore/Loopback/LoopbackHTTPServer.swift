@@ -32,9 +32,63 @@ import Network
 ///
 /// Fast serves keep the byte-identical `Content-Length` shape — the chunked
 /// path is the exception, not the norm.
+///
+/// ## Reachability
+///
+/// The default (`Reachability.loopbackOnly`) is the whole story above: bound to
+/// `127.0.0.1`, unreachable from anywhere else, no token, byte-identical to
+/// what shipped before this mode existed.
+///
+/// `.localNetworkUnencryptedForAirPlay` is the opt-in exception, and it exists
+/// for exactly one reason: when the host AirPlays to an external receiver, the
+/// receiver fetches the playlist and every segment *itself*, and `127.0.0.1`
+/// resolves to the receiver. See that case's documentation for what it costs.
 public actor LoopbackHTTPServer {
 
     public struct FailedToStart: Error {}
+
+    /// No interface to serve from: Wi-Fi off, cable out, or nothing left after
+    /// the tunnels and peer-to-peer radios are excluded. Thrown from `start()`
+    /// in LAN mode, because the alternative is publishing a URL nobody can
+    /// reach and letting the host find out from a playback timeout.
+    public struct NoLocalNetworkInterface: Error {}
+
+    /// Who can reach this server. Opt in with care; the default is the safe one.
+    public enum Reachability: Sendable, Equatable {
+        /// Bound to `127.0.0.1`. Nothing off-device can connect, and no token
+        /// is issued or required.
+        case loopbackOnly
+
+        /// **Opt-in, and named at length on purpose.** Binds the preferred LAN
+        /// IPv4 interface so an AirPlay receiver can fetch the playlist, and
+        /// gates every request on a per-session token (see
+        /// `SessionAccessToken`).
+        ///
+        /// The residual risk, stated plainly: this is **cleartext HTTP on the
+        /// local network**. Anyone on that LAN who can observe the traffic sees
+        /// the token, the playlist and the media bytes — and anyone who holds
+        /// the token can fetch the session's segments for as long as it runs.
+        /// The token makes the server unguessable, not private. Enable it for
+        /// the duration of an AirPlay route on a network the user trusts, and
+        /// stop the session when the route ends.
+        case localNetworkUnencryptedForAirPlay
+    }
+
+    /// Where the server is currently reachable.
+    public enum ServiceAddress: Sendable, Equatable {
+        case loopback
+        /// Bound to this LAN address and still holding it.
+        case localNetwork(String)
+        /// Bound to this LAN address and the machine no longer has it — a
+        /// Wi-Fi-to-Ethernet swap, a DHCP change, the radio going down.
+        ///
+        /// The server does not re-bind: the URL AVPlayer and the receiver were
+        /// handed is baked into the item and every segment reference, so a new
+        /// address would need a new session anyway. It refuses every request
+        /// with `503` instead, so the failure is an honest error rather than a
+        /// URL that hangs, and the host can see it on `serviceAddress`.
+        case addressLost(String)
+    }
 
     /// Resource bounds. Defaults are tuned for one AVPlayer talking to one
     /// remux session; tests dial them down.
@@ -70,29 +124,72 @@ public actor LoopbackHTTPServer {
 
     private let provider: SegmentProvider
     private let limits: Limits
+    private let reachability: Reachability
     private var listener: NWListener?
+    private var pathMonitor: NWPathMonitor?
     private var connections: [ObjectIdentifier: (connection: NWConnection, task: Task<Void, Never>)] = [:]
     private var isStopped = false
     /// The bound port, available after `start()`.
     public private(set) var port: UInt16 = 0
+    /// The host in the published base URL, available after `start()`.
+    public private(set) var host: String = "127.0.0.1"
+    /// Where this server is reachable, and whether it still is.
+    public private(set) var serviceAddress: ServiceAddress = .loopback
+    /// The gate on every request in LAN mode; `nil` on loopback, where there
+    /// is nobody to gate against.
+    public private(set) var accessToken: SessionAccessToken?
+    /// How the server learns which addresses this machine currently holds.
+    private var assignedAddresses: @Sendable () -> Set<String> = {
+        LocalNetworkInterface.assignedIPv4Addresses()
+    }
 
     /// Serve a directory from disk — the v0 shape, unchanged in behavior.
-    public init(root: URL, limits: Limits = Limits()) {
-        self.init(provider: DirectorySegmentProvider(root: root), limits: limits)
+    public init(root: URL, limits: Limits = Limits(), reachability: Reachability = .loopbackOnly) {
+        self.init(
+            provider: DirectorySegmentProvider(root: root),
+            limits: limits,
+            reachability: reachability
+        )
     }
 
-    public init(provider: SegmentProvider, limits: Limits = Limits()) {
+    public init(
+        provider: SegmentProvider,
+        limits: Limits = Limits(),
+        reachability: Reachability = .loopbackOnly
+    ) {
         self.provider = provider
         self.limits = limits
+        self.reachability = reachability
     }
 
-    /// Bind and listen. Returns the base URL (`http://127.0.0.1:<port>/`).
+    /// Bind and listen. Returns the base URL — `http://127.0.0.1:<port>/` by
+    /// default, and `http://<lan-ip>:<port>/<token>/` in LAN mode, where every
+    /// relative reference inside the served playlists inherits the token
+    /// prefix for free.
     @discardableResult
     public func start() async throws -> URL {
         let parameters = NWParameters.tcp
-        // Loopback only — never reachable off-device.
-        parameters.requiredInterfaceType = .loopback
         parameters.allowLocalEndpointReuse = true
+
+        var lanAddress: String?
+        switch reachability {
+        case .loopbackOnly:
+            // Loopback only — never reachable off-device.
+            parameters.requiredInterfaceType = .loopback
+        case .localNetworkUnencryptedForAirPlay:
+            guard let address = LocalNetworkInterface.preferredIPv4Address(),
+                  let ipv4 = IPv4Address(address) else {
+                throw NoLocalNetworkInterface()
+            }
+            lanAddress = address
+            // Bound to the one address, not to `.any`: a server that also
+            // answered on a VPN's `utun` or on Internet Sharing's bridge would
+            // be exposed on networks the user never had in mind. A local
+            // AVPlayer reaches this address too, so one bind serves both the
+            // on-device player and the receiver.
+            parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(ipv4), port: .any)
+            accessToken = .random()
+        }
 
         let listener = try NWListener(using: parameters, on: .any)
         self.listener = listener
@@ -123,7 +220,54 @@ public actor LoopbackHTTPServer {
         listener.stateUpdateHandler = nil
         guard bound != 0 else { throw FailedToStart() }
         port = bound
-        return URL(string: "http://127.0.0.1:\(bound)/")!
+
+        guard let lanAddress, let token = accessToken else {
+            return URL(string: "http://127.0.0.1:\(bound)/")!
+        }
+        host = lanAddress
+        serviceAddress = .localNetwork(lanAddress)
+        startWatchingForAddressLoss()
+        // The trailing slash matters: the token is a directory in the served
+        // namespace, so `master.m3u8`'s own relative references
+        // (`video/index.m3u8`, `seg00001.m4s`) resolve under it without the
+        // playlist writer knowing the token exists.
+        return URL(string: "http://\(lanAddress):\(bound)/\(token.value)/")!
+    }
+
+    /// A path change is the only cheap signal that the address we published
+    /// may be gone; the enumeration is the check that says whether it is.
+    private func startWatchingForAddressLoss() {
+        let monitor = NWPathMonitor()
+        monitor.pathUpdateHandler = { [weak self] _ in
+            Task { await self?.revalidateServiceAddress() }
+        }
+        monitor.start(queue: .global(qos: .utility))
+        pathMonitor = monitor
+    }
+
+    /// Re-check whether the machine still holds the address this server
+    /// published, and flip `serviceAddress` accordingly. Self-healing on
+    /// purpose: a Wi-Fi blip that comes back with the same address goes back
+    /// to serving instead of staying broken.
+    public func revalidateServiceAddress() {
+        let assigned = assignedAddresses()
+        switch serviceAddress {
+        case .loopback:
+            break
+        case .localNetwork(let address), .addressLost(let address):
+            serviceAddress = assigned.contains(address)
+                ? .localNetwork(address)
+                : .addressLost(address)
+        }
+    }
+
+    /// Point the check above at something other than this machine. The only
+    /// way to exercise the address-loss path without unplugging a cable
+    /// mid-run — and it has to be a seam rather than a one-shot state poke,
+    /// because the path monitor re-checks against reality on its own schedule
+    /// and would undo a poked state within milliseconds.
+    func overrideAssignedAddresses(_ source: @escaping @Sendable () -> Set<String>) {
+        assignedAddresses = source
     }
 
     /// Stop listening and tear down every connection, including ones with a
@@ -137,6 +281,8 @@ public actor LoopbackHTTPServer {
         isStopped = true
         listener?.cancel()
         listener = nil
+        pathMonitor?.cancel()
+        pathMonitor = nil
         for entry in connections.values {
             entry.task.cancel()
             entry.connection.cancel()
@@ -259,11 +405,16 @@ public actor LoopbackHTTPServer {
 
     // MARK: - Requests
 
-    private struct Request {
+    /// Internal rather than private so the token gate can be unit-tested
+    /// without a socket.
+    struct Request {
         let method: String
         let path: String
         let wantsClose: Bool
         let hasBody: Bool
+        /// `X-PrismCore-Token`, for clients that can set headers. AirPlay
+        /// receivers cannot, which is why the path prefix is the primary form.
+        let token: String?
 
         init?(head: String) {
             let lines = head.split(separator: "\r\n", omittingEmptySubsequences: true)
@@ -275,19 +426,24 @@ public actor LoopbackHTTPServer {
 
             var connectionHeader: String?
             var contentLength = 0
+            var tokenHeader: String?
             for line in lines.dropFirst() {
                 guard let colon = line.firstIndex(of: ":") else { continue }
                 let name = line[..<colon].lowercased()
-                let value = line[line.index(after: colon)...]
-                    .trimmingCharacters(in: .whitespaces)
-                    .lowercased()
+                // Kept verbatim: the token is case-sensitive base64url, and
+                // lowercasing it — as the other headers are — would reject
+                // every correct token that happens to contain a capital.
+                let raw = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+                let value = raw.lowercased()
                 switch name {
                 case "connection": connectionHeader = value
                 case "content-length": contentLength = Int(value) ?? 0
                 case "transfer-encoding": contentLength = value.isEmpty ? 0 : 1
+                case SessionAccessToken.headerName.lowercased(): tokenHeader = raw
                 default: break
                 }
             }
+            token = tokenHeader
             // HTTP/1.1 keeps the connection alive unless told otherwise; 1.0 is
             // the other way round.
             if version == "HTTP/1.0" {
@@ -309,6 +465,23 @@ public actor LoopbackHTTPServer {
         }
     }
 
+    /// The resource this request is asking for, once the token has been
+    /// accounted for — or `nil` if it never presented one.
+    ///
+    /// Normalization runs FIRST, so `/<token>/../secret` is refused by the
+    /// same traversal guard as ever: a token buys access to the namespace,
+    /// never a way out of it.
+    static func path(of request: Request, behind token: SessionAccessToken) -> String? {
+        guard let normalized = request.normalizedPath else { return nil }
+        if let separator = normalized.firstIndex(of: "/"),
+           token.matches(normalized[..<separator]) {
+            let rest = String(normalized[normalized.index(after: separator)...])
+            return rest.isEmpty ? nil : rest
+        }
+        if let header = request.token, token.matches(header) { return normalized }
+        return nil
+    }
+
     private enum Outcome {
         case completed
         /// The connection was deliberately killed mid-response.
@@ -316,12 +489,33 @@ public actor LoopbackHTTPServer {
     }
 
     private func respond(to request: Request, on connection: NWConnection, keepAlive: Bool) async -> Outcome {
+        // The address under the server moved. Everything below would answer
+        // correctly and reach nobody, so say so instead.
+        if case .addressLost = serviceAddress {
+            _ = await send(Self.errorResponse(status: "503 Service Unavailable"), on: connection)
+            return .completed
+        }
+        // In LAN mode the token gates everything, ahead of the method check:
+        // a caller without it must not learn even which methods this server
+        // implements. On loopback `accessToken` is nil and the order below is
+        // exactly what it always was.
+        var authorizedPath: String?
+        if let token = accessToken {
+            guard let path = Self.path(of: request, behind: token) else {
+                // 404, not 403: a wrong token has to be indistinguishable from
+                // a wrong path, or the server becomes an oracle that confirms
+                // "something is here, keep guessing".
+                _ = await send(Self.errorResponse(status: "404 Not Found", keepAlive: keepAlive), on: connection)
+                return .completed
+            }
+            authorizedPath = path
+        }
         guard request.method == "GET" || request.method == "HEAD" else {
             _ = await send(Self.errorResponse(status: "405 Method Not Allowed"), on: connection)
             return .completed
         }
         let headOnly = request.method == "HEAD"
-        guard let path = request.normalizedPath else {
+        guard let path = authorizedPath ?? request.normalizedPath else {
             _ = await send(Self.errorResponse(status: "404 Not Found", keepAlive: keepAlive), on: connection)
             return .completed
         }

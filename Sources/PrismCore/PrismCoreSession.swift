@@ -88,6 +88,17 @@ public actor PrismCoreSession {
         var dialogueBoost: [DialogueBoostLevel]
         var audioDelaySeconds: Double
         var coordinatedHTTP: Bool
+        var reachability: LoopbackHTTPServer.Reachability
+    }
+
+    /// Where this session's server is reachable, and whether it still is.
+    ///
+    /// `.loopback` for every session that did not opt into LAN reachability.
+    /// A session that did should be watched for `.addressLost` (a Wi-Fi to
+    /// Ethernet swap mid-playback): the served URL cannot be revived, so the
+    /// honest response is to stop and start a new session.
+    public var serviceAddress: LoopbackHTTPServer.ServiceAddress {
+        get async { await server.serviceAddress }
     }
 
     private let configuration: Configuration
@@ -248,7 +259,8 @@ public actor PrismCoreSession {
         keyframeIndexCacheDirectory: URL? = nil,
         dialogueBoost: [DialogueBoostLevel] = [],
         audioDelaySeconds: Double = 0,
-        coordinatedHTTP: Bool = false
+        coordinatedHTTP: Bool = false,
+        reachability: LoopbackHTTPServer.Reachability = .loopbackOnly
     ) throws {
         try self.init(
             url: url,
@@ -262,7 +274,8 @@ public actor PrismCoreSession {
             keyframeIndexCacheDirectory: keyframeIndexCacheDirectory,
             dialogueBoost: dialogueBoost,
             audioDelaySeconds: audioDelaySeconds,
-            coordinatedHTTP: coordinatedHTTP
+            coordinatedHTTP: coordinatedHTTP,
+            reachability: reachability
         )
     }
 
@@ -290,6 +303,15 @@ public actor PrismCoreSession {
     ///   are skipped, and `dialogueBoostRenditions` reports what actually
     ///   made it into the served master. Renditions live only in a master, so
     ///   the muxed fallback shape drops them.
+    /// - Parameter reachability: leave it alone unless the host is routing
+    ///   this session to an **external AirPlay receiver**. A receiver fetches
+    ///   the playlist itself, so `127.0.0.1` resolves to the receiver and the
+    ///   whole master — native WebVTT renditions included — is unreachable.
+    ///   `.localNetworkUnencryptedForAirPlay` binds a LAN interface instead
+    ///   and gates every request on a per-session token. It is cleartext HTTP
+    ///   on the local network; read the case's documentation before enabling
+    ///   it, and watch `serviceAddress` for the address changing under the
+    ///   session.
     public init(
         url: URL,
         httpHeaders: [String: String] = [:],
@@ -300,7 +322,8 @@ public actor PrismCoreSession {
         keyframeIndexCacheDirectory: URL? = nil,
         dialogueBoost: [DialogueBoostLevel] = [],
         audioDelaySeconds: Double = 0,
-        coordinatedHTTP: Bool = false
+        coordinatedHTTP: Bool = false,
+        reachability: LoopbackHTTPServer.Reachability = .loopbackOnly
     ) throws {
         self.configuration = Configuration(
             url: url,
@@ -311,7 +334,8 @@ public actor PrismCoreSession {
             keyframeIndexCacheDirectory: keyframeIndexCacheDirectory,
             dialogueBoost: dialogueBoost,
             audioDelaySeconds: AudioDelay.normalized(audioDelaySeconds),
-            coordinatedHTTP: coordinatedHTTP || probed?.interruptGuard.usesCoordinatedHTTP == true
+            coordinatedHTTP: coordinatedHTTP || probed?.interruptGuard.usesCoordinatedHTTP == true,
+            reachability: reachability
         )
 
         let directory = FileManager.default.temporaryDirectory
@@ -358,7 +382,7 @@ public actor PrismCoreSession {
         provider.audioDemand = { [remuxer] path in
             remuxer.noteAudioDemand(path: path)
         }
-        self.server = LoopbackHTTPServer(provider: provider)
+        self.server = LoopbackHTTPServer(provider: provider, reachability: reachability)
     }
 
     /// A session for the display the host is playing to right now.
@@ -376,7 +400,8 @@ public actor PrismCoreSession {
         keyframeIndexCacheDirectory: URL? = nil,
         dialogueBoost: [DialogueBoostLevel] = [],
         audioDelaySeconds: Double = 0,
-        coordinatedHTTP: Bool = false
+        coordinatedHTTP: Bool = false,
+        reachability: LoopbackHTTPServer.Reachability = .loopbackOnly
     ) throws -> PrismCoreSession {
         try PrismCoreSession(
             url: url,
@@ -387,7 +412,8 @@ public actor PrismCoreSession {
             keyframeIndexCacheDirectory: keyframeIndexCacheDirectory,
             dialogueBoost: dialogueBoost,
             audioDelaySeconds: audioDelaySeconds,
-            coordinatedHTTP: coordinatedHTTP
+            coordinatedHTTP: coordinatedHTTP,
+            reachability: reachability
         )
     }
 
@@ -433,7 +459,10 @@ public actor PrismCoreSession {
             // boost renditions live in a master, and this shape has none.
             dialogueBoost: configuration.dialogueBoost,
             audioDelaySeconds: configuration.audioDelaySeconds,
-            coordinatedHTTP: configuration.coordinatedHTTP
+            coordinatedHTTP: configuration.coordinatedHTTP,
+            // Carried, or a master rejection would quietly drop an AirPlayed
+            // session back onto an address the receiver cannot reach.
+            reachability: configuration.reachability
         )
         try await replayExternalSubtitles(onto: fallback)
         return fallback
@@ -478,7 +507,10 @@ public actor PrismCoreSession {
             keyframeIndexCacheDirectory: configuration.keyframeIndexCacheDirectory,
             dialogueBoost: configuration.dialogueBoost,
             audioDelaySeconds: configuration.audioDelaySeconds,
-            coordinatedHTTP: configuration.coordinatedHTTP
+            coordinatedHTTP: configuration.coordinatedHTTP,
+            // Carried, or a master rejection would quietly drop an AirPlayed
+            // session back onto an address the receiver cannot reach.
+            reachability: configuration.reachability
         )
         try await replayExternalSubtitles(onto: fallback)
         return fallback

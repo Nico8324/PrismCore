@@ -261,6 +261,64 @@ an idle timeout), `GET` + `HEAD`, and pipelined requests. Payloads come from a
 pending serve that ultimately fails aborts the connection (a truncated transfer
 makes AVPlayer retry) instead of framing a cacheable empty `200`.
 
+### AirPlay to an external receiver
+
+The server binds `127.0.0.1` by default, which is right for playback on the
+device and wrong for AirPlay: when the host routes to an Apple TV or an
+AirPlay 2 TV, the **receiver** fetches the playlist and every segment itself,
+and `127.0.0.1` resolves to the receiver. The master playlist — native WebVTT
+renditions, alternate audio, the lot — is simply unreachable.
+
+Opt in per session when, and only when, that is the route:
+
+```swift
+let session = try PrismCoreSession(
+    url: sourceURL,
+    display: .current(),
+    reachability: .localNetworkUnencryptedForAirPlay
+)
+let playlist = try await session.start()
+// http://10.0.0.7:51234/<32-char token>/master.m3u8
+```
+
+- **Interface** — `getifaddrs`, IPv4 only, up *and* running, no loopback and no
+  point-to-point links; tunnels (`utun`, `ipsec`, `ppp`), the peer-to-peer
+  radios (`awdl`, `llw`, `nan`), Apple silicon's internal `anpi` links and
+  self-assigned `169.254/16` addresses are excluded outright. A real `en`
+  interface wins, then anything unrecognized, and an Internet Sharing or VM
+  `bridge` last; ties break on the interface's own number, so the choice is
+  deterministic. The server binds that one address rather than `0.0.0.0`, so a
+  VPN or a shared-internet bridge is never exposed. No interface left →
+  `start()` throws `LoopbackHTTPServer.NoLocalNetworkInterface` instead of
+  publishing a URL nobody can reach.
+- **IPv6 is deliberately not supported.** A literal needs brackets in a URL, a
+  link-local one needs a `%zone` receivers handle inconsistently, and the
+  platform rotates temporary privacy addresses on its own schedule — which
+  would make "the address changed mid-session" routine. Every AirPlay receiver
+  on a home network is reachable over IPv4.
+- **Token** — 192 bits from the system CSPRNG, base64url, as the first path
+  component of every URL (`X-PrismCore-Token` is accepted too, for clients that
+  can set headers; an AirPlay receiver cannot). Everything without it is `404`,
+  ahead of the method check, and a wrong token is indistinguishable from a
+  wrong path so the server is not an oracle. The token buys the session's
+  namespace and nothing else: path traversal, the method restriction, the
+  request-line and header caps, the per-connection budget and the idle timeout
+  all behave exactly as on loopback.
+- **The address changing mid-session** (Wi-Fi to Ethernet, a DHCP change, the
+  radio dropping) is watched with `NWPathMonitor`. The server does **not**
+  re-bind — the URL is already baked into the `AVPlayerItem` and every segment
+  reference — it answers `503` and publishes `session.serviceAddress ==
+  .addressLost(…)`. A host that sees that should stop the session and start a
+  new one. An address that comes back resumes serving.
+
+**The residual risk, plainly: this is cleartext HTTP on the local network.**
+Anyone on that LAN who can observe the traffic sees the token, the playlist and
+the media bytes, and anyone holding the token can fetch the session's segments
+for as long as it runs. The token makes the server unguessable, not private.
+Enable the mode for the duration of an AirPlay route on a network the user
+trusts, and stop the session when the route ends. Sessions that never AirPlay
+should never enable it — the default is unchanged and unreachable off-device.
+
 ### Design notes
 
 The things that were expensive to learn, kept here so the next person doesn't pay

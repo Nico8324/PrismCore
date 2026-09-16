@@ -39,7 +39,11 @@ final class ClosedCaptionReader {
     private let framing: HEVCNALUnits.Framing
     private let codec: HEVCNALUnits.Codec
     /// Index 0 is 608 field 1 (CC1/CC2), index 1 is field 2 (CC3/CC4).
-    private let fields = [CEA608FieldDecoder(), CEA608FieldDecoder()]
+    /// Only field 2 carries XDS, so only field 2 runs the packet state that
+    /// keeps programme metadata out of CC3 and CC4.
+    private let fields = [
+        CEA608FieldDecoder(carriesXDS: false), CEA608FieldDecoder(carriesXDS: true),
+    ]
     /// Pending frames, ascending by presentation time. Small and almost always
     /// already sorted, which is why an insertion into an array beats a heap.
     private var window: [(seconds: Double, triplets: [A53CaptionData.Triplet])] = []

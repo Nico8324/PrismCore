@@ -89,5 +89,15 @@ struct FuzzSmokeTests {
             captionReader.ingest($0, presentationSeconds: 1)
         }
         #expect(captionReader.flush(at: 2).first?.cue.text == "HI♪")
+        // The XDS seed must reach the packet state machine, not merely the SEI
+        // walk: exactly the caption survives, and neither half of the programme
+        // name it is interleaved with does.
+        let xdsReader = ClosedCaptionReader(framing: .annexB, codec: .h264)
+        FuzzSeeds.xdsAccessUnit.withUnsafeBufferPointer {
+            xdsReader.ingest($0, presentationSeconds: 1)
+        }
+        let xdsCues = xdsReader.flush(at: 2)
+        #expect(xdsCues.map(\.channel) == [3])
+        #expect(xdsCues.map(\.cue.text) == ["HI"])
     }
 }

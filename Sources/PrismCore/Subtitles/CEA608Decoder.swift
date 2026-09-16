@@ -158,6 +158,19 @@ final class CEA608ChannelDecoder {
     /// Start of the interval the current screen contents cover, in source
     /// seconds. `nil` until the first caption byte gives us a clock.
     private var intervalStart: Double?
+
+    /// When the contents now on screen were *displayed*, in source seconds.
+    ///
+    /// Separate from `intervalStart` on purpose, and the distinction is the
+    /// whole point of the cap. A segment boundary opens a new interval over the
+    /// same caption — nothing about the screen changed. Measured from the
+    /// interval, a caption displayed at 1 s and split at 6, 12, 18 … renewed
+    /// its ten seconds at every boundary and was re-emitted for the rest of the
+    /// programme: the exact failure the cap exists to prevent, performed by the
+    /// mechanism meant to prevent it. Only a wholesale display change moves
+    /// this — which is also why roll-up is unaffected, since every carriage
+    /// return genuinely redisplays the rows it scrolls.
+    private var displayedSince: Double?
     private var closed: [SubtitleCue] = []
 
     /// Whether this service has ever printed a character. The scout reads it to
@@ -176,6 +189,9 @@ final class CEA608ChannelDecoder {
     /// caption command and neither may leave a cue open.
     func splitPending(at boundary: Double) -> SubtitleCue? {
         guard let start = intervalStart, start < boundary else { return nil }
+        // `displayedSince` deliberately stays put: a boundary is a cut in the
+        // rendition, not a caption command, and the screen it cuts across is
+        // still showing what it was showing before.
         intervalStart = boundary
         return cue(from: start, to: boundary)
     }
@@ -187,6 +203,7 @@ final class CEA608ChannelDecoder {
         displayed.clear()
         nonDisplayed.clear()
         intervalStart = nil
+        displayedSince = nil
         closed = []
     }
 
@@ -195,6 +212,7 @@ final class CEA608ChannelDecoder {
     /// One parity-stripped byte pair addressed to this service.
     func ingest(control: (UInt8, UInt8)?, characters: (UInt8, UInt8)?, at seconds: Double) {
         if intervalStart == nil { intervalStart = seconds }
+        if displayedSince == nil { displayedSince = seconds }
         if let control { apply(control: control, at: seconds) }
         if let characters {
             print(byte: characters.0)
@@ -348,14 +366,21 @@ final class CEA608ChannelDecoder {
             closed.append(cue)
         }
         intervalStart = seconds
+        // This is a wholesale display change, so the caption's allowance starts
+        // here — unlike a segment split, which leaves it where it was.
+        displayedSince = seconds
     }
 
     private func cue(from start: Double, to end: Double) -> SubtitleCue? {
         let text = TextSubtitleConverter.sanitize(displayed.text)
         guard !text.isEmpty else { return nil }
         // Capped, not dropped: a caption whose erase never arrives is still a
-        // caption, it just must not outstay the scene it belongs to.
-        let cappedEnd = min(end, start + Self.maximumCueSeconds)
+        // caption, it just must not outstay the scene it belongs to. The
+        // allowance runs from when the caption was displayed, never from the
+        // interval — see `displayedSince` for what measuring it from the
+        // interval did.
+        let expiry = (displayedSince ?? start) + Self.maximumCueSeconds
+        let cappedEnd = min(end, expiry)
         guard cappedEnd > start else { return nil }
         return SubtitleCue(start: start, end: cappedEnd, text: text)
     }
@@ -414,6 +439,26 @@ final class CEA608FieldDecoder {
     /// Acting on both would erase twice, scroll twice, or print two spaces.
     private var lastControl: (UInt8, UInt8)?
 
+    /// Whether this field can carry XDS. Only field 2 does; on field 1 the
+    /// `0x01…0x0F` pairs are simply not printable and need no packet state.
+    private let carriesXDS: Bool
+
+    /// Whether an XDS packet is currently open on this field.
+    ///
+    /// XDS — programme name, rating, time of day — shares field 2 with CC3 and
+    /// CC4, and **only its framing pairs are outside the printable range**. The
+    /// payload between them is ordinary text. Judging each pair on its own,
+    /// which this used to do, therefore rejected the brackets and fed the
+    /// programme name straight into the caption memory a viewer is reading. An
+    /// XDS packet is state, not a property of a pair: once it opens, every pair
+    /// belongs to it until `0x0F` closes it or a caption control code takes the
+    /// field back.
+    private var inXDSPacket = false
+
+    init(carriesXDS: Bool) {
+        self.carriesXDS = carriesXDS
+    }
+
     /// One `cc_data` byte pair, already known to belong to this field.
     func ingest(_ data0: UInt8, _ data1: UInt8, at seconds: Double) {
         // Parity is stripped rather than checked. The bytes reached us inside
@@ -428,6 +473,13 @@ final class CEA608FieldDecoder {
         if byte0 == 0 && byte1 == 0 { return }
 
         if (0x10...0x1F).contains(byte0) {
+            // A caption control code takes the field back mid-packet. The
+            // standard allows that and real broadcast relies on it: XDS is
+            // transmitted in the gaps between captions, and the remainder of an
+            // interrupted packet arrives later under a continuation class code.
+            // Suppressing until `0x0F` regardless would swallow every caption
+            // after the first packet a caption ever interrupted.
+            inXDSPacket = false
             if let last = lastControl, last == (byte0, byte1) {
                 // Consumed: a third transmission of the same pair is a new
                 // command, not a repeat, so the memory is cleared rather than
@@ -444,9 +496,22 @@ final class CEA608FieldDecoder {
         }
 
         lastControl = nil
-        // 0x01…0x0F on field 2 is XDS (programme metadata, not captions), and
-        // on either field a byte below 0x20 that is not a control code is not
-        // printable. Both simply are not ours.
+        if carriesXDS {
+            // 0x01…0x0E open (odd class) or continue (even class) an XDS
+            // packet; 0x0F ends it and carries the checksum.
+            if (0x01...0x0E).contains(byte0) {
+                inXDSPacket = true
+                return
+            }
+            if byte0 == 0x0F {
+                inXDSPacket = false
+                return
+            }
+            // Printable, but claimed: it is this packet's payload, not caption
+            // text. See `inXDSPacket`.
+            if inXDSPacket { return }
+        }
+        // A byte below 0x20 that is not a control code is not printable.
         guard byte0 >= 0x20 else { return }
         channels[currentChannel].ingest(
             control: nil, characters: (byte0, byte1), at: seconds
@@ -462,5 +527,6 @@ final class CEA608FieldDecoder {
     func reanchor() {
         for channel in channels { channel.reanchor() }
         lastControl = nil
+        inXDSPacket = false
     }
 }

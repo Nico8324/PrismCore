@@ -26,6 +26,25 @@ source-compatible.)
   order. Covered by two tests that fail without the change: a host that
   survives startup and throws mid-production, and a probe whose host throws
   and then stalls past its budget.
+### Fixed — 3.0.1
+
+- **An interrupted transfer is retryable again.** When an origin answered a
+  range request with 206 and the connection then died *during the body*,
+  `HTTPRangeInput` latched `.originUnreachable(status: 206, …)`.
+  `PrismCoreError.retryability` saw a non-nil status below 500, read it as "the
+  origin answered about this request", and told the host `.permanent` — do not
+  retry — for what is a transient transport failure on an origin that is
+  answering perfectly. The status and the failure were about different things:
+  the 206 described a *response* that succeeded, the error described a
+  *transfer* that did not. The reader now records no status for a transport
+  failure, which is what `retryability`'s no-status branch already documents
+  ("a transport failure … the engine's own reader retries these eight times");
+  the transport error itself still rides along in `underlying`. Fixed at the
+  recording site rather than by teaching `retryability` about success codes,
+  because a failure carrying a success status is a state that should not
+  exist — and the four argued verdicts (`originRefused` permanent,
+  `originRateLimited` retryable, 5xx retryable, 4xx permanent) are untouched,
+  now with a test of their own that says so.
 
 ## [3.0.0] — 2026-09-16
 

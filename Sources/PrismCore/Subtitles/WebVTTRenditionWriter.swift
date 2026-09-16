@@ -104,7 +104,12 @@ final class WebVTTRenditionWriter {
             .sorted { ($0.start, $0.end) < ($1.start, $1.end) }
             // Printed relative to the origin; the timestamp map carries the
             // origin itself back onto the media axis.
-            .map { SubtitleCue(start: $0.start - originSeconds, end: $0.end - originSeconds, text: $0.text) }
+            .map { cue in
+                var rebased = cue
+                rebased.start -= originSeconds
+                rebased.end -= originSeconds
+                return rebased
+            }
 
         let file = String(format: "seg%05d.vtt", segmentIndex)
         try Data(Self.render(cues: inRange, mpegtsOffset: mpegtsOffset).utf8)
@@ -140,7 +145,12 @@ final class WebVTTRenditionWriter {
         var text = "WEBVTT\n"
         text += "X-TIMESTAMP-MAP=MPEGTS:\(mpegtsOffset),LOCAL:00:00:00.000\n\n"
         for cue in cues {
-            text += "\(webVTTTimestamp(cue.start)) --> \(webVTTTimestamp(cue.end))\n"
+            text += "\(webVTTTimestamp(cue.start)) --> \(webVTTTimestamp(cue.end))"
+            // Settings share the timing line, separated by a single space.
+            // They arrive pre-sanitized (`TextCuePlacement`): a newline here
+            // would end the cue before its payload.
+            if let settings = cue.settings, !settings.isEmpty { text += " " + settings }
+            text += "\n"
             // Every cue ends with its own blank line, so the last one leaves the
             // file terminated too — a cue block cut off by EOF is the same
             // parse hazard in a different place.

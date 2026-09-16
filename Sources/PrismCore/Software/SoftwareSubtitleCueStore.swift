@@ -19,7 +19,8 @@ final class SoftwareSubtitleCueStore: @unchecked Sendable {
 
     func ingest(
         _ packet: UnsafeMutablePointer<AVPacket>, timeBase: AVRational,
-        kind: TextSubtitleConverter.Kind, currentTime: Double
+        kind: TextSubtitleConverter.Kind, currentTime: Double,
+        playResolution: TextSubtitleConverter.PlayResolution? = nil
     ) {
         // Reject oversized payloads before copying or parsing: subtitle data
         // must not bypass the decoded video pipeline's memory discipline.
@@ -31,11 +32,19 @@ final class SoftwareSubtitleCueStore: @unchecked Sendable {
         let end = start + Double(packet.pointee.duration) * av_q2d(timeBase)
         guard start.isFinite, end.isFinite, end > start,
               !currentTime.isFinite || end > currentTime,
-              let text = TextSubtitleConverter.cueText(
-                from: Data(bytes: bytes, count: Int(packet.pointee.size)), kind: kind
+              let converted = TextSubtitleConverter.convert(
+                Data(bytes: bytes, count: Int(packet.pointee.size)), kind: kind, playResolution: playResolution
               ) else { return }
+        // A WebVTT track's own settings outrank anything read off the payload
+        // — the same precedence the remux renditions use.
+        let placement = kind == .webvtt
+            ? SubtitleRenditionSet.webVTTSettings(on: packet)
+                .flatMap(TextCuePlacement.sanitizedWebVTTSettings)
+                .flatMap(TextCuePlacement.init(webVTTSettings:)) ?? converted.placement
+            : converted.placement
         insert(TimedTextCue(streamIndex: packet.pointee.stream_index,
-                            start: start, end: end, text: text), currentTime: currentTime)
+                            start: start, end: end, text: converted.text, placement: placement),
+               currentTime: currentTime)
     }
 
     func insert(_ cue: TimedTextCue, currentTime: Double) {

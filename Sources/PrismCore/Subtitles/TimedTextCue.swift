@@ -24,13 +24,23 @@ public struct TimedTextCue: Sendable, Equatable {
     public let start: Double
     public let end: Double
     /// Cue payload as the converter produced it — WebVTT-safe plain text,
-    /// possibly carrying simple inline tags (`<i>`, `<b>`) the source had.
+    /// possibly carrying simple inline tags (`<i>`, `<b>`, `<u>`) the source
+    /// had, including ones translated from ASS `{\i1}`-style overrides.
     public let text: String
+    /// Where the source asked for the cue to be drawn (an ASS `\an8`, a
+    /// WebVTT `line:`), or `nil` for the host's default placement — which is
+    /// what nearly every cue wants. A host that ignores it draws exactly what
+    /// it drew before.
+    public let placement: TextCuePlacement?
 
-    public init(streamIndex: Int32, start: Double, end: Double, text: String) {
+    public init(
+        streamIndex: Int32, start: Double, end: Double, text: String,
+        placement: TextCuePlacement? = nil
+    ) {
         self.streamIndex = streamIndex
         self.start = start
         self.end = end
         self.text = text
+        self.placement = placement
     }
 }

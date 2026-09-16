@@ -1253,7 +1253,8 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
         if let stream = input.pointee.streams[Int(packet.pointee.stream_index)],
            let kind = SubtitleRenditionSet.kind(for: stream.pointee.codecpar.pointee.codec_id) {
             subtitleCues.ingest(packet, timeBase: stream.pointee.time_base, kind: kind,
-                                currentTime: clockAnchored ? CMTimeGetSeconds(timeline.currentTime) : .nan)
+                                currentTime: clockAnchored ? CMTimeGetSeconds(timeline.currentTime) : .nan,
+                                playResolution: SubtitleRenditionSet.playResolution(of: stream.pointee.codecpar, kind: kind))
         }
 
         switch Int32(packet.pointee.stream_index) {

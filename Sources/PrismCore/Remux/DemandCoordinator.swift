@@ -242,6 +242,13 @@ final class DemandCoordinator: @unchecked Sendable {
         lock.withLock { _ = unproduciblePaths.insert(path) }
     }
 
+    /// Forget every "never coming" mark at once: the producer changed
+    /// something that decides which slots carry audio at all (the audio
+    /// offset), so each one has to be answered by production again.
+    func clearUnproducible() {
+        lock.withLock { unproduciblePaths.removeAll() }
+    }
+
     func isUnproducible(path: String) -> Bool {
         lock.withLock { unproduciblePaths.contains(path) }
     }

@@ -58,7 +58,71 @@ import Libavutil
 final class HLSRemuxer: @unchecked Sendable {
     let residentSegments = ResidentSegmentStore()
     let audioDeliveryStore = AudioDeliveryStore()
-    var audioDelaySeconds: Double = 0
+
+    /// The offset the muxers are writing with RIGHT NOW. Written from the
+    /// session before `start()` and from the producer thread when it adopts a
+    /// request at a re-anchor; read per packet by the writers. Lock-guarded
+    /// because the host reads it from its own thread while the producer runs.
+    var audioDelaySeconds: Double {
+        get { audioDelayLock.withLock { effectiveAudioDelaySeconds } }
+        set {
+            audioDelayLock.withLock {
+                effectiveAudioDelaySeconds = AudioDelay.normalized(newValue)
+                requestedAudioDelaySeconds = nil
+            }
+        }
+    }
+
+    /// A delay the host asked for that no muxer has taken up yet, or `nil`
+    /// when nothing is outstanding. Never conflated with `audioDelaySeconds`:
+    /// a host that reported this value as the one in force would be telling
+    /// the viewer their correction had landed while the segments still on
+    /// disk carry the old one.
+    var pendingAudioDelaySeconds: Double? {
+        audioDelayLock.withLock { requestedAudioDelaySeconds }
+    }
+
+    private let audioDelayLock = NSLock()
+    private var effectiveAudioDelaySeconds: Double = 0
+    private var requestedAudioDelaySeconds: Double?
+
+    /// Ask the producer to start muxing with `seconds`, and return whether
+    /// there is a re-anchor to carry it — the only point at which the offset
+    /// can change without corrupting output. Mid-fragment it cannot: the
+    /// shift moves audio dts, and a backward step there is a non-monotonic
+    /// dts the muxer refuses outright.
+    ///
+    /// False means this session has no demand plan (the sequential shape
+    /// never re-anchors), so the request is not even stored — reporting a
+    /// pending change that can never arrive is worse than refusing it.
+    func requestAudioDelay(_ seconds: Double) -> Bool {
+        let value = AudioDelay.normalized(seconds)
+        guard let demand, let plan = demand.publishedPlan, !plan.entries.isEmpty,
+              let playhead = demand.armAnchorIndex else { return false }
+        // Clamped into the plan: a producer parked at EOF reports an index one
+        // past the last entry, and the producer drops an anchor request it
+        // cannot find in the plan — the request would then sit pending
+        // forever, which is exactly the lie this API exists to avoid.
+        let anchor = min(max(0, playhead), plan.entries.count - 1)
+        audioDelayLock.withLock {
+            requestedAudioDelaySeconds = value == effectiveAudioDelaySeconds ? nil : value
+        }
+        // Forced: the playhead's segment is usually the one production is
+        // already on, and an unforced request for that index is dropped.
+        demand.requestProduction(of: anchor, force: true)
+        return true
+    }
+
+    /// The producer's side of the handshake, called only at a re-anchor:
+    /// takes the outstanding request, if any, and makes it the one in force.
+    private func adoptRequestedAudioDelay() -> Double? {
+        audioDelayLock.withLock {
+            guard let requested = requestedAudioDelaySeconds else { return nil }
+            requestedAudioDelaySeconds = nil
+            effectiveAudioDelaySeconds = requested
+            return requested
+        }
+    }
     var coordinatedHTTP = false
     private let activeGuardLock = NSLock()
     private var activeGuard: ReadInterruptGuard?
@@ -1100,12 +1164,39 @@ final class HLSRemuxer: @unchecked Sendable {
                 av_seek_frame(input, videoIndex, target, AVSEEK_FLAG_BACKWARD),
                 "av_seek_frame"
             )
+            // A re-anchor rebuilds every muxer, which is the one moment a new
+            // audio offset can be taken up: the shift moves audio dts, and
+            // applying it inside a running fragment would step dts backwards —
+            // `av_interleaved_write_frame` refuses that (-22).
+            let adoptedDelay = adoptRequestedAudioDelay()
             writer = FMP4SegmentWriter()
             writer.audioDelaySeconds = audioDelaySeconds
             _ = try writer.open(input: input, plan: plan, restart: true)
             streamMap = writer.streamMap
             for rendition in renditions {
+                rendition.audioDelaySeconds = audioDelaySeconds
                 try rendition.reanchor(input: input, segmentIndex: anchor)
+            }
+            if adoptedDelay != nil {
+                // Every segment already on disk was muxed with the PREVIOUS
+                // offset. Left there, the provider serves them as hits and a
+                // backward seek plays audio at the offset the viewer just
+                // corrected away from — the failure a delay control must not
+                // have. Discarding them makes the next fetch a miss, which
+                // re-anchors production and rewrites the segment.
+                let victims = residentSegments.retireAll()
+                let directories = [outputDirectory] + renditions.map {
+                    outputDirectory.appendingPathComponent($0.directoryName)
+                }
+                unlinkQueue.async { [residentSegments] in
+                    for victim in victims {
+                        residentSegments.unlinkRetired(index: victim, directories: directories)
+                    }
+                }
+                // A rendition slot that carried no audio at the old offset may
+                // carry some at the new one; a stale 404 there is a rendition
+                // segment AVPlayer counts as failed.
+                demand?.clearUnproducible()
             }
             subtitles.reanchor(segmentIndex: anchor, startSeconds: Double(target) * tickSeconds)
             segmentIndex = anchor

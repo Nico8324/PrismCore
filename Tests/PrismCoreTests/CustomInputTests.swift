@@ -20,6 +20,13 @@ private final class MemoryInput: PrismCoreInput, @unchecked Sendable {
     /// Throw from `read` once this many bytes have been handed out — the
     /// transport dying mid-playback.
     private let failAfterBytes: Int?
+    /// How long the dying read hangs before it throws. A real transport
+    /// rarely fails instantly — it stalls and then gives up — and the stall
+    /// is what lets a read budget expire *after* the host's own failure has
+    /// been recorded, which is the ordering a caller has to get right.
+    private let failureStall: Duration?
+    /// The most this input answers in one call — see `defaultChunk`.
+    private let chunk: Int
     private var delivered = 0
     private var storedReads = 0
     private var storedSeeks = 0
@@ -27,14 +34,19 @@ private final class MemoryInput: PrismCoreInput, @unchecked Sendable {
 
     struct Broken: Error {}
 
-    init(data: Data, reportsLength: Bool = true, failAfterBytes: Int? = nil) {
+    init(data: Data, reportsLength: Bool = true, failAfterBytes: Int? = nil,
+         failureStall: Duration? = nil, chunk: Int = MemoryInput.defaultChunk) {
+        self.chunk = chunk
         self.bytes = [UInt8](data)
         self.reportsLength = reportsLength
         self.failAfterBytes = failAfterBytes
+        self.failureStall = failureStall
     }
 
     var length: Int64? { reportsLength ? Int64(bytes.count) : nil }
     var reads: Int { lock.withLock { storedReads } }
+    /// Bytes handed over so far — how a test sizes a mid-playback failure.
+    var deliveredBytes: Int { lock.withLock { delivered } }
     var seeks: Int { lock.withLock { storedSeeks } }
     /// Whether a read ever answered 0 — the protocol's EOF.
     var sawEOF: Bool { lock.withLock { storedSawEOF } }
@@ -50,14 +62,21 @@ private final class MemoryInput: PrismCoreInput, @unchecked Sendable {
     /// response, an SMB read), and a stand-in that hands over the whole file
     /// in one call never exercises EOF, a mid-file failure or a seek at all:
     /// libavformat's format probe asks for up to a megabyte in ONE read, and
-    /// this fixture is 1.27 MB.
-    private static let chunk = 16 * 1024
+    /// this fixture is 1.27 MB. A test that needs to die at a precise point
+    /// of the *startup* sequence shrinks it further, because at 16 KiB the
+    /// whole probe is one or two answers wide.
+    static let defaultChunk = 16 * 1024
 
     func read(into buffer: UnsafeMutableRawBufferPointer) throws -> Int {
-        try lock.withLock {
+        // Stalling outside the lock, like a real transport blocked on a
+        // socket: the engine is free to time the read out while it hangs.
+        if let failureStall, let failAfterBytes, deliveredBytes >= failAfterBytes {
+            blockingSleep(failureStall)
+        }
+        return try lock.withLock {
             storedReads += 1
             if let failAfterBytes, delivered >= failAfterBytes { throw Broken() }
-            var count = min(min(buffer.count, Self.chunk), bytes.count - position)
+            var count = min(min(buffer.count, chunk), bytes.count - position)
             // Hand over exactly the scheduled budget, then fail on the NEXT
             // call — a transport that dies mid-file, not one that refuses to
             // start (which libavformat would simply report as an unopenable
@@ -74,6 +93,14 @@ private final class MemoryInput: PrismCoreInput, @unchecked Sendable {
             return count
         }
     }
+}
+
+/// Sleeps the calling thread — the host is called from libavformat's read
+/// callback, which is not an async context.
+private func blockingSleep(_ duration: Duration) {
+    let seconds = Double(duration.components.seconds)
+        + Double(duration.components.attoseconds) / 1e18
+    if seconds > 0 { Thread.sleep(forTimeInterval: seconds) }
 }
 
 private func fixtureData(_ name: String, _ ext: String) throws -> Data {
@@ -184,6 +211,83 @@ struct CustomInputTests {
             // The point of the typed failure: the caller gets an answer
             // instead of a session waiting on a playlist nobody will write.
             #expect(started.duration(to: .now) < .seconds(10))
+        }
+    }
+
+    /// The gap 3.0.0 left: a host input that survives startup and dies LATER.
+    /// The opening paths ask the guard what the host said; the produce loop
+    /// used to report FFmpeg's `-EIO` instead, so an SMB mount that dropped
+    /// or a debrid link that expired mid-film reached the host as
+    /// "Input/output error" with nothing to act on.
+    @Test func aHostInputThatDiesDuringProductionSurfacesTheHostError() async throws {
+        let data = try fixtureData("h264_aac_30s", "mkv")
+        // Measured on this fixture: startup (open, `find_stream_info`, the
+        // Cues at the tail) costs ~164 KB of host answers and the whole
+        // 1.27 MB container ~1.34 MB. 400 KB is therefore comfortably inside
+        // the copy loop — production is already under way.
+        let input = MemoryInput(data: data, failAfterBytes: 400_000)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PrismCoreCustomInput-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let remuxer = HLSRemuxer(
+            sourceURL: absentURL("fixture.mkv"),
+            outputDirectory: directory,
+            segmentSeconds: 3,
+            input: { input }
+        )
+        // A real thread, like the session's own: `run()` blocks in FFmpeg
+        // reads and parks at EOF (#44).
+        let producer = ProducerThread(name: "prismcore.tests.custom-input") { try remuxer.run() }
+        defer { remuxer.cancel() }
+        let deadline = ContinuousClock.now.advanced(by: .seconds(30))
+        while !producer.isFinished, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        #expect(producer.isFinished, "the producer never returned")
+        await producer.join()
+
+        // Startup really did succeed — the failure under test is a
+        // steady-state one, not another open.
+        #expect(FileManager.default.fileExists(
+            atPath: directory.appendingPathComponent("seg00000.m4s").path
+        ), "the host died before production started; the test proves nothing")
+
+        let failure = try #require(producer.failureIfAny)
+        guard case PrismCoreInputError.readFailed(let hostError) = failure else {
+            Issue.record("Expected PrismCoreInputError.readFailed, got \(failure)")
+            return
+        }
+        #expect(hostError is MemoryInput.Broken)
+    }
+
+    /// The probe's budget-exhausted exit had the same gap: a host that threw
+    /// and then let the clock run out was reported as the expiry, not as the
+    /// failure that caused it — and the expiry is the symptom.
+    @Test func aProbeBudgetThatExpiresAfterAHostFailureNamesTheHostError() throws {
+        let data = try fixtureData("h264_aac_30s", "mkv")
+        // Tuned to land on that exit and nowhere else (swept, 2026-09-16):
+        // in 2 KiB answers the open needs ~5, so failing after 4 KiB puts the
+        // death inside `find_stream_info`, and the 600 ms stall means the
+        // 200 ms budget is already spent when the host finally throws. The
+        // read then comes back as the abort `find_stream_info` swallows, so
+        // the probe's only visible symptom is an expired clock.
+        let input = MemoryInput(data: data, failAfterBytes: 4096,
+                                failureStall: .milliseconds(600), chunk: 2048)
+        do {
+            _ = try SourceProbe.open(url: absentURL("fixture.mkv"),
+                                     budget: .milliseconds(200), input: { input })
+            Issue.record("A probe whose host input died reported success")
+        } catch {
+            let underlying = (error as? SourceProbe.Failure).flatMap {
+                if case .openFailed(let inner) = $0 { return inner } else { return nil }
+            } ?? error
+            guard case PrismCoreInputError.readFailed(let hostError) = underlying else {
+                Issue.record("Expected PrismCoreInputError.readFailed, got \(underlying)")
+                return
+            }
+            #expect(hostError is MemoryInput.Broken)
         }
     }
 

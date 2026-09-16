@@ -8,6 +8,25 @@ source-compatible.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **A host-supplied input that dies AFTER startup now reaches the host as its
+  own error, not as "Input/output error".** 3.0.0's `PrismCoreInput` promised
+  that a host's failing read or seek comes back as
+  `PrismCoreInputError.readFailed(_:)` wrapping the host's own error, and the
+  opening paths kept that promise — but the steady-state ones did not. The
+  remuxer's `av_read_frame` failure and the probe's budget-exhausted exit
+  asked the guard only for the *origin's* classification, which is `nil` when
+  the bytes come from a host, so an SMB mount that dropped mid-film or a
+  debrid link that expired an hour in surfaced as FFmpeg's `-EIO` and the host
+  lost the one thing that named which transport gave up. Both now consult the
+  custom-input failure first, then the origin failure, then the raw libav*
+  code — most specific first, the same order the opening paths already used.
+  The preview service's `find_stream_info` had the same gap and got the same
+  order. Covered by two tests that fail without the change: a host that
+  survives startup and throws mid-production, and a probe whose host throws
+  and then stalls past its budget.
+
 ## [3.0.0] — 2026-09-16
 
 Eight additions in one release: the host can supply the bytes, classify a

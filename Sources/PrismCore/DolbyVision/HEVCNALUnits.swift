@@ -193,4 +193,103 @@ enum HEVCNALUnits {
         }
         return true
     }
+
+    // MARK: - Read-only walks (H.264 framing, Annex-B carriage)
+
+    /// Which codec's NAL header the walk should read. The *framing* is shared;
+    /// only the header differs — H.264 spends one byte (`nal_unit_type` in the
+    /// low 5 bits), HEVC two (type in bits 6…1 of the first).
+    enum Codec {
+        case h264
+        case hevc
+
+        /// Bytes of NAL header before the payload.
+        var headerSize: Int { self == .h264 ? 1 : 2 }
+    }
+
+    /// How the units are delimited inside one packet.
+    enum Framing: Equatable {
+        /// `avcC` / `hvcC` carriage: a big-endian length before each unit.
+        /// What the mov and matroska demuxers hand us.
+        case lengthPrefixed(Int)
+        /// Annex-B start codes (`00 00 01`, optionally with a leading `00`) —
+        /// what the MPEG-TS demuxer hands us, and the form most captioned
+        /// broadcast recordings arrive in. A video stream with no
+        /// `avcC`/`hvcC` extradata is exactly this case, which is how the
+        /// caller picks between the two.
+        case annexB
+    }
+
+    /// Visit every NAL unit of a packet without allocating.
+    ///
+    /// Deliberately **best-effort**, unlike `units(in:lengthSize:)`: that one
+    /// returns `nil` on a framing mismatch because its caller rewrites the
+    /// packet, and a half-parsed rewrite splices garbage into the bitstream.
+    /// This walk only reads — the worst a mis-framed packet can do is yield no
+    /// captions for one frame — so it stops at the damage instead of
+    /// discarding the units it had already framed correctly.
+    ///
+    /// `visit` receives the `nal_unit_type` and the payload **after** the NAL
+    /// header, still carrying its emulation-prevention bytes.
+    static func scan(
+        _ bytes: UnsafeBufferPointer<UInt8>,
+        framing: Framing,
+        codec: Codec,
+        visit: (UInt8, UnsafeBufferPointer<UInt8>) -> Void
+    ) {
+        guard let base = bytes.baseAddress else { return }
+        let count = bytes.count
+        let headerSize = codec.headerSize
+
+        func emit(offset: Int, length: Int) {
+            guard length > headerSize else { return }
+            let type = codec == .h264 ? (base[offset] & 0x1F) : ((base[offset] >> 1) & 0x3F)
+            visit(
+                type,
+                UnsafeBufferPointer(start: base + offset + headerSize, count: length - headerSize)
+            )
+        }
+
+        switch framing {
+        case .lengthPrefixed(let lengthSize):
+            guard (1...4).contains(lengthSize) else { return }
+            var cursor = 0
+            while cursor + lengthSize <= count {
+                var length = 0
+                for offset in 0..<lengthSize {
+                    length = (length << 8) | Int(base[cursor + offset])
+                }
+                cursor += lengthSize
+                // A zero length would spin this loop forever; a length past the
+                // end is a truncated packet, and the units before it stand.
+                guard length > 0, cursor + length <= count else { return }
+                emit(offset: cursor, length: length)
+                cursor += length
+            }
+
+        case .annexB:
+            var cursor = 0
+            var unitStart: Int?
+            while cursor + 2 < count {
+                guard base[cursor] == 0, base[cursor + 1] == 0, base[cursor + 2] == 1 else {
+                    cursor += 1
+                    continue
+                }
+                if let start = unitStart {
+                    // The leading zero of a four-byte start code belongs to the
+                    // start code, not to the unit before it. Counting it in
+                    // hands the SEI parser a trailing zero byte, which reads as
+                    // another payload type and walks off the end of the message.
+                    var end = cursor
+                    while end > start, base[end - 1] == 0 { end -= 1 }
+                    emit(offset: start, length: end - start)
+                }
+                cursor += 3
+                unitStart = cursor
+            }
+            if let start = unitStart, start < count {
+                emit(offset: start, length: count - start)
+            }
+        }
+    }
 }

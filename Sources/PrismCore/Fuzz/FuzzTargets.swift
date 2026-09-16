@@ -39,6 +39,7 @@ package enum FuzzTargets {
         "hvcc-normalize": { @Sendable in hvccNormalize($0) },
         "isobmff-patch": { @Sendable in isobmffPatch($0) },
         "text-subtitles": { @Sendable in textSubtitles($0) },
+        "a53-captions": { @Sendable in a53Captions($0) },
     ]
 
     // MARK: - Targets
@@ -119,6 +120,55 @@ package enum FuzzTargets {
             }) else { continue }
             if !rewritten.isEmpty, HEVCNALUnits.units(in: rewritten, lengthSize: lengthSize) == nil {
                 fatalError("rewrite output no longer frames (lengthSize \(lengthSize))")
+            }
+        }
+    }
+
+    /// The closed-caption path end to end: SEI walk, T.35 message loop, and the
+    /// 608 terminal that the extracted bytes drive.
+    ///
+    /// The inputs here are the least trustworthy bytes in the whole engine — a
+    /// broadcast recording's video packets, arbitrary and unvalidated, walked
+    /// by a parser whose message loop reads its own lengths. The invariants are
+    /// about the *cues*, not just survival: a cue that inverts, outstays its
+    /// cap, or carries a `-->` is a wrong answer the decoder must not be able
+    /// to produce however malformed the bitstream was.
+    package static func a53Captions(_ bytes: [UInt8]) {
+        let carriages: [(HEVCNALUnits.Framing, HEVCNALUnits.Codec)] = [
+            (.annexB, .h264), (.annexB, .hevc), (.lengthPrefixed(4), .h264), (.lengthPrefixed(2), .hevc),
+        ]
+        for (framing, codec) in carriages {
+            let triplets = bytes.withUnsafeBufferPointer {
+                A53CaptionData.triplets(in: $0, framing: framing, codec: codec)
+            }
+            for triplet in triplets where triplet.type > 3 {
+                fatalError("cc_type is two bits and cannot exceed 3: \(triplet.type)")
+            }
+
+            let reader = ClosedCaptionReader(framing: framing, codec: codec)
+            let start = 1.0
+            bytes.withUnsafeBufferPointer { reader.ingest($0, presentationSeconds: start) }
+            let end = start + 1_000
+            for entry in reader.flush(at: end) {
+                guard (1...4).contains(entry.channel) else {
+                    fatalError("cue attributed to a service that does not exist: CC\(entry.channel)")
+                }
+                let cue = entry.cue
+                guard !cue.text.isEmpty else { fatalError("empty cue emitted") }
+                guard cue.end > cue.start else {
+                    fatalError("cue does not advance: \(cue.start) → \(cue.end)")
+                }
+                guard cue.start >= start, cue.end <= end else {
+                    fatalError("cue outside the times it was fed: \(cue.start) → \(cue.end)")
+                }
+                // The open-cue cap is what keeps a caption whose erase never
+                // comes from standing for the rest of the film.
+                guard cue.end - cue.start <= CEA608ChannelDecoder.maximumCueSeconds + 0.001 else {
+                    fatalError("cue outlived the cap: \(cue.end - cue.start)s")
+                }
+                guard !cue.text.contains("-->"), !cue.text.contains("\n\n") else {
+                    fatalError("cue text would break the WebVTT it is written into")
+                }
             }
         }
     }

@@ -8,6 +8,323 @@ source-compatible.)
 
 ## [Unreleased]
 
+## [3.0.0] — 2026-09-16
+
+Eight additions in one release: the host can supply the bytes, classify a
+failure, read captions the video stream carries, reach the server from an
+AirPlay receiver, name the language it wants, clone a session with one setting
+moved, move the audio delay while the title plays, and watch startup happen.
+
+**Why a major.** Nothing here changes a signature, so existing call sites
+compile untouched — but two things a host may have relied on did move:
+`SessionError` gained `alreadySuperseded`, which breaks an exhaustive `switch`,
+and `SourceProbe.Failure.openFailed`, `SessionError.startupTimedOut` and
+`remuxError` now sometimes carry a `PrismCoreError` where they used to carry an
+`FFmpegError`, so a host pattern-matching that payload stops matching.
+`PrismCoreError.classify(_:)` reads both shapes.
+
+### Added
+
+- **`PrismCoreSession.makeSession(changing:)` — one public door for "same
+  title, one option different".** A session is single-use, so every setting
+  that reaches the remux could until now only be changed by building a new
+  session by hand and re-registering everything the old one knew. The clone
+  takes `PrismCoreSession.Options` (everything the initializers take: display
+  capabilities, `segmentCacheBytes`, `forceMuxedShape`, the keyframe index
+  cache, `dialogueBoost`, `audioDelaySeconds`, `coordinatedHTTP`), applies the
+  host's mutation, and replays the registered external subtitles and the
+  timed-text cue handler onto the successor. `sourceURL` and `httpHeaders` are
+  read-only in `Options`: the replay is what makes them part of a session's
+  identity. Read the current values with `PrismCoreSession.options`.
+  Explicitly **not** a seamless swap — nothing is transplanted, and the host
+  replaces its `AVPlayerItem` and seeks the successor to where it wants to
+  resume.
+- The lifecycle contract is now stated and enforced: the caller still owns
+  `stop()` on the predecessor (the factory cannot stop a session whose frames
+  the player may still be drawing), a successor never inherits the
+  predecessor's work directory (two producers on one directory write the same
+  segment names, and the predecessor's `stop()` deletes the directory out from
+  under a successor serving from it), and a session mints **at most one**
+  successor — a second call throws the new `SessionError.alreadySuperseded`.
+  Successors chain; fanning out from one long-lived session is how a host ends
+  up with several producers and several servers on one title. Hosts that
+  `switch` exhaustively over `SessionError` need the new case.
+
+- **`PrismCoreError` — a failure taxonomy a host can branch on.** Until now a
+  host got `SessionError.startupTimedOut(underlying:)` wrapping an `FFmpegError`
+  whose only distinguishing feature was an English string from libavformat, so
+  "your token expired", "the server is throttling us", "this file has no video"
+  and "the disk is full" were one failure with four different remedies.
+  `PrismCoreError.classify(_:)` reads any of them — plus the `AVPlayerItem.error`
+  the host gets back from AVFoundation — into one of: `originRefused`
+  (401/403/407), `originRateLimited` (429/503/509, carrying the origin's own
+  `Retry-After` in seconds), `originUnreachable`, `noVideoStream`,
+  `videoCodecNotRemuxable` (with the stream index), `videoCodecUnplayable`,
+  `startupBudgetExpired`, `masterRejectedByPlayer` (`MasterRejection` folded in,
+  not duplicated), `workDirectoryOutOfSpace`, `ffmpeg` (raw code + message) and
+  `unknown`. `PrismCoreSession.remuxFailure` is the same classification of
+  `remuxError`.
+- The HTTP status the coordinated reader already computed is no longer thrown
+  away. `HTTPRangeInput` can only answer libavformat in errno, so every origin
+  verdict used to reach the open site as `-EIO`; it now latches what it saw and
+  the open/read sites ask for that first. This is what makes a 403 tell a host
+  to re-authenticate instead of "Input/output error". The latch is cleared on
+  the first successful read, so a refusal the retry loop rode out is not
+  reported forty minutes later.
+- A 429 that spends the whole probe budget is reported as the rate limit, not as
+  the budget expiry it caused — the expiry is the symptom, the status is the
+  reason, and only one of the two says when to come back.
+- `FFmpegError.message` (libav*'s own text, without the operation wrapped around
+  it), and reconstructed `AVERROR_HTTP_*` shims. Those are the only libavformat
+  codes that report an origin's *status* rather than a symptom, which is why
+  they are worth mapping; everything else keeps its raw code and message rather
+  than being squeezed into a category it has not earned. A test checks the
+  reconstructed tags against `av_strerror`'s own table, not against the
+  arithmetic that produced them.
+
+### Changed
+
+
+- `makeMuxedFallbackSession()` and `makeMasterRejectionFallbackSession()` now
+  go *through* `makeSession(changing:)` instead of each minting their own
+  clone. Same behaviour, same signatures — but the replay of subtitles and cue
+  handler, and the lifecycle rules, now live in one place and cannot drift
+  apart from the public path. The muxed fallback keeps carrying `dialogueBoost`
+  it cannot serve, so a clone taken off the fallback session does not silently
+  forget the host ever asked for it.
+
+- `SourceProbe.Failure.openFailed(_:)`, `SessionError.startupTimedOut(underlying:)`
+  and `PrismCoreSession.remuxError` now sometimes carry a `PrismCoreError` where
+  they carried an `FFmpegError` before. **Source-compatible** — the declared
+  types are unchanged and all three have always been `any Error` — but a host
+  that pattern-matches the payload as `FFmpegError` will stop matching those
+  cases. `PrismCoreError.classify(_:)` is the replacement, and it unwraps both
+  shapes.
+- Two `HLSRemuxer` guards that reported `noVideoStream` when handed no format
+  context now report `openProducedNoContext` (internal type, no API change).
+  They were never a verdict about the source — no stream list had been walked —
+  and leaving them merged would have had the taxonomy tell a host "audio-only"
+  about a file it never looked inside. `.noVideoStream` now means only what it
+  says.
+- **A host can supply the bytes itself.** `PrismCoreInput` is a public
+  read/seek/length protocol, handed to the engine as a factory
+  (`input:` on `PrismCoreSession`'s initializers and
+  `readingCurrentDisplay`, on `SourceProbe.probe`/`open`/`openDetached`, and
+  on `SeekPreviewService`), so sources libavformat cannot open on its own —
+  an SMB share reached through the host's own client, a debrid or torrent
+  session, an encrypted store, a file inside a disc image — play through the
+  remux path like anything else. It is a **factory** rather than an instance
+  because a session opens its source more than once (probe, producer, scrub
+  preview) and those contexts read from different positions at the same time;
+  one shared cursor would corrupt all of them intermittently. The adapter
+  installs an `avio_alloc_context` on the format context the same way the
+  HTTP range reader does, under the same `ReadInterruptGuard` (installed
+  before `avformat_open_input`, so a host read that blocks is still
+  abortable), answers `AVSEEK_SIZE` from the input's `length`, and defers the
+  host's own seek to the next read — libavformat seeks far more often than it
+  reads from the new position, and on these transports a seek is a round
+  trip. Errors thrown by the host come back typed
+  (`PrismCoreInputError.readFailed` / `.seekFailed`, wrapping the host's own
+  error) instead of as FFmpeg's `-EIO`. **No behaviour change without one:**
+  every path keeps native FFmpeg I/O when no factory is given.
+- An input that reports `length == nil` is refused at open with
+  `PrismCoreInputError.notSeekable`. It is refused rather than tolerated
+  because the half-working shape is silent: with the gate removed,
+  `h264_aac_30s.mkv` behind a length-less input opened fine, reported its
+  full 30.023 s duration and planned six keyframe-aligned segments — and then
+  a fetch of the last of them blocked for 45.4 s before the connection
+  dropped, with nothing resident, where the same bytes behind a seekable
+  input served it in 2 ms. The avio context still reports `seekable = 0` and
+  fails backward seeks honestly; only the engine's entry points refuse.
+- **The audio delay can be changed while the title is playing.** It is a
+  lip-sync control — a viewer turns it with the picture in front of them — and
+  a value fixed at construction was the one shape the feature could not have.
+  The clamp is unchanged (+/-2 s, non-finite becomes zero), and video,
+  subtitles and the source clock stay untouched.
+
+  `SoftwarePlaybackPipeline.setAudioDelaySeconds(_:completion:)` is in force
+  when it has run: the offset is applied where a decoded buffer reaches the
+  renderer, so the call flushes the audio renderer and refills it from the
+  source at the playhead — the move a track switch already made, now shared
+  between the two. The cost is a gap of decode-to-playhead time; the clock and
+  the video renderer never see it. Setting the offset it already has is a
+  no-op that reports success, so a slider settling back on its old value
+  costs no gap.
+
+  `PrismCoreSession.setAudioDelaySeconds(_:)` cannot be, and says so. The
+  engine is serving fMP4 segments that were written with the previous offset,
+  and the offset moves audio dts, which cannot step backwards inside a
+  fragment the muxer is already writing (`av_interleaved_write_frame` refuses
+  it). The call therefore asks the producer to re-anchor at the playhead and
+  returns `.pendingReanchor`; at that re-anchor the new offset goes in force
+  and **every segment written with the old one is discarded**, so a later
+  backward seek cannot serve audio at the offset the viewer just corrected
+  away from. `audioDelaySeconds` keeps naming what is actually being served
+  and `pendingAudioDelaySeconds` names a request that has not landed yet, so a
+  host can report the re-buffer honestly instead of showing a correction that
+  has not happened. A session whose source could not be planned (live, or a
+  container with no usable index) never re-anchors: it answers `.unsupported`
+  and stores nothing, because a request that can never arrive is worse than a
+  refusal. Fallback sessions carry the value the host last asked for.
+
+### Validation and limits
+
+- Synthetic macOS tests cover the software change at negative, zero-crossing
+  and positive offsets (the refilled audio presents AT the playhead, which
+  fails by the whole offset if either the rewind or the shift misses it), the
+  runtime clamp, the no-op, a refusal after stop, and on the remux path: the
+  pending report, the adoption at the re-anchor, the re-anchored segment's
+  bytes carrying the new offset, the discarded old segments, and a negative
+  offset still writing nothing below the timeline's origin.
+- What is NOT covered: AVPlayer's own buffer draining at the old offset, and
+  whether the result is audibly in sync — both need a device. The re-anchor
+  reproduces from the playhead, so a delay change costs the same re-buffer a
+  seek does.
+- **`preferredAudioLanguage:` / `preferredSubtitleLanguage:` at session
+  construction.** Which rendition carried `DEFAULT` was decided by the source's
+  own ordering, so a viewer who wants Czech audio mounted the item, heard
+  English, and switched — a visible wrong-language moment at every start, and
+  on the remux path a track switch is not free. The hints steer three things
+  and only those three: which audio rendition is flagged `DEFAULT` (`chooseAudio`
+  gains a rung above the container's *original* and *default* flags), which
+  subtitle rendition is flagged `DEFAULT=YES,AUTOSELECT=YES` (the one exception
+  to the blanket `NO` those renditions otherwise carry — the ban exists so AVKit
+  does not turn subtitles on for people who never asked, and a host passing this
+  parameter is the person having asked), and — because dialogue boost derives
+  from the default track — which track a boost level is built from.
+
+  Matching is tolerant, because container tags are a mess: 639-2/B (`cze`),
+  639-2/T (`ces`) and 639-1 (`cs`) are one language, a bare tag matches a
+  regioned one (`pt` ↔ `pt-BR`) with an exact region scoring higher, case and
+  underscores are normalized, and `und` / empty are not languages. No table
+  was written for it: `Locale.canonicalLanguageIdentifier(from:)` folds every
+  one of those cases honestly (probed on this toolchain before it was trusted).
+  The obvious alternative does not —
+  `Locale.Language(identifier: "cze").languageCode?.identifier(.alpha2)` returns
+  **nil**, so a matcher built on `Locale.Language` silently fails on exactly the
+  bibliographic tags that made tolerant matching necessary.
+
+  A no-match is a no-op, never an error and never an empty selection: the
+  source's own default stands. No track is dropped — every viable track is still
+  an alternate rendition — and no decode, bridge or stream-copy decision changes;
+  a preferred track this build can neither copy nor bridge is passed over, since
+  a rendition AVPlayer cannot play is worse than the wrong language.
+- **`PrismCoreSession.startupCheckpoints()` — the stages of `start()`, as they
+  happen.** `start(startupTimeout: .seconds(20))` was a black box for up to
+  twenty seconds: a host could show a spinner and nothing else, unable to tell
+  "still opening a slow origin over SMB" from "probed fine, muxing the first
+  segment", and unable to give up early on the one that is actually hopeless.
+  It now hands back an `AsyncStream<StartupCheckpoint>` carrying the five
+  stages the session already passed through — `.sourceOpened` (open +
+  `find_stream_info` returned), `.streamInfoResolved(SourceInfo)` (the probe's
+  verdict, published even for a source the remux is about to refuse),
+  `.segmentPlanReady(origin:segments:)`, `.firstVideoSegmentWritten(index:)`
+  and `.playlistServable(URL)` — each stamped with the time since the `start()`
+  call, at the moment it happened. A stream, not a handler (the `cue handler`
+  precedent), because startup has a terminus and the terminus is the point: it
+  finishes on success, on failure, and on `stop()`, so a spinner always has
+  something that ends it.
+  - `origin` distinguishes a plan taken from `KeyframeIndexCache` (which also
+    skips the index-load seek) from one built here and from a source that got
+    no trustworthy plan at all — three very different costs a host may want to
+    explain.
+  - Deliberately **no percentage**: nobody knows in advance how long a probe
+    over a slow origin takes, so a fraction would be a number invented to fill
+    a bar. Stages with timestamps are things that happened.
+  - Registration must precede `start()` (`SessionError.alreadyStarted`
+    otherwise), and is *not* replayed onto `makeMuxedFallbackSession()` /
+    `makeMasterRejectionFallbackSession()` — a fallback's startup is its own,
+    and the host registers again on the clone. Costs nothing when nobody
+    registers: the producer's sink stays `nil`.
+- **An opt-in LAN-reachable server, so a session can be AirPlayed to a real
+  receiver.** The loopback bind is correct for on-device playback and fatal for
+  AirPlay: an Apple TV or AirPlay 2 TV fetches the playlist and every segment
+  itself, and `127.0.0.1` resolves to the receiver — which took the whole
+  master playlist, native WebVTT renditions included, off the table.
+  `PrismCoreSession(… reachability: .localNetworkUnencryptedForAirPlay)` binds
+  a LAN IPv4 interface instead and returns
+  `http://<address>:<port>/<token>/master.m3u8`; the token is the first path
+  component, so every relative reference inside the playlists inherits it
+  without the playlist writers knowing it exists. Default is
+  `.loopbackOnly` and byte-identical to before.
+  - Interface choice is deliberate: `getifaddrs`, up *and* running, no
+    loopback or point-to-point links, tunnels / peer-to-peer radios /
+    `anpi` / self-assigned `169.254` addresses excluded, `en` preferred over
+    unknown over `bridge`, ties broken on the interface number. One address is
+    bound rather than `0.0.0.0`, so a VPN or an Internet Sharing bridge is
+    never exposed. No interface at all throws `NoLocalNetworkInterface` rather
+    than publishing a URL nobody can reach.
+  - IPv6 is explicitly out of scope (bracketed literals, `%zone` on
+    link-local, and rotating privacy addresses that would make a mid-session
+    address change routine).
+  - Every request is gated on a 192-bit CSPRNG token, in the path or in
+    `X-PrismCore-Token`, compared in constant time and refused with `404` —
+    not `403`, so a wrong token looks exactly like a wrong path. The gate runs
+    ahead of the method check; every existing hardening guarantee (traversal,
+    `GET`/`HEAD` only, request-line and header caps, per-connection budget,
+    idle timeout, slow-serve framing) is now covered by the same tests in both
+    modes.
+  - An address that moves under a running session (Wi-Fi to Ethernet, DHCP
+    change) is caught by `NWPathMonitor`: the server does not re-bind — the URL
+    is already inside the `AVPlayerItem` — it answers `503` and reports
+    `session.serviceAddress == .addressLost(…)`, so a host can stop and start a
+    new session instead of waiting on a dead URL. An address that returns
+    resumes serving.
+  - **Residual risk, recorded in the README and in the API documentation: this
+    is cleartext HTTP on the local network.** Anyone on that LAN who observes
+    the traffic sees the token, the playlist and the media bytes, and anyone
+    holding the token can fetch the session's segments while it runs. The token
+    makes the server unguessable, not private.
+- **Embedded CEA-608 closed captions become real subtitle renditions.** These
+  captions are not a demuxable stream: they ride inside the video elementary
+  stream, in H.264 / HEVC SEI `user_data_registered_itu_t_t35` messages with
+  ATSC A/53 (`GA94`) payloads, as `cc_data` byte triplets. Every US broadcast
+  recording, MPEG-TS capture and a good share of disc rips carries them, and
+  until now this engine could not see them at all — nor could any host on top
+  of it. They are now decoded during the remux read into the same segmented
+  WebVTT machinery the text and OCR paths already use, so CC1…CC4 arrive as
+  genuine `AVMediaSelectionOption`s and survive PiP, AirPlay and external
+  display like every other text track. Pop-on, roll-up and paint-on; the
+  control codes, preamble addressing and the basic, special and extended
+  character sets; renditions labelled by channel, plus the video track's
+  language where the container declares one; cues also delivered through the
+  existing `TimedTextCue` host tap under a synthetic negative stream index
+  (CC1 is `-1`), which cannot collide with a demuxed track's.
+  - `HEVCNALUnits` grew a read-only `scan` that also frames **H.264** NAL
+    headers and **Annex-B** start codes, rather than a second parser existing
+    beside it. The rewrite walk is untouched: it still refuses a mis-framed
+    packet outright, because its caller splices bytes back into the bitstream.
+  - **Caption bytes are reordered from decode order to presentation order
+    before they reach the decoder.** `av_read_frame` hands packets over in
+    decode order, and 608 is a stateful terminal — replayed out of order on a
+    stream with B-frames, an erase lands before the flip it was meant to end
+    and the screen shows the caption before last. The damage is wrong *text*,
+    not a wrong timestamp, which is why the reorder window is sized to
+    H.264's own maximum reorder depth and drained at every segment boundary.
+  - A caption has no end time on the wire — the wire says "erase" or "flip",
+    and whatever was on screen until then was the caption. Cue intervals are
+    synthesised from exactly those commands, split at segment boundaries, and
+    capped at ten seconds, the same cap the bitmap path uses so a caption
+    whose erase never arrives cannot stand for the rest of the film.
+  - Sources without captions pay nothing in the copy loop: a bounded packet
+    scan before the first segment settles the question, and the per-packet tap
+    is never installed when the answer is no. Absence cannot be proven more
+    cheaply than that — nothing in a container declares that its video has no
+    captions — so the scan is capped at 28 video packets, stops early on the
+    first printed character, and is skipped entirely for a codec with no SEI
+    or an input that could not be rewound afterwards.
+  - New fuzz target `a53-captions` over the SEI walk, the T.35 message loop
+    and the terminal, with invariants on the cues (ordered, capped, non-empty,
+    WebVTT-safe), plus its seed.
+- **CEA-708 is deliberately declined, not half-decoded.** DTVCC packets are
+  recognised in `cc_data` and skipped. A service decode means the window model
+  — up to eight windows with their own anchors, sizes, pen states and row
+  locks — and a partial one draws text in the wrong place while presenting
+  itself as a working caption track. On real content it costs nothing, since
+  effectively every 708 encoder emits the 608 compatibility bytes too; a
+  stream carrying only 708 gets no rendition rather than a broken one. Said
+  out loud in the README and in `ClosedCaptionReader`.
+
 ## [2.3.0] — 2026-09-16
 
 ### Added

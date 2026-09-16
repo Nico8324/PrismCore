@@ -676,10 +676,14 @@ public enum SourceProbe {
         isBridgeable(codecID)
     }
 
-    public static func probe(url: URL, httpHeaders: [String: String] = [:]) throws -> SourceInfo {
+    public static func probe(
+        url: URL,
+        httpHeaders: [String: String] = [:],
+        input: PrismCoreInputFactory? = nil
+    ) throws -> SourceInfo {
         // The context is closed when the returned `ProbedSource` goes out of
         // scope here — this overload is for callers that only want the answer.
-        try open(url: url, httpHeaders: httpHeaders).info
+        try open(url: url, httpHeaders: httpHeaders, input: input).info
     }
 
     /// Probe a source and **keep the open context**, so a session over the same
@@ -719,13 +723,15 @@ public enum SourceProbe {
         url: URL,
         httpHeaders: [String: String] = [:],
         budget: Duration = SourceOpenTuning.probeBudget,
-        coordinatedHTTP: Bool = false
+        coordinatedHTTP: Bool = false,
+        input: PrismCoreInputFactory? = nil
     ) async throws -> ProbedSource {
         try Task.checkCancellation()
         let outcome: Result<ProbedSource, any Error> = await withCheckedContinuation { continuation in
             let thread = ProducerThread(name: "cz.zmrhal.prismcore.probe") {
                 continuation.resume(returning: Result {
-                    try open(url: url, httpHeaders: httpHeaders, budget: budget, coordinatedHTTP: coordinatedHTTP)
+                    try open(url: url, httpHeaders: httpHeaders, budget: budget,
+                             coordinatedHTTP: coordinatedHTTP, input: input)
                 })
             }
             // Kept alive by its own closure until it exits; nothing to join.
@@ -739,11 +745,16 @@ public enum SourceProbe {
         return try outcome.get()
     }
 
+    /// - Parameter input: a host-supplied byte source (`PrismCoreInput`) for a
+    ///   transport libavformat cannot open itself. One instance is taken for
+    ///   this open; `url` is then only a naming hint for format probing, never
+    ///   fetched. `nil` (the default) keeps native FFmpeg I/O.
     public static func open(
         url: URL,
         httpHeaders: [String: String] = [:],
         budget: Duration = SourceOpenTuning.probeBudget,
-        coordinatedHTTP: Bool = false
+        coordinatedHTTP: Bool = false,
+        input inputFactory: PrismCoreInputFactory? = nil
     ) throws -> ProbedSource {
         // The interrupt guard has to exist BEFORE the open — the blocking
         // reads check the URLContext's copy of the callback, taken at
@@ -752,7 +763,13 @@ public enum SourceProbe {
         // inherits this very context (see `ReadInterruptGuard`).
         let interruptGuard = ReadInterruptGuard()
         var input: UnsafeMutablePointer<AVFormatContext>? = interruptGuard.makeContext()
-        if coordinatedHTTP, ["http", "https"].contains(url.scheme?.lowercased() ?? ""), let input {
+        // A host-supplied input wins over the coordinated HTTP reader: the
+        // host asked to provide the bytes itself, and the two would otherwise
+        // both claim `pb`.
+        if let inputFactory, let input {
+            do { try interruptGuard.installCustomInput(on: input, factory: inputFactory) }
+            catch { avformat_free_context(input); throw error }
+        } else if coordinatedHTTP, ["http", "https"].contains(url.scheme?.lowercased() ?? ""), let input {
             do { try interruptGuard.installHTTPInput(on: input, url: url, headers: httpHeaders) }
             catch { avformat_free_context(input); throw error }
         }
@@ -779,7 +796,10 @@ public enum SourceProbe {
                 "avformat_open_input"
             )
         } catch {
-            throw Failure.openFailed(error)
+            // `originFailure` first: over the coordinated reader the libav*
+            // code is always `-EIO`, and wrapping that is how a 403 used to
+            // reach a host as "Input/output error".
+            throw Failure.openFailed(interruptGuard.customInputFailure ?? interruptGuard.originFailure ?? error)
         }
         guard let input else { throw Failure.noStreams }
         let openedAt = clock.now
@@ -805,7 +825,7 @@ public enum SourceProbe {
                 avformat_find_stream_info(input, nil), "avformat_find_stream_info"
             )
         } catch {
-            throw closeAndThrow(error)
+            throw closeAndThrow(interruptGuard.customInputFailure ?? interruptGuard.originFailure ?? error)
         }
         // `find_stream_info` swallows aborted reads: cut off mid-analysis it
         // returns success with half-filled parameters, and a half-analysed
@@ -813,8 +833,12 @@ public enum SourceProbe {
         // The clock is the honest witness — still-armed and expired means the
         // analysis cannot be trusted, whatever it returned.
         if interruptGuard.shouldInterrupt {
+            // An origin that spent the whole budget refusing us gets named as
+            // the refusal it was: the expiry is the symptom, the 429 is the
+            // reason, and only one of the two tells a host when to come back.
             throw closeAndThrow(Failure.openFailed(
-                FFmpegError(code: swift_AVERROR_EXIT(), operation: "probe budget exhausted")
+                interruptGuard.originFailure
+                    ?? FFmpegError(code: swift_AVERROR_EXIT(), operation: "probe budget exhausted")
             ))
         }
         let analyzedAt = clock.now
@@ -837,7 +861,7 @@ public enum SourceProbe {
         }
 
         return ProbedSource(
-            info: info, url: url, httpHeaders: httpHeaders,
+            info: info, url: url, httpHeaders: httpHeaders, inputFactory: inputFactory,
             context: input, interruptGuard: interruptGuard,
             timing: ProbeTiming(
                 open: probeStart.duration(to: openedAt),

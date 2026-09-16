@@ -249,11 +249,17 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
     /// call back on. That is the whole concurrency story: no locks around
     /// libav* state, because there is only ever one thread in it.
     private let feedQueue = DispatchQueue(label: "cz.aether.prismcore.software.feed", qos: .userInitiated)
-    /// Fixed for this pipeline; create a replacement to change already queued
-    /// audio. Positive values present audio later. Range: -2...2 seconds.
-    public private(set) var audioDelaySeconds: Double = 0
+    /// The offset audio is being enqueued with, in seconds. Positive values
+    /// present audio later. Range: -2...2 seconds. Changeable while playing —
+    /// see `setAudioDelaySeconds(_:completion:)`.
+    ///
+    /// Under `stateLock` rather than feed-queue confined: the feed queue
+    /// writes it, and the host reads it from wherever its lip-sync control
+    /// lives.
+    public var audioDelaySeconds: Double { stateLock.withLock { storedAudioDelaySeconds } }
 
     private let stateLock = NSLock()
+    private var storedAudioDelaySeconds: Double = 0
     private var storedState: State = .idle
     private var storedDurationSeconds: Double?
     private var storedSourceInfo: SourceInfo?
@@ -397,7 +403,7 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
         self.timeline = timeline
         self.pacing = pacing
         self.allowHardwareDecode = allowHardwareDecode
-        self.audioDelaySeconds = AudioDelay.normalized(audioDelaySeconds)
+        self.storedAudioDelaySeconds = AudioDelay.normalized(audioDelaySeconds)
     }
 
     deinit {
@@ -668,6 +674,103 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
         drainPending()
     }
 
+    /// Re-read the source from where the listener is and refill the audio
+    /// renderer from there, leaving the clock and the picture alone. What a
+    /// track switch and an offset change both need, and the only part of
+    /// either that is delicate. Feed queue only.
+    ///
+    /// - Parameter install: the change itself, applied between the rewind and
+    ///   the flush — a new decoder, or nothing. Runs on the feed queue.
+    private func refeedAudioFromPlayhead(
+        _ input: UnsafeMutablePointer<AVFormatContext>, installing install: () -> Void
+    ) {
+        // Rewind the demuxer to the clock's present so the audio picks up
+        // where the listener is, not where the read cursor had run ahead to.
+        // `.invalid` clock (never anchored) means nothing has played yet —
+        // the read position IS the present, skip the seek.
+        let now = timeline.currentTime
+        // Positive output delay means the source audio we need is earlier
+        // than the playhead; negative delay needs later source samples.
+        let audioTarget = now - CMTime(seconds: audioDelaySeconds, preferredTimescale: 1_000_000)
+        let rewound = now.isNumeric && seekDemuxer(input, to: min(now, audioTarget))
+
+        install()
+        pendingAudio.removeAll()
+        audioSink.flush()
+        cancelEndObserver()
+        discardAudioBefore = audioTarget
+
+        if rewound {
+            // A refused rewind at EOF cannot enqueue a new audio boundary;
+            // keep the old horizon so audio-only playback does not end now.
+            lastEnqueuedAudioEnd = .invalid
+            // The rewind re-reads video the renderer already holds: flush
+            // the decoder (its reference chain broke with the seek) and
+            // drop re-decoded frames up to the renderer's horizon, so the
+            // video path never notices anything happened.
+            videoDecoder?.flushBuffers()
+            clearPendingVideo()
+            discardVideoUpTo = lastEnqueuedVideoPTS
+            discardIsBounded = false
+            // The rewind lands on a keyframe before the present; audio
+            // from that gap is late (playing) or a stale burst on resume
+            // (paused) — drop it here rather than trusting the renderer.
+            reachedEOF = false
+            videoTailPending = false
+        }
+    }
+
+    /// Change the audio offset while the title is playing — lip-sync
+    /// correction is something a viewer turns with the picture in front of
+    /// them, not a value chosen before the first frame.
+    ///
+    /// Clamped to +/-2 s; a non-finite value becomes zero. Video, subtitles
+    /// and the clock are untouched, and the rate never changes.
+    ///
+    /// **When it takes effect.** On this path, at once: the offset is applied
+    /// where a decoded buffer is handed to the renderer, so nothing on disk
+    /// or in a container constrains it. What the renderer already holds was
+    /// shifted by the OLD value, so the call flushes it and refills from the
+    /// source at the playhead — the same move a track switch makes. The
+    /// audible cost is a gap of decode-to-playhead time, not a re-buffer;
+    /// `audioDelaySeconds` reports the new value as soon as the call has run,
+    /// and it is then true of everything the renderer holds.
+    ///
+    /// Works while paused (the new offset is primed at the paused position)
+    /// and refuses only what a track switch refuses: a pipeline that is not
+    /// in a playable state.
+    ///
+    /// - Parameter completion: called on the feed queue with whether the
+    ///   offset changed. Optional — a slider can fire and forget and read
+    ///   `audioDelaySeconds` for the settled answer.
+    public func setAudioDelaySeconds(
+        _ seconds: Double, completion: (@Sendable (Bool) -> Void)? = nil
+    ) {
+        let value = AudioDelay.normalized(seconds)
+        feedQueue.async { [self] in
+            guard let input, !stopped, storedStateIsResumable else {
+                completion?(false)
+                return
+            }
+            guard value != audioDelaySeconds else {
+                // No flush for a change that changes nothing: a slider that
+                // settles back on its old value must not cost a gap.
+                completion?(true)
+                return
+            }
+            stateLock.withLock { storedAudioDelaySeconds = value }
+            if audioDecoder != nil {
+                refeedAudioFromPlayhead(input) {
+                    // The demuxer moved; the decoder's frames belong to the
+                    // old read position.
+                    audioDecoder?.flushBuffers()
+                }
+            }
+            pump()
+            completion?(state != .failed)
+        }
+    }
+
     /// Switch the audio to another of the source's tracks, mid-playback,
     /// without touching the clock or the video renderer (issue #35).
     ///
@@ -726,39 +829,12 @@ public final class SoftwarePlaybackPipeline: @unchecked Sendable {
             // up where the listener is, not where the read cursor had run
             // ahead to. `.invalid` clock (never anchored) means nothing has
             // played yet — the read position IS the present, skip the seek.
-            let now = timeline.currentTime
-            // Positive output delay means the source audio we need is earlier
-            // than the playhead; negative delay needs later source samples.
-            let audioTarget = now - CMTime(seconds: audioDelaySeconds, preferredTimescale: 1_000_000)
-            let rewound = now.isNumeric && seekDemuxer(input, to: min(now, audioTarget))
-
             let hadAudio = audioDecoder != nil
-            audioDecoder?.close()
-            audioDecoder = newDecoder
-            audioStreamIndex = Int32(streamIndex)
-            stateLock.withLock { storedSelectedAudioStreamIndex = Int32(streamIndex) }
-            pendingAudio.removeAll()
-            audioSink.flush()
-            cancelEndObserver()
-            discardAudioBefore = audioTarget
-
-            if rewound {
-                // A refused rewind at EOF cannot enqueue a new audio boundary;
-                // keep the old horizon so audio-only playback does not end now.
-                lastEnqueuedAudioEnd = .invalid
-                // The rewind re-reads video the renderer already holds: flush
-                // the decoder (its reference chain broke with the seek) and
-                // drop re-decoded frames up to the renderer's horizon, so the
-                // video path never notices the switch happened.
-                videoDecoder?.flushBuffers()
-                clearPendingVideo()
-                discardVideoUpTo = lastEnqueuedVideoPTS
-                discardIsBounded = false
-                // The rewind lands on a keyframe before the present; audio
-                // from that gap is late (playing) or a stale burst on resume
-                // (paused) — drop it here rather than trusting the renderer.
-                reachedEOF = false
-                videoTailPending = false
+            refeedAudioFromPlayhead(input) {
+                audioDecoder?.close()
+                audioDecoder = newDecoder
+                audioStreamIndex = Int32(streamIndex)
+                stateLock.withLock { storedSelectedAudioStreamIndex = Int32(streamIndex) }
             }
 
             if !hadAudio {

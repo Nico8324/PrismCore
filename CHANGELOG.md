@@ -8,6 +8,21 @@ source-compatible.)
 
 ## [Unreleased]
 
+## [3.0.0] — 2026-09-16
+
+Eight additions in one release: the host can supply the bytes, classify a
+failure, read captions the video stream carries, reach the server from an
+AirPlay receiver, name the language it wants, clone a session with one setting
+moved, move the audio delay while the title plays, and watch startup happen.
+
+**Why a major.** Nothing here changes a signature, so existing call sites
+compile untouched — but two things a host may have relied on did move:
+`SessionError` gained `alreadySuperseded`, which breaks an exhaustive `switch`,
+and `SourceProbe.Failure.openFailed`, `SessionError.startupTimedOut` and
+`remuxError` now sometimes carry a `PrismCoreError` where they used to carry an
+`FFmpegError`, so a host pattern-matching that payload stops matching.
+`PrismCoreError.classify(_:)` reads both shapes.
+
 ### Added
 
 - **`PrismCoreSession.makeSession(changing:)` — one public door for "same

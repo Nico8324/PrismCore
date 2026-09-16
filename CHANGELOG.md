@@ -35,7 +35,40 @@ source-compatible.)
   up with several producers and several servers on one title. Hosts that
   `switch` exhaustively over `SessionError` need the new case.
 
+- **`PrismCoreError` — a failure taxonomy a host can branch on.** Until now a
+  host got `SessionError.startupTimedOut(underlying:)` wrapping an `FFmpegError`
+  whose only distinguishing feature was an English string from libavformat, so
+  "your token expired", "the server is throttling us", "this file has no video"
+  and "the disk is full" were one failure with four different remedies.
+  `PrismCoreError.classify(_:)` reads any of them — plus the `AVPlayerItem.error`
+  the host gets back from AVFoundation — into one of: `originRefused`
+  (401/403/407), `originRateLimited` (429/503/509, carrying the origin's own
+  `Retry-After` in seconds), `originUnreachable`, `noVideoStream`,
+  `videoCodecNotRemuxable` (with the stream index), `videoCodecUnplayable`,
+  `startupBudgetExpired`, `masterRejectedByPlayer` (`MasterRejection` folded in,
+  not duplicated), `workDirectoryOutOfSpace`, `ffmpeg` (raw code + message) and
+  `unknown`. `PrismCoreSession.remuxFailure` is the same classification of
+  `remuxError`.
+- The HTTP status the coordinated reader already computed is no longer thrown
+  away. `HTTPRangeInput` can only answer libavformat in errno, so every origin
+  verdict used to reach the open site as `-EIO`; it now latches what it saw and
+  the open/read sites ask for that first. This is what makes a 403 tell a host
+  to re-authenticate instead of "Input/output error". The latch is cleared on
+  the first successful read, so a refusal the retry loop rode out is not
+  reported forty minutes later.
+- A 429 that spends the whole probe budget is reported as the rate limit, not as
+  the budget expiry it caused — the expiry is the symptom, the status is the
+  reason, and only one of the two says when to come back.
+- `FFmpegError.message` (libav*'s own text, without the operation wrapped around
+  it), and reconstructed `AVERROR_HTTP_*` shims. Those are the only libavformat
+  codes that report an origin's *status* rather than a symptom, which is why
+  they are worth mapping; everything else keeps its raw code and message rather
+  than being squeezed into a category it has not earned. A test checks the
+  reconstructed tags against `av_strerror`'s own table, not against the
+  arithmetic that produced them.
+
 ### Changed
+
 
 - `makeMuxedFallbackSession()` and `makeMasterRejectionFallbackSession()` now
   go *through* `makeSession(changing:)` instead of each minting their own
@@ -44,6 +77,20 @@ source-compatible.)
   apart from the public path. The muxed fallback keeps carrying `dialogueBoost`
   it cannot serve, so a clone taken off the fallback session does not silently
   forget the host ever asked for it.
+
+- `SourceProbe.Failure.openFailed(_:)`, `SessionError.startupTimedOut(underlying:)`
+  and `PrismCoreSession.remuxError` now sometimes carry a `PrismCoreError` where
+  they carried an `FFmpegError` before. **Source-compatible** — the declared
+  types are unchanged and all three have always been `any Error` — but a host
+  that pattern-matches the payload as `FFmpegError` will stop matching those
+  cases. `PrismCoreError.classify(_:)` is the replacement, and it unwraps both
+  shapes.
+- Two `HLSRemuxer` guards that reported `noVideoStream` when handed no format
+  context now report `openProducedNoContext` (internal type, no API change).
+  They were never a verdict about the source — no stream list had been walked —
+  and leaving them merged would have had the taxonomy tell a host "audio-only"
+  about a file it never looked inside. `.noVideoStream` now means only what it
+  says.
 
 ## [2.3.0] — 2026-09-16
 

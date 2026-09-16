@@ -215,6 +215,43 @@ Built-in panels (iPhone, iPad, Mac) engage HDR on demand and skip all of this.
 as the backstop for the one state no API can prove: Match Content switched off on
 an HDR-capable panel.
 
+### Knowing why a session failed
+
+`PrismCoreError.classify(_:)` turns anything this engine (or the host's
+`AVPlayer`) threw into one machine-readable case, so a failure can be acted on
+rather than logged:
+
+```swift
+do {
+    let playlist = try await session.start()
+    …
+} catch {
+    switch PrismCoreError.classify(error) {
+    case .originRefused:                     await refreshToken()
+    case .originRateLimited(_, let after, _): await backOff(after ?? 5)
+    case .videoCodecNotRemuxable:            routeToSoftwarePath()
+    case .masterRejectedByPlayer:            try await session.makeMasterRejectionFallbackSession()
+    default:                                 show(error)
+    }
+}
+```
+
+The cases: `originRefused` (401/403/407), `originRateLimited` (429/503/509, with
+the origin's own `Retry-After`), `originUnreachable`, `noVideoStream`,
+`videoCodecNotRemuxable`, `videoCodecUnplayable`, `startupBudgetExpired`,
+`masterRejectedByPlayer`, `workDirectoryOutOfSpace`, `ffmpeg` (raw code and
+message, for the libav* failures with no honest mapping) and `unknown`.
+`retryability` is three-valued — `.retryable`, `.permanent`, `.unknown` — because
+for a startup budget or a full volume this engine genuinely cannot say, and a
+`Bool` would have to invent an answer. After startup, `session.remuxFailure` is
+the same classification of `session.remuxError`.
+
+Every case is something the engine observed. Where it cannot separate two
+situations they share one case: an origin that never answered and one that
+vanished mid-session are both `originUnreachable`, because the evidence at the
+failure site is identical — the host knows which it was from whether `start()`
+had returned.
+
 ## How it works
 
 ```

@@ -218,6 +218,15 @@ public actor PrismCoreSession {
     /// this when AVPlayer reports a stalled item.
     public private(set) var remuxError: (any Error)?
 
+    /// The same failure, classified — what the host branches on.
+    ///
+    /// `remuxError` keeps its shape and meaning (a host logging it verbatim
+    /// keeps working); this is the machine-readable read of it. Both are `nil`
+    /// until the remux dies.
+    public var remuxFailure: PrismCoreError? {
+        remuxError.map(PrismCoreError.classify)
+    }
+
     /// The display criteria to program before AVPlayer loads this session's
     /// playlist — step 1 of the tvOS playback contract (see the type doc).
     ///

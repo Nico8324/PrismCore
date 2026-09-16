@@ -7,11 +7,17 @@ public struct FFmpegError: Error, CustomStringConvertible {
     public let code: Int32
     public let operation: String
 
-    public var description: String {
+    /// FFmpeg's own text for `code`, without the operation wrapped around it —
+    /// what `PrismCoreError.ffmpeg` carries, so a host can log the engine's
+    /// verdict and the library's wording separately.
+    public var message: String {
         var buffer = [CChar](repeating: 0, count: Int(AV_ERROR_MAX_STRING_SIZE))
         av_strerror(code, &buffer, buffer.count)
-        let message = String(cString: buffer)
-        return "\(operation) failed: \(message) (\(code))"
+        return String(cString: buffer)
+    }
+
+    public var description: String {
+        "\(operation) failed: \(message) (\(code))"
     }
 
     /// Throw when `code` is a libav* failure (negative).
@@ -68,3 +74,22 @@ func swift_AVERROR_EXIT() -> Int32 {
         | (Int32(UInt8(ascii: "I")) << 16) | (Int32(UInt8(ascii: "T")) << 24)
     return -tag
 }
+
+/// `FFERRTAG(a,b,c,d)` — `MKTAG` negated, the shape every named libav* error
+/// code is built from. Computed rather than pasted as four magic negative
+/// integers, whose bytes nobody can check by eye.
+private func ffErrorTag(_ a: UInt8, _ b: UInt8, _ c: UInt8, _ d: UInt8) -> Int32 {
+    -(Int32(a) | (Int32(b) << 8) | (Int32(c) << 16) | (Int32(d) << 24))
+}
+
+/// The `AVERROR_HTTP_*` family. These are the only libavformat codes that
+/// report an origin's *status* rather than a symptom, which is what makes them
+/// worth reconstructing: without them an expired token and a truncated file
+/// both reach a host as "Input/output error".
+func swift_AVERROR_HTTP_BAD_REQUEST() -> Int32 { ffErrorTag(0xF8, UInt8(ascii: "4"), UInt8(ascii: "0"), UInt8(ascii: "0")) }
+func swift_AVERROR_HTTP_UNAUTHORIZED() -> Int32 { ffErrorTag(0xF8, UInt8(ascii: "4"), UInt8(ascii: "0"), UInt8(ascii: "1")) }
+func swift_AVERROR_HTTP_FORBIDDEN() -> Int32 { ffErrorTag(0xF8, UInt8(ascii: "4"), UInt8(ascii: "0"), UInt8(ascii: "3")) }
+func swift_AVERROR_HTTP_NOT_FOUND() -> Int32 { ffErrorTag(0xF8, UInt8(ascii: "4"), UInt8(ascii: "0"), UInt8(ascii: "4")) }
+func swift_AVERROR_HTTP_TOO_MANY_REQUESTS() -> Int32 { ffErrorTag(0xF8, UInt8(ascii: "4"), UInt8(ascii: "2"), UInt8(ascii: "9")) }
+func swift_AVERROR_HTTP_OTHER_4XX() -> Int32 { ffErrorTag(0xF8, UInt8(ascii: "4"), UInt8(ascii: "X"), UInt8(ascii: "X")) }
+func swift_AVERROR_HTTP_SERVER_ERROR() -> Int32 { ffErrorTag(0xF8, UInt8(ascii: "5"), UInt8(ascii: "X"), UInt8(ascii: "X")) }

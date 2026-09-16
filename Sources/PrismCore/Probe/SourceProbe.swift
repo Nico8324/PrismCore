@@ -779,7 +779,10 @@ public enum SourceProbe {
                 "avformat_open_input"
             )
         } catch {
-            throw Failure.openFailed(error)
+            // `originFailure` first: over the coordinated reader the libav*
+            // code is always `-EIO`, and wrapping that is how a 403 used to
+            // reach a host as "Input/output error".
+            throw Failure.openFailed(interruptGuard.originFailure ?? error)
         }
         guard let input else { throw Failure.noStreams }
         let openedAt = clock.now
@@ -805,7 +808,7 @@ public enum SourceProbe {
                 avformat_find_stream_info(input, nil), "avformat_find_stream_info"
             )
         } catch {
-            throw closeAndThrow(error)
+            throw closeAndThrow(interruptGuard.originFailure ?? error)
         }
         // `find_stream_info` swallows aborted reads: cut off mid-analysis it
         // returns success with half-filled parameters, and a half-analysed
@@ -813,8 +816,12 @@ public enum SourceProbe {
         // The clock is the honest witness — still-armed and expired means the
         // analysis cannot be trusted, whatever it returned.
         if interruptGuard.shouldInterrupt {
+            // An origin that spent the whole budget refusing us gets named as
+            // the refusal it was: the expiry is the symptom, the 429 is the
+            // reason, and only one of the two tells a host when to come back.
             throw closeAndThrow(Failure.openFailed(
-                FFmpegError(code: swift_AVERROR_EXIT(), operation: "probe budget exhausted")
+                interruptGuard.originFailure
+                    ?? FFmpegError(code: swift_AVERROR_EXIT(), operation: "probe budget exhausted")
             ))
         }
         let analyzedAt = clock.now

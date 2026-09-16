@@ -13,10 +13,18 @@ final class RangeFixtureServer: @unchecked Sendable {
     private var connections: [ObjectIdentifier: NWConnection] = [:]
     private var refusals: Int
     private var drops: Int
+    /// Answered to every request, forever. `refusals` is a transient origin
+    /// (it relents); this is one that never will — an expired token, a revoked
+    /// share — which is the difference the taxonomy has to survive.
+    private let deniedStatus: Int?
+    private let retryAfter: String
     private var requestTimes: [TimeInterval] = []
     private var resumed = false
 
-    init(media: Data, bytesPerSecond: Double = 4_000_000, firstByteDelay: Double = 0.02, refusals: Int = 0, drops: Int = 0) throws {
+    init(media: Data, bytesPerSecond: Double = 4_000_000, firstByteDelay: Double = 0.02, refusals: Int = 0,
+         drops: Int = 0, deniedStatus: Int? = nil, retryAfter: String = "1") throws {
+        self.deniedStatus = deniedStatus
+        self.retryAfter = retryAfter
         self.media = media
         self.bytesPerSecond = bytesPerSecond
         self.firstByteDelay = firstByteDelay
@@ -75,9 +83,15 @@ final class RangeFixtureServer: @unchecked Sendable {
             }
             requestTimes.append(ProcessInfo.processInfo.systemUptime)
             if drops > 0 { drops -= 1; close(connection); return }
+            if let deniedStatus {
+                let retryHeader = [429, 503, 509].contains(deniedStatus) ? "Retry-After: \(retryAfter)\r\n" : ""
+                connection.send(content: Data("HTTP/1.1 \(deniedStatus) Denied\r\n\(retryHeader)Content-Length: 0\r\nConnection: close\r\n\r\n".utf8),
+                    completion: .contentProcessed { _ in self.close(connection) })
+                return
+            }
             if refusals > 0 {
                 refusals -= 1
-                connection.send(content: Data("HTTP/1.1 429 Too Many Requests\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8),
+                connection.send(content: Data("HTTP/1.1 429 Too Many Requests\r\nRetry-After: \(retryAfter)\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8),
                     completion: .contentProcessed { _ in self.close(connection) })
                 return
             }

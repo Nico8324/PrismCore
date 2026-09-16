@@ -13,6 +13,17 @@ struct FrameChunkerTests {
         FrameChunker(frameSize: 1536, padsFinalFrame: true)
     }
 
+    /// Stock MPVKit has no eac3 encoder; with EAC3 as the only target every DTS
+    /// source left the remux path. AAC is FFmpeg's own and always present.
+    @Test("The bridge targets eac3 when the build has it and aac otherwise")
+    func targetFollowsTheBuild() {
+        let hasEAC3 = avcodec_find_encoder(AV_CODEC_ID_EAC3) != nil
+        #expect(AudioBridge.defaultTargetCodec == (hasEAC3 ? AV_CODEC_ID_EAC3 : AV_CODEC_ID_AAC))
+        #expect(AudioBridge.defaultTargetCodecName == (hasEAC3 ? "eac3" : "aac"))
+        #expect(AudioBridge.isEncoderAvailable)
+        #expect(AudioBridge.canBridge(codecID: AV_CODEC_ID_DTS) == (avcodec_find_decoder(AV_CODEC_ID_DTS) != nil))
+    }
+
     @Test("Nothing is emitted until a full encoder frame exists")
     func withholdsPartialFrames() {
         var chunker = eac3Chunker()

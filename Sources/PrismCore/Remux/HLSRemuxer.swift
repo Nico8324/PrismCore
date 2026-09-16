@@ -115,9 +115,19 @@ final class HLSRemuxer: @unchecked Sendable {
 
     /// The producer's side of the handshake, called only at a re-anchor:
     /// takes the outstanding request, if any, and makes it the one in force.
-    private func adoptRequestedAudioDelay() -> Double? {
+    ///
+    /// - Parameter invalidating: runs INSIDE the lock, before the request is
+    ///   cleared. Everything that makes the old offset's output unservable
+    ///   belongs here: the documented way to use this API is to watch
+    ///   `pendingAudioDelaySeconds` and refresh the player the moment it
+    ///   clears, so a host doing exactly that fetches at this instant. Clear
+    ///   first and that fetch is answered off disk with the offset the viewer
+    ///   just corrected away from — and AVPlayer may cache the answer past
+    ///   the deletion that follows.
+    private func adoptRequestedAudioDelay(invalidating: () -> Void) -> Double? {
         audioDelayLock.withLock {
             guard let requested = requestedAudioDelaySeconds else { return nil }
+            invalidating()
             requestedAudioDelaySeconds = nil
             effectiveAudioDelaySeconds = requested
             return requested
@@ -1250,6 +1260,12 @@ final class HLSRemuxer: @unchecked Sendable {
             for rendition in renditions {
                 renditionBytes += try rendition.cut(durationSeconds: duration)
             }
+            // The whole cut for this index is on disk now — variant and every
+            // rendition — so a superseded index becomes servable again HERE,
+            // not at the variant's `publish`: a rendition of the same index is
+            // written after it, and clearing early would let an
+            // `audioN/segNNNNN.m4s` fetch be answered with the old offset.
+            residentSegments.markProduced(index: segmentIndex - 1)
             demand?.setProducing(index: segmentIndex)
             recordAndEvict(index: segmentIndex - 1, videoBytes: media.count, renditionBytes: renditionBytes)
             // Refreshed per segment rather than once at EOF: a host that wants to
@@ -1273,7 +1289,25 @@ final class HLSRemuxer: @unchecked Sendable {
             // audio offset can be taken up: the shift moves audio dts, and
             // applying it inside a running fragment would step dts backwards —
             // `av_interleaved_write_frame` refuses that (-22).
-            let adoptedDelay = adoptRequestedAudioDelay()
+            // Marking the old output unservable happens inside the adoption,
+            // before `pendingAudioDelaySeconds` can report nil. Only the
+            // *deletion* is deferred to the unlink queue: it is filesystem
+            // work (one `removeItem` per index per rendition, a whole cache's
+            // worth at once here), and this sits on the seek path between a
+            // demuxer seek and the first packet of the new anchor. The
+            // serving path consults the store instead of waiting for the
+            // files to go — a superseded index reads as a miss, which
+            // re-anchors production and rewrites it, so nothing becomes
+            // permanently unfetchable.
+            var supersededVictims: [Int] = []
+            let adoptedDelay = adoptRequestedAudioDelay {
+                supersededVictims = residentSegments.supersedeAll()
+                // A rendition slot that carried no audio at the old offset may
+                // carry some at the new one; a stale 404 there is a rendition
+                // segment AVPlayer counts as failed. Cleared with the rest of
+                // the old verdicts, for the same reason they are.
+                demand?.clearUnproducible()
+            }
             writer = FMP4SegmentWriter()
             writer.audioDelaySeconds = audioDelaySeconds
             _ = try writer.open(input: input, plan: plan, restart: true)
@@ -1287,21 +1321,16 @@ final class HLSRemuxer: @unchecked Sendable {
                 // offset. Left there, the provider serves them as hits and a
                 // backward seek plays audio at the offset the viewer just
                 // corrected away from — the failure a delay control must not
-                // have. Discarding them makes the next fetch a miss, which
-                // re-anchors production and rewrites the segment.
-                let victims = residentSegments.retireAll()
+                // have. They stopped being servable above; here they stop
+                // taking up disk.
                 let directories = [outputDirectory] + renditions.map {
                     outputDirectory.appendingPathComponent($0.directoryName)
                 }
-                unlinkQueue.async { [residentSegments] in
-                    for victim in victims {
+                unlinkQueue.async { [residentSegments, supersededVictims] in
+                    for victim in supersededVictims {
                         residentSegments.unlinkRetired(index: victim, directories: directories)
                     }
                 }
-                // A rendition slot that carried no audio at the old offset may
-                // carry some at the new one; a stale 404 there is a rendition
-                // segment AVPlayer counts as failed.
-                demand?.clearUnproducible()
             }
             subtitles.reanchor(segmentIndex: anchor, startSeconds: Double(target) * tickSeconds)
             segmentIndex = anchor
@@ -1591,6 +1620,7 @@ final class HLSRemuxer: @unchecked Sendable {
                 if plannedPlan == nil {
                     try playlist.appendSegment(duration: finalDuration, file: file)
                 }
+                residentSegments.markProduced(index: segmentIndex)
                 recordAndEvict(index: segmentIndex, videoBytes: finalSegment.count, renditionBytes: 0)
                 // A source shorter than the first target never reaches
                 // `emitSegment`, so this is where ITS first segment lands —

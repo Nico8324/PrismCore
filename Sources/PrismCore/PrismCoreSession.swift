@@ -56,6 +56,12 @@ public actor PrismCoreSession {
     /// A requested offset the producer has not taken up yet, or `nil` when
     /// there is none. Non-nil means what is being served still carries
     /// `audioDelaySeconds`.
+    ///
+    /// The moment it clears, nothing muxed with the old offset can be served
+    /// any more: a fetch made at that instant either gets a rewritten segment
+    /// or waits for one. So "poll this, then refresh the player" is safe
+    /// without a delay of the host's own — the cost is the re-buffer
+    /// `pendingReanchor` documents, not a stale correction.
     public var pendingAudioDelaySeconds: Double? { remuxer.pendingAudioDelaySeconds }
 
     /// What `setAudioDelaySeconds(_:)` did.
@@ -554,6 +560,14 @@ public actor PrismCoreSession {
         // requests on every session cost nothing until someone picks one.
         provider.audioDemand = { [remuxer] path in
             remuxer.noteAudioDemand(path: path)
+        }
+        // And the seam that makes a runtime audio-delay change atomic from the
+        // outside: the producer marks the old offset's segments unservable
+        // before `pendingAudioDelaySeconds` clears, so a host that refreshes
+        // the player the moment it clears cannot be handed them off disk while
+        // the unlink queue is still catching up.
+        provider.isSuperseded = { [store = remuxer.residentSegments] index in
+            store.isSuperseded(index: index)
         }
         self.server = LoopbackHTTPServer(provider: provider, reachability: reachability)
     }

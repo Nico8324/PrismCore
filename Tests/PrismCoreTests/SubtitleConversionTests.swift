@@ -32,11 +32,11 @@ struct SubtitleConversionTests {
         #expect(text.contains("after"), "the words around the mangled tag must survive")
     }
 
-    @Test("Matroska ASS event: 7 fields before the text, overrides stripped")
+    @Test("Matroska ASS event: 7 fields before the text, italics kept, position lifted out")
     func matroskaASSEvent() throws {
         let payload = "0,Default,,0,0,0,,{\\pos(192,240)}{\\i1}Ahoj{\\i0}\\Nsvěte"
         let text = try #require(TextSubtitleConverter.cueText(from: Data(payload.utf8), kind: .ass))
-        #expect(text == "Ahoj\nsvěte")
+        #expect(text == "<i>Ahoj</i>\nsvěte")
     }
 
     @Test("libavcodec ASS line: numeric second field means 8 fields before the text")
@@ -116,7 +116,7 @@ struct SubtitleConversionTests {
         #expect(cues.last?.start == 4.5)
     }
 
-    @Test("VTT sidecar: header, NOTE/STYLE blocks, identifiers and cue settings dropped")
+    @Test("VTT sidecar: header, NOTE/STYLE blocks and identifiers dropped, cue settings kept")
     func vttSidecar() {
         let file = """
         WEBVTT
@@ -136,8 +136,13 @@ struct SubtitleConversionTests {
         """
         let cues = TextSubtitleConverter.cues(fromWebVTT: file)
         #expect(cues.count == 2)
-        #expect(cues.first == SubtitleCue(start: 1, end: 3, text: "short form timing"))
+        #expect(cues.first?.start == 1)
+        #expect(cues.first?.end == 3)
+        #expect(cues.first?.text == "short form timing")
+        #expect(cues.first?.settings == "line:90% align:center")
+        #expect(cues.first?.placement == TextCuePlacement(alignment: 2, anchor: .init(x: 0.5, y: 0.9)))
         #expect(cues.last?.text == "second")
+        #expect(cues.last?.settings == nil)
     }
 
     @Test("A cue whose end is not after its start is dropped")

@@ -169,10 +169,15 @@ package enum FuzzTargets {
     /// converter's whole reason to exist.
     package static func textSubtitles(_ bytes: [UInt8]) {
         let data = Data(bytes)
+        let playResolution = TextSubtitleConverter.PlayResolution(width: 1920, height: 1080)
         for kind: TextSubtitleConverter.Kind in [.subrip, .ass, .webvtt, .movText] {
-            guard let text = TextSubtitleConverter.cueText(from: data, kind: kind) else { continue }
-            assertWebVTTSafe(text, from: "cueText(\(kind))")
+            guard let converted = TextSubtitleConverter.convert(data, kind: kind, playResolution: playResolution)
+            else { continue }
+            assertWebVTTSafe(converted.text, from: "convert(\(kind))")
+            assertBalancedTags(converted.text, from: "convert(\(kind))")
+            assertPlacementSane(converted.placement, from: "convert(\(kind))")
         }
+        _ = TextSubtitleConverter.playResolution(fromASSHeader: data)
 
         guard let text = String(data: data, encoding: .utf8) else { return }
         assertWebVTTSafe(TextSubtitleConverter.sanitize(text), from: "sanitize")
@@ -182,9 +187,62 @@ package enum FuzzTargets {
                 fatalError("cue with non-positive duration: \(cue.start)…\(cue.end)")
             }
             assertWebVTTSafe(cue.text, from: "cues(from…)")
+            assertBalancedTags(cue.text, from: "cues(from…)")
+            if let settings = cue.settings { assertSettingsSafe(settings, from: "cues(from…)") }
+            assertPlacementSane(cue.placement, from: "cues(from…)")
         }
-        _ = TextSubtitleConverter.parseTimingLine(text)
+        // Raw side-data settings take this path in production; the string
+        // here stands in for whatever a demuxer attached.
+        if let settings = TextCuePlacement.sanitizedWebVTTSettings(text) {
+            assertSettingsSafe(settings, from: "sanitizedWebVTTSettings")
+            assertPlacementSane(TextCuePlacement(webVTTSettings: settings), from: "sanitizedWebVTTSettings")
+        }
+        _ = TextCuePlacement(webVTTSettings: text)
+        _ = TextSubtitleConverter.parseTimingLineWithSettings(text)
         _ = TextSubtitleConverter.parseTimestamp(text)
+    }
+
+    /// A settings string shares the cue's timing line, where a newline ends
+    /// the (still payload-less) cue and `-->` starts a second timing.
+    private static func assertSettingsSafe(_ settings: String, from source: String) {
+        if settings.contains("\n") || settings.contains("\r") || settings.contains("-->") || settings.isEmpty {
+            fatalError("\(source) produced unsafe cue settings: \(settings.debugDescription)")
+        }
+    }
+
+    /// A placement is either absent or a numpad alignment with finite anchor.
+    private static func assertPlacementSane(_ placement: TextCuePlacement?, from source: String) {
+        guard let placement else { return }
+        if !(1...9).contains(placement.alignment) {
+            fatalError("\(source) produced alignment \(placement.alignment)")
+        }
+        if let anchor = placement.anchor, !anchor.x.isFinite || !anchor.y.isFinite {
+            fatalError("\(source) produced a non-finite anchor")
+        }
+        if let settings = placement.webVTTSettings { assertSettingsSafe(settings, from: source) }
+    }
+
+    /// The `<b>`/`<i>`/`<u>` tags the override translation emits must nest
+    /// and close — an overlapping or open tag is what makes a renderer
+    /// style the rest of the cue, or the next one, by mistake.
+    private static func assertBalancedTags(_ text: String, from source: String) {
+        var stack: [Substring] = []
+        var rest = text[...]
+        while let open = rest.firstIndex(of: "<") {
+            rest = rest[open...]
+            guard let close = rest.firstIndex(of: ">") else { return }
+            let inner = rest[rest.index(after: open)..<close]
+            rest = rest[rest.index(after: close)...]
+            // Only the tags the translation writes are checked; a source's
+            // own `<i>` (SRT) may legitimately be unbalanced and is passed
+            // through as before.
+            guard ["b", "i", "u", "/b", "/i", "/u"].contains(String(inner)) else { continue }
+            if inner.hasPrefix("/") {
+                guard stack.popLast() == inner.dropFirst() else { return } // source-authored tag
+            } else {
+                stack.append(inner)
+            }
+        }
     }
 
     /// Empty output is legal (the caller drops the cue); unsafe output is not.

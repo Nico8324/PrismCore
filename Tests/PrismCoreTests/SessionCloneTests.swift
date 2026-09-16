@@ -22,7 +22,7 @@ struct SessionCloneTests {
     /// that, exactly as the remux and subtitle suites do.
     private func waitForFinishedPlaylist(_ playlistURL: URL, timeout: Duration = .seconds(30)) async throws {
         var mediaURL = playlistURL
-        let (firstData, _) = try await URLSession.shared.data(from: playlistURL)
+        let (firstData, _) = try await URLSession.uncached.data(from: playlistURL)
         let first = String(decoding: firstData, as: UTF8.self)
         if first.contains("#EXT-X-STREAM-INF") {
             let variant = try #require(
@@ -33,7 +33,7 @@ struct SessionCloneTests {
         }
         let deadline = ContinuousClock.now.advanced(by: timeout)
         while ContinuousClock.now < deadline {
-            let (data, _) = try await URLSession.shared.data(from: mediaURL)
+            let (data, _) = try await URLSession.uncached.data(from: mediaURL)
             if String(decoding: data, as: UTF8.self).contains("#EXT-X-ENDLIST") { return }
             try await Task.sleep(for: .milliseconds(200))
         }

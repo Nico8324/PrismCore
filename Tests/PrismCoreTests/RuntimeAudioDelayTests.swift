@@ -178,7 +178,7 @@ struct RuntimeAudioDelayTests {
             // wherever production happens to be, and this test wants the one
             // segment whose audio starts below the timeline's origin.
             let segment0 = playlist.deletingLastPathComponent().appendingPathComponent("seg00000.m4s")
-            _ = try await URLSession.shared.data(from: segment0)
+            _ = try await URLSession.uncached.data(from: segment0)
             let baseline = try segmentTimestamps(root: root, index: 0)
             let baselineAudio = try #require(baseline[AVMEDIA_TYPE_AUDIO])
             // The fixture's audio starts BEFORE zero (an AAC priming packet),
@@ -370,11 +370,13 @@ struct RuntimeAudioDelayTests {
     }
 
     /// A fetch with every cache defeated — this suite is asking what the
-    /// SERVER answers, not what URLSession remembers.
+    /// SERVER answers, not what URLSession remembers. Now the whole test
+    /// target fetches through `URLSession.uncached`, so this is belt and
+    /// braces rather than the only guard it once was.
     private func uncachedFetch(_ url: URL) async throws -> Data {
         var request = URLRequest(url: url)
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        return try await URLSession.shared.data(for: request).0
+        return try await URLSession.uncached.data(for: request).0
     }
 
     @Test("Before start() the change is in force at once; after stop() it is refused")

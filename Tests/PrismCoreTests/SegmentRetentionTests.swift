@@ -90,11 +90,11 @@ struct SegmentRetentionTests {
         let playlist = try await session.start()
         defer { Task { await session.stop() } }
 
-        let (data, _) = try await URLSession.shared.data(from: playlist)
+        let (data, _) = try await URLSession.uncached.data(from: playlist)
         let master = String(decoding: data, as: UTF8.self)
         let variantURI = try #require(PrismCoreSession.playlistURIs(inMaster: master).last)
         let base = playlist.deletingLastPathComponent()
-        let (variantData, _) = try await URLSession.shared.data(
+        let (variantData, _) = try await URLSession.uncached.data(
             from: base.appendingPathComponent(variantURI)
         )
         let segments = String(decoding: variantData, as: UTF8.self)
@@ -104,7 +104,7 @@ struct SegmentRetentionTests {
         // Drive production to the end by demanding the last segment, then
         // give eviction a beat to run on the closing cuts.
         let lastURL = base.appendingPathComponent(try #require(segments.last))
-        _ = try await URLSession.shared.data(from: lastURL)
+        _ = try await URLSession.uncached.data(from: lastURL)
         try await Task.sleep(for: .milliseconds(300))
 
         // Under a 300 KB budget at least one produced segment must be gone
@@ -113,7 +113,7 @@ struct SegmentRetentionTests {
         // Every listed segment must still SERVE, evicted or not: a miss goes
         // through the demand path and reproduces it.
         for segment in segments {
-            let (media, response) = try await URLSession.shared.data(
+            let (media, response) = try await URLSession.uncached.data(
                 from: base.appendingPathComponent(segment)
             )
             #expect((response as? HTTPURLResponse)?.statusCode == 200)
@@ -196,13 +196,13 @@ struct SegmentRetentionTests {
         defer { Task { await session.stop() } }
 
         #expect(playlist.lastPathComponent == "index.m3u8")
-        let (data, _) = try await URLSession.shared.data(from: playlist)
+        let (data, _) = try await URLSession.uncached.data(from: playlist)
         let text = String(decoding: data, as: UTF8.self)
         #expect(!text.contains("#EXT-X-STREAM-INF"))
 
         // The init segment carries BOTH track sample entries (avc1 + mp4a) —
         // muxed means the audio rides inside the variant.
-        let (initData, _) = try await URLSession.shared.data(
+        let (initData, _) = try await URLSession.uncached.data(
             from: playlist.deletingLastPathComponent().appendingPathComponent("init.mp4")
         )
         #expect(initData.range(of: Data("avc1".utf8)) != nil)

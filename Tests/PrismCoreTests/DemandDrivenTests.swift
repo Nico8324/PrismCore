@@ -20,7 +20,7 @@ struct DemandDrivenTests {
     }
 
     private func fetch(_ url: URL) async throws -> (data: Data, status: Int) {
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await URLSession.uncached.data(from: url)
         return (data, (response as? HTTPURLResponse)?.statusCode ?? 0)
     }
 

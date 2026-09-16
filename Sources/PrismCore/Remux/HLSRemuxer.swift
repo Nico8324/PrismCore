@@ -1339,10 +1339,21 @@ final class HLSRemuxer: @unchecked Sendable {
                     // surfaces here ends the remux (the playlists stay valid up
                     // to the last written segment).
                     // An origin that went away mid-session is the most common
-                    // way to arrive here, and over the coordinated reader it
-                    // arrives as `-EIO` — ask the guard what it really was
-                    // before reporting a symptom.
-                    throw interruptGuard.originFailure
+                    // way to arrive here, and neither a host-supplied input
+                    // nor the coordinated reader can tell libavformat more
+                    // than an errno — it arrives as `-EIO` either way, so ask
+                    // the guard what it really was before reporting a symptom.
+                    //
+                    // The order is most-specific-first and it matters: the
+                    // host's own thrown error (an expired debrid token, a
+                    // dropped SMB mount) is the only thing that names WHICH
+                    // transport gave up, the origin's classification is the
+                    // next best, and the libav* code is the consequence of
+                    // whichever of them happened. Same order as the opening
+                    // paths, so a failure reads identically to a host whether
+                    // it lands at startup or an hour into a film.
+                    throw interruptGuard.customInputFailure
+                        ?? interruptGuard.originFailure
                         ?? FFmpegError(code: readResult, operation: "av_read_frame")
                 }
                 countSourceBytes(packet.pointee.size)

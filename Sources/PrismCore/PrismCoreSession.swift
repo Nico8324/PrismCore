@@ -88,6 +88,10 @@ public actor PrismCoreSession {
         var dialogueBoost: [DialogueBoostLevel]
         var audioDelaySeconds: Double
         var coordinatedHTTP: Bool
+        /// Kept verbatim like everything else here, so the muxed fallback
+        /// clone reads through the same host transport — a fallback that
+        /// quietly went back to native I/O would simply fail to open.
+        var input: PrismCoreInputFactory?
     }
 
     private let configuration: Configuration
@@ -248,7 +252,8 @@ public actor PrismCoreSession {
         keyframeIndexCacheDirectory: URL? = nil,
         dialogueBoost: [DialogueBoostLevel] = [],
         audioDelaySeconds: Double = 0,
-        coordinatedHTTP: Bool = false
+        coordinatedHTTP: Bool = false,
+        input: PrismCoreInputFactory? = nil
     ) throws {
         try self.init(
             url: url,
@@ -262,7 +267,8 @@ public actor PrismCoreSession {
             keyframeIndexCacheDirectory: keyframeIndexCacheDirectory,
             dialogueBoost: dialogueBoost,
             audioDelaySeconds: audioDelaySeconds,
-            coordinatedHTTP: coordinatedHTTP
+            coordinatedHTTP: coordinatedHTTP,
+            input: input
         )
     }
 
@@ -300,7 +306,8 @@ public actor PrismCoreSession {
         keyframeIndexCacheDirectory: URL? = nil,
         dialogueBoost: [DialogueBoostLevel] = [],
         audioDelaySeconds: Double = 0,
-        coordinatedHTTP: Bool = false
+        coordinatedHTTP: Bool = false,
+        input: PrismCoreInputFactory? = nil
     ) throws {
         self.configuration = Configuration(
             url: url,
@@ -311,7 +318,11 @@ public actor PrismCoreSession {
             keyframeIndexCacheDirectory: keyframeIndexCacheDirectory,
             dialogueBoost: dialogueBoost,
             audioDelaySeconds: AudioDelay.normalized(audioDelaySeconds),
-            coordinatedHTTP: coordinatedHTTP || probed?.interruptGuard.usesCoordinatedHTTP == true
+            coordinatedHTTP: coordinatedHTTP || probed?.interruptGuard.usesCoordinatedHTTP == true,
+            // A `ProbedSource` that was probed through a host input carries
+            // its factory; a session built from one must not have to be told
+            // twice where its bytes come from.
+            input: input ?? probed?.inputFactory
         )
 
         let directory = FileManager.default.temporaryDirectory
@@ -339,6 +350,7 @@ public actor PrismCoreSession {
             forceMuxed: forceMuxedShape,
             dialogueBoost: dialogueBoost,
             probed: probed,
+            input: configuration.input,
             keyframeCacheDirectory: keyframeIndexCacheDirectory,
             landed: landed
         )
@@ -376,7 +388,8 @@ public actor PrismCoreSession {
         keyframeIndexCacheDirectory: URL? = nil,
         dialogueBoost: [DialogueBoostLevel] = [],
         audioDelaySeconds: Double = 0,
-        coordinatedHTTP: Bool = false
+        coordinatedHTTP: Bool = false,
+        input: PrismCoreInputFactory? = nil
     ) throws -> PrismCoreSession {
         try PrismCoreSession(
             url: url,
@@ -387,7 +400,8 @@ public actor PrismCoreSession {
             keyframeIndexCacheDirectory: keyframeIndexCacheDirectory,
             dialogueBoost: dialogueBoost,
             audioDelaySeconds: audioDelaySeconds,
-            coordinatedHTTP: coordinatedHTTP
+            coordinatedHTTP: coordinatedHTTP,
+            input: input
         )
     }
 
@@ -433,7 +447,8 @@ public actor PrismCoreSession {
             // boost renditions live in a master, and this shape has none.
             dialogueBoost: configuration.dialogueBoost,
             audioDelaySeconds: configuration.audioDelaySeconds,
-            coordinatedHTTP: configuration.coordinatedHTTP
+            coordinatedHTTP: configuration.coordinatedHTTP,
+            input: configuration.input
         )
         try await replayExternalSubtitles(onto: fallback)
         return fallback
@@ -478,7 +493,8 @@ public actor PrismCoreSession {
             keyframeIndexCacheDirectory: configuration.keyframeIndexCacheDirectory,
             dialogueBoost: configuration.dialogueBoost,
             audioDelaySeconds: configuration.audioDelaySeconds,
-            coordinatedHTTP: configuration.coordinatedHTTP
+            coordinatedHTTP: configuration.coordinatedHTTP,
+            input: configuration.input
         )
         try await replayExternalSubtitles(onto: fallback)
         return fallback

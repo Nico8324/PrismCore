@@ -31,6 +31,38 @@ final class ReadInterruptGuard: @unchecked Sendable {
     func cancel() { lock.withLock { cancelled = true } }
     private var httpInput: HTTPRangeInput?
     var usesCoordinatedHTTP: Bool { httpInput != nil }
+    /// The host-supplied input this context reads through, when there is one.
+    /// Held here for the same reason `httpInput` is: the avio callbacks carry
+    /// an unretained pointer, so the adapter must live exactly as long as the
+    /// context — and the guard already has that lifetime by contract.
+    private var customInput: CustomInput?
+
+    /// The host's own error behind the last negative avio return code, when a
+    /// custom input produced one. Callers use it to re-throw something typed
+    /// instead of handing on FFmpeg's `-EIO`.
+    var customInputFailure: (any Error)? { customInput?.failure }
+
+    /// Install a host-supplied input on `context`, taking ONE instance from
+    /// `factory` for this open (see `PrismCoreInputFactory` on why the
+    /// factory, not an instance).
+    ///
+    /// Throws `PrismCoreInputError.notSeekable` before touching the context
+    /// when the input has no length: every engine path that reaches here needs
+    /// to seek, and what a length-less one produces instead is a session that
+    /// publishes a plan it cannot serve — see `CustomInput` for the measured
+    /// shape of that failure.
+    func installCustomInput(
+        on context: UnsafeMutablePointer<AVFormatContext>,
+        factory: PrismCoreInputFactory
+    ) throws {
+        let input = try factory()
+        guard input.length != nil else { throw PrismCoreInputError.notSeekable }
+        let adapter = CustomInput(input: input, interrupted: { [weak self] in
+            self?.shouldInterrupt ?? true
+        })
+        try adapter.install(on: context)
+        customInput = adapter
+    }
 
     func installHTTPInput(on context: UnsafeMutablePointer<AVFormatContext>, url: URL,
                           headers: [String: String]) throws {

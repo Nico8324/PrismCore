@@ -8,6 +8,39 @@ source-compatible.)
 
 ## [Unreleased]
 
+### Added
+
+- **A host can supply the bytes itself.** `PrismCoreInput` is a public
+  read/seek/length protocol, handed to the engine as a factory
+  (`input:` on `PrismCoreSession`'s initializers and
+  `readingCurrentDisplay`, on `SourceProbe.probe`/`open`/`openDetached`, and
+  on `SeekPreviewService`), so sources libavformat cannot open on its own —
+  an SMB share reached through the host's own client, a debrid or torrent
+  session, an encrypted store, a file inside a disc image — play through the
+  remux path like anything else. It is a **factory** rather than an instance
+  because a session opens its source more than once (probe, producer, scrub
+  preview) and those contexts read from different positions at the same time;
+  one shared cursor would corrupt all of them intermittently. The adapter
+  installs an `avio_alloc_context` on the format context the same way the
+  HTTP range reader does, under the same `ReadInterruptGuard` (installed
+  before `avformat_open_input`, so a host read that blocks is still
+  abortable), answers `AVSEEK_SIZE` from the input's `length`, and defers the
+  host's own seek to the next read — libavformat seeks far more often than it
+  reads from the new position, and on these transports a seek is a round
+  trip. Errors thrown by the host come back typed
+  (`PrismCoreInputError.readFailed` / `.seekFailed`, wrapping the host's own
+  error) instead of as FFmpeg's `-EIO`. **No behaviour change without one:**
+  every path keeps native FFmpeg I/O when no factory is given.
+- An input that reports `length == nil` is refused at open with
+  `PrismCoreInputError.notSeekable`. It is refused rather than tolerated
+  because the half-working shape is silent: with the gate removed,
+  `h264_aac_30s.mkv` behind a length-less input opened fine, reported its
+  full 30.023 s duration and planned six keyframe-aligned segments — and then
+  a fetch of the last of them blocked for 45.4 s before the connection
+  dropped, with nothing resident, where the same bytes behind a seekable
+  input served it in 2 ms. The avio context still reports `seekable = 0` and
+  fails backward seeks honestly; only the engine's entry points refuse.
+
 ## [2.3.0] — 2026-09-16
 
 ### Added

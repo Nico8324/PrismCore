@@ -202,6 +202,10 @@ final class HLSRemuxer: @unchecked Sendable {
     /// the reference also means an unconsumed one is closed when this remuxer
     /// is released rather than leaked.
     private let probed: ProbedSource?
+    /// The host's byte source, when it supplies one. `run()` takes its own
+    /// instance from it — never the probe's, which belongs to the context
+    /// that probe opened.
+    private let inputFactory: PrismCoreInputFactory?
 
     /// Set by `cancel()`; checked once per packet in the copy loop.
     private let cancelled = LockedFlag()
@@ -367,11 +371,16 @@ final class HLSRemuxer: @unchecked Sendable {
         forceMuxed: Bool = false,
         dialogueBoost: [DialogueBoostLevel] = [],
         probed: ProbedSource? = nil,
+        input: PrismCoreInputFactory? = nil,
         keyframeCacheDirectory: URL? = nil,
         indexLoadBudget: Duration = SegmentPlan.indexLoadBudget,
         landed: ProductionSignal? = nil
     ) {
         self.probed = probed
+        // The probe's factory carries over when the caller did not pass one:
+        // a session built from a `ProbedSource` must be able to re-open the
+        // same bytes if the context handover has already happened.
+        self.inputFactory = input ?? probed?.inputFactory
         self.landed = landed
         self.keyframeCache = keyframeCacheDirectory.map { KeyframeIndexCache(directory: $0) }
         self.indexLoadBudget = indexLoadBudget
@@ -440,7 +449,12 @@ final class HLSRemuxer: @unchecked Sendable {
 
             interruptGuard = ReadInterruptGuard()
             input = interruptGuard.makeContext()
-            if coordinatedHTTP, ["http", "https"].contains(sourceURL.scheme?.lowercased() ?? ""), let input {
+            // Host-supplied bytes take `pb`; the coordinated HTTP reader is
+            // the fallback for sources the host does NOT carry itself.
+            if let inputFactory, let input {
+                do { try interruptGuard.installCustomInput(on: input, factory: inputFactory) }
+                catch { avformat_free_context(input); throw error }
+            } else if coordinatedHTTP, ["http", "https"].contains(sourceURL.scheme?.lowercased() ?? ""), let input {
                 do { try interruptGuard.installHTTPInput(on: input, url: sourceURL, headers: httpHeaders) }
                 catch { avformat_free_context(input); throw error }
             }
@@ -451,14 +465,21 @@ final class HLSRemuxer: @unchecked Sendable {
             // throws and the session surfaces a startup error instead.
             interruptGuard.arm(budget: SourceOpenTuning.probeBudget)
             let sourceSpec = sourceURL.isFileURL ? sourceURL.path : sourceURL.absoluteString
-            try FFmpegError.check(
-                avformat_open_input(&input, sourceSpec, nil, &openOptions),
-                "avformat_open_input"
-            )
-            guard let opened = input else { throw Failure.noVideoStream }
-            try FFmpegError.check(
-                avformat_find_stream_info(opened, nil), "avformat_find_stream_info"
-            )
+            do {
+                try FFmpegError.check(
+                    avformat_open_input(&input, sourceSpec, nil, &openOptions),
+                    "avformat_open_input"
+                )
+                guard let opened = input else { throw Failure.noVideoStream }
+                try FFmpegError.check(
+                    avformat_find_stream_info(opened, nil), "avformat_find_stream_info"
+                )
+            } catch {
+                // A host input that threw is reported as the host's own error:
+                // FFmpeg's `-EIO` names nothing the host can act on, and this
+                // error is what the session's startup failure carries.
+                throw interruptGuard.customInputFailure ?? error
+            }
             interruptGuard.disarm()
             adoptedInfo = nil
         }

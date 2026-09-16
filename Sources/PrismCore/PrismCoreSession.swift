@@ -182,6 +182,20 @@ public actor PrismCoreSession {
         /// is the one in force, not the one asked for.
         public var audioDelaySeconds: Double
         public var coordinatedHTTP: Bool
+        /// Whether the server is reachable beyond `127.0.0.1`. Carried by a
+        /// clone, or a master rejection would quietly drop an AirPlayed
+        /// session back onto an address the receiver cannot reach.
+        public var reachability: LoopbackHTTPServer.Reachability
+    }
+
+    /// Where this session's server is reachable, and whether it still is.
+    ///
+    /// `.loopback` for every session that did not opt into LAN reachability.
+    /// A session that did should be watched for `.addressLost` (a Wi-Fi to
+    /// Ethernet swap mid-playback): the served URL cannot be revived, so the
+    /// honest response is to stop and start a new session.
+    public var serviceAddress: LoopbackHTTPServer.ServiceAddress {
+        get async { await server.serviceAddress }
     }
 
     /// What this session was built from — the starting point for
@@ -383,7 +397,8 @@ public actor PrismCoreSession {
         preferredSubtitleLanguage: String? = nil,
         audioDelaySeconds: Double = 0,
         coordinatedHTTP: Bool = false,
-        input: PrismCoreInputFactory? = nil
+        input: PrismCoreInputFactory? = nil,
+        reachability: LoopbackHTTPServer.Reachability = .loopbackOnly
     ) throws {
         try self.init(
             url: url,
@@ -400,7 +415,8 @@ public actor PrismCoreSession {
             preferredSubtitleLanguage: preferredSubtitleLanguage,
             audioDelaySeconds: audioDelaySeconds,
             coordinatedHTTP: coordinatedHTTP,
-            input: input
+            input: input,
+            reachability: reachability
         )
     }
 
@@ -470,7 +486,8 @@ public actor PrismCoreSession {
         preferredSubtitleLanguage: String? = nil,
         audioDelaySeconds: Double = 0,
         coordinatedHTTP: Bool = false,
-        input: PrismCoreInputFactory? = nil
+        input: PrismCoreInputFactory? = nil,
+        reachability: LoopbackHTTPServer.Reachability = .loopbackOnly
     ) throws {
         self.configuration = Options(
             sourceURL: url,
@@ -483,7 +500,8 @@ public actor PrismCoreSession {
             preferredAudioLanguage: preferredAudioLanguage,
             preferredSubtitleLanguage: preferredSubtitleLanguage,
             audioDelaySeconds: AudioDelay.normalized(audioDelaySeconds),
-            coordinatedHTTP: coordinatedHTTP || probed?.interruptGuard.usesCoordinatedHTTP == true
+            coordinatedHTTP: coordinatedHTTP || probed?.interruptGuard.usesCoordinatedHTTP == true,
+            reachability: reachability
         )
         // A `ProbedSource` that was probed through a host input carries its
         // factory; a session built from one must not have to be told twice
@@ -537,7 +555,7 @@ public actor PrismCoreSession {
         provider.audioDemand = { [remuxer] path in
             remuxer.noteAudioDemand(path: path)
         }
-        self.server = LoopbackHTTPServer(provider: provider)
+        self.server = LoopbackHTTPServer(provider: provider, reachability: reachability)
     }
 
     /// A session for the display the host is playing to right now.
@@ -558,7 +576,8 @@ public actor PrismCoreSession {
         preferredSubtitleLanguage: String? = nil,
         audioDelaySeconds: Double = 0,
         coordinatedHTTP: Bool = false,
-        input: PrismCoreInputFactory? = nil
+        input: PrismCoreInputFactory? = nil,
+        reachability: LoopbackHTTPServer.Reachability = .loopbackOnly
     ) throws -> PrismCoreSession {
         try PrismCoreSession(
             url: url,
@@ -572,7 +591,8 @@ public actor PrismCoreSession {
             preferredSubtitleLanguage: preferredSubtitleLanguage,
             audioDelaySeconds: audioDelaySeconds,
             coordinatedHTTP: coordinatedHTTP,
-            input: input
+            input: input,
+            reachability: reachability
         )
     }
 
@@ -669,7 +689,12 @@ public actor PrismCoreSession {
             coordinatedHTTP: options.coordinatedHTTP,
             // Carried, never chosen: a successor that quietly went back to
             // native I/O would fail to open a source only the host can read.
-            input: inputFactory
+            input: inputFactory,
+            // Carried for the same reason, and the default is what makes this
+            // easy to lose: a successor that fell back to `.loopbackOnly`
+            // would serve 127.0.0.1 to an AirPlay receiver that cannot reach
+            // it, and the rejection tier is exactly when that happens.
+            reachability: options.reachability
         )
         // A tripwire, not a doubt about today's initializer: the day someone
         // adds a work-directory parameter for a test or a cache, this is the

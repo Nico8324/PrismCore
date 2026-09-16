@@ -305,6 +305,17 @@ final class HLSRemuxer: @unchecked Sendable {
     /// cut path. `nil` in production.
     var onSegmentLanded: ((Int) -> Void)?
 
+    /// The session's startup-checkpoint sink, called on the producer thread as
+    /// each stage is reached. `nil` unless a host registered for them, and a
+    /// nil check is the whole cost of that case.
+    ///
+    /// No lock, deliberately: this is written once by `PrismCoreSession.start()`
+    /// BEFORE the `ProducerThread` is created, and the thread's creation is the
+    /// happens-before edge that publishes it. Nothing writes it afterwards, so
+    /// the producer only ever reads a value it was born with — the same
+    /// discipline `onSegmentLanded` already relies on.
+    var onStartupPhase: (@Sendable (StartupPhase) -> Void)?
+
     /// The WebVTT subtitle renditions produced alongside the fMP4 (phase 6).
     /// Exposed so the session can register external files before the run and
     /// read the produced renditions for the master playlist.
@@ -589,6 +600,10 @@ final class HLSRemuxer: @unchecked Sendable {
             withExtendedLifetime(interruptGuard) {}
         }
         guard let input else { throw Failure.openProducedNoContext }
+        // Open + `find_stream_info` are behind us. On a remote origin this is
+        // usually where most of a slow startup went, which is why it is the
+        // first thing a host is told about.
+        onStartupPhase?(.sourceOpened)
 
         // The probe already reads everything both decisions below need — which
         // streams exist, what they are, whether they copy, their languages and
@@ -602,6 +617,11 @@ final class HLSRemuxer: @unchecked Sendable {
         // them), so the session surfaces them as API instead — publish before
         // any packet work so they are readable the moment `start()` returns.
         chaptersLock.withLock { storedChapters = info.chapters }
+        // Published BEFORE the two guards below: a source we are about to
+        // refuse (no video, or video we cannot stream-copy) is exactly the one
+        // a host most wants described — the checkpoint is what lets it say
+        // *why* it is routing elsewhere instead of only that it is.
+        onStartupPhase?(.streamInfoResolved(info))
         guard let videoTrack = info.video else { throw Failure.noVideoStream }
         guard videoTrack.copyability == .streamCopy else {
             throw Failure.videoCodecNotNativelyPlayable(videoTrack.codecName, streamIndex: videoTrack.streamIndex)
@@ -738,6 +758,17 @@ final class HLSRemuxer: @unchecked Sendable {
         }
         let plannedPlan: SegmentPlan? = builtPlan?.basis == .keyframeIndex ? builtPlan : nil
         let planIsPartial = plannedPlan != nil && cachedCoveredThrough != nil
+        if let onStartupPhase {
+            // The cached map and a freshly loaded index reach the same plan by
+            // very different routes (one skips the index-load seek entirely),
+            // so the origin is reported rather than flattened into "planned".
+            let origin: SegmentPlanOrigin = plannedPlan == nil
+                ? .sequential
+                : (cachedKeyframes != nil ? .keyframeIndexCache : .builtFromSource)
+            onStartupPhase(.segmentPlanReady(
+                origin: origin, segments: plannedPlan?.entries.count ?? 0
+            ))
+        }
 
         // Harvest for next time (issue #34): this session degraded to the
         // sequential shape even though it could have been planned — the map
@@ -1007,6 +1038,11 @@ final class HLSRemuxer: @unchecked Sendable {
         var nextBoundaryPTS: Int64 = 0
         var lastVideoEndPTS: Int64?
         var segmentIndex = 0
+        /// Has the startup checkpoint for the first landed video segment gone
+        /// out? Producer-thread-local, so no lock — and a plain "is it index
+        /// 0" test would not do: a re-anchor back to the head re-produces
+        /// segment 0, and the host would be told startup happened twice.
+        var didAnnounceFirstSegment = false
         /// Post-reanchor: discard packets until the anchor keyframe arrives
         /// (a BACKWARD seek may land at an earlier keyframe than requested).
         var droppingUntilPTS: Int64?
@@ -1166,6 +1202,10 @@ final class HLSRemuxer: @unchecked Sendable {
                 try playlist.appendSegment(duration: duration, file: file)
             }
             onSegmentLanded?(segmentIndex)
+            if !didAnnounceFirstSegment {
+                didAnnounceFirstSegment = true
+                onStartupPhase?(.firstVideoSegmentWritten(index: segmentIndex))
+            }
             // Same wall-time window, so rendition segment N covers variant
             // segment N — cut only when a media segment really landed.
             try subtitles.flushSegment(
@@ -1505,6 +1545,13 @@ final class HLSRemuxer: @unchecked Sendable {
                     try playlist.appendSegment(duration: finalDuration, file: file)
                 }
                 recordAndEvict(index: segmentIndex, videoBytes: finalSegment.count, renditionBytes: 0)
+                // A source shorter than the first target never reaches
+                // `emitSegment`, so this is where ITS first segment lands —
+                // and the readiness gate is waiting on exactly this write.
+                if !didAnnounceFirstSegment {
+                    didAnnounceFirstSegment = true
+                    onStartupPhase?(.firstVideoSegmentWritten(index: segmentIndex))
+                }
                 if let start = segmentStartPTS {
                     try subtitles.flushSegment(
                         start: Double(start) * tickSeconds,

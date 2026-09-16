@@ -755,6 +755,11 @@ public actor PrismCoreSession {
     /// doesn't have to remember what it registered. The timed-text cue handler
     /// rides along for the same reason: a master rejection must not silently
     /// cost the host its captions.
+    ///
+    /// A startup-checkpoint registration deliberately does NOT ride along: it
+    /// describes one session's startup, and by the time a master rejection is
+    /// known that startup has finished and the stream has ended. The host
+    /// registers again on the clone if it still wants to watch.
     private func replayExternalSubtitles(onto fallback: PrismCoreSession) async throws {
         for subtitle in externalSubtitles {
             try await fallback.addExternalSubtitle(
@@ -821,6 +826,71 @@ public actor PrismCoreSession {
         remuxer.subtitles.setCueHandler(handler)
     }
 
+    // MARK: - Startup checkpoints
+
+    /// Live stages of this session's `start()`, in order, each stamped with
+    /// the time it happened at. Register **before** `start()`.
+    ///
+    /// ```swift
+    /// let session = try PrismCoreSession(url: mkvURL, display: .current())
+    /// let checkpoints = try await session.startupCheckpoints()
+    /// Task { for await mark in checkpoints { log("\(mark.elapsed): \(mark.phase)") } }
+    /// let playlist = try await session.start()
+    /// ```
+    ///
+    /// **Why a stream and not a handler**, when `setTimedTextCueHandler` set
+    /// the opposite precedent: cues are an endless feed with no terminus, and
+    /// the host draws each one and forgets it. Startup has a terminus, and the
+    /// terminus is the point — "no more checkpoints are coming" is what
+    /// dismisses the spinner, and an `AsyncStream` says that in the language
+    /// the host is already awaiting in. A callback would need a sentinel
+    /// value, and a sentinel a host forgets to handle is a spinner that never
+    /// stops.
+    ///
+    /// The stream is buffered without limit and always finishes: after the
+    /// final `.playlistServable`, when `start()` throws (the error is the
+    /// thrown one — the stream just ends), and on `stop()` for a session that
+    /// registered and was torn down without ever starting. A host awaiting a
+    /// stream that never ends would be a worse bug than the blindness this
+    /// fixes.
+    ///
+    /// Not replayed onto a fallback session (unlike external subtitles and the
+    /// cue handler): this stream describes the startup of *this* session, and
+    /// that startup is over by the time a master rejection is known. A host
+    /// taking `makeMasterRejectionFallbackSession()` registers again on the
+    /// new session, whose startup is a new and separately interesting thing.
+    ///
+    /// Calling this twice finishes the earlier stream and hands out a new one;
+    /// there is one startup to describe, so there is one consumer.
+    public func startupCheckpoints() throws -> AsyncStream<StartupCheckpoint> {
+        guard !started else { throw SessionError.alreadyStarted }
+        let (stream, continuation) = AsyncStream<StartupCheckpoint>.makeStream(
+            // Unbounded because a host that registers, starts, and only then
+            // gets around to its `for await` must still see `.sourceOpened`:
+            // the stages are the record of where the time went, and a dropped
+            // one turns the log into a guess. Five values per session.
+            bufferingPolicy: .unbounded
+        )
+        checkpoints?.finish()
+        checkpoints = continuation
+        return stream
+    }
+
+    /// The registered stream's continuation, `nil` when nobody asked — which
+    /// is what keeps the producer's sink nil and the whole feature free.
+    private var checkpoints: AsyncStream<StartupCheckpoint>.Continuation?
+
+    /// When `start()` was called — the zero every checkpoint's `elapsed` is
+    /// measured from.
+    private var startupReference: ContinuousClock.Instant?
+
+    private func note(_ phase: StartupPhase) {
+        guard let checkpoints, let startupReference else { return }
+        checkpoints.yield(
+            StartupCheckpoint(phase: phase, elapsed: ContinuousClock.now - startupReference)
+        )
+    }
+
     /// The WebVTT subtitle renditions this session serves, in declaration order
     /// (embedded text tracks first, then registered external files).
     ///
@@ -839,6 +909,30 @@ public actor PrismCoreSession {
     public func start(startupTimeout: Duration = .seconds(20)) async throws -> URL {
         precondition(!started, "PrismCoreSession is single-use — make a new one per load")
         started = true
+        let reference = ContinuousClock.now
+        startupReference = reference
+        // Every exit finishes the stream — the success path below emits
+        // `.playlistServable` first, and `defer` runs after the return value
+        // is built. Put on the ONE statement that covers all five throw sites:
+        // a host awaiting a stream a failed startup forgot to end is a hang,
+        // which is worse than the blindness this feature removes.
+        defer {
+            checkpoints?.finish()
+            checkpoints = nil
+        }
+
+        // The producer's sink is installed BEFORE the thread that calls it
+        // exists — that ordering is what lets the remuxer read it without a
+        // lock on its own hot path (see `HLSRemuxer.onStartupPhase`). Left nil
+        // when nobody registered, so an unwatched session pays a nil check per
+        // stage and nothing else.
+        if let checkpoints {
+            remuxer.onStartupPhase = { phase in
+                checkpoints.yield(
+                    StartupCheckpoint(phase: phase, elapsed: ContinuousClock.now - reference)
+                )
+            }
+        }
 
         // The producer first, the listener second: the remux's opening move
         // is a source open over the network (hundreds of milliseconds on a
@@ -879,7 +973,9 @@ public actor PrismCoreSession {
             if let ready = Self.readyPlaylistName(
                 in: workDirectory, lazyRenditions: remuxer.lazyRenditionPlaylistURIs
             ) {
-                return base.appendingPathComponent(ready)
+                let playlist = base.appendingPathComponent(ready)
+                note(.playlistServable(playlist))
+                return playlist
             }
             // A remux that already died will never produce the playlist —
             // surface its error instead of burning the whole timeout. The
@@ -906,6 +1002,12 @@ public actor PrismCoreSession {
     /// Cancel the remux, stop serving, and remove the session's segments.
     public func stop() async {
         stopped = true
+        // Idempotent after a `start()` that already finished it; this covers
+        // the session that registered for checkpoints and was torn down
+        // without ever starting — its consumer is awaiting a stream that would
+        // otherwise never end.
+        checkpoints?.finish()
+        checkpoints = nil
         // `cancel()` is the only stop signal the producer has (it also wakes a
         // parked one); the join then waits for the thread to notice, exactly as
         // awaiting the task's value used to.

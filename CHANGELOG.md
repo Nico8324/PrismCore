@@ -8,6 +8,58 @@ source-compatible.)
 
 ## [Unreleased]
 
+### Added
+
+- **Embedded CEA-608 closed captions become real subtitle renditions.** These
+  captions are not a demuxable stream: they ride inside the video elementary
+  stream, in H.264 / HEVC SEI `user_data_registered_itu_t_t35` messages with
+  ATSC A/53 (`GA94`) payloads, as `cc_data` byte triplets. Every US broadcast
+  recording, MPEG-TS capture and a good share of disc rips carries them, and
+  until now this engine could not see them at all — nor could any host on top
+  of it. They are now decoded during the remux read into the same segmented
+  WebVTT machinery the text and OCR paths already use, so CC1…CC4 arrive as
+  genuine `AVMediaSelectionOption`s and survive PiP, AirPlay and external
+  display like every other text track. Pop-on, roll-up and paint-on; the
+  control codes, preamble addressing and the basic, special and extended
+  character sets; renditions labelled by channel, plus the video track's
+  language where the container declares one; cues also delivered through the
+  existing `TimedTextCue` host tap under a synthetic negative stream index
+  (CC1 is `-1`), which cannot collide with a demuxed track's.
+  - `HEVCNALUnits` grew a read-only `scan` that also frames **H.264** NAL
+    headers and **Annex-B** start codes, rather than a second parser existing
+    beside it. The rewrite walk is untouched: it still refuses a mis-framed
+    packet outright, because its caller splices bytes back into the bitstream.
+  - **Caption bytes are reordered from decode order to presentation order
+    before they reach the decoder.** `av_read_frame` hands packets over in
+    decode order, and 608 is a stateful terminal — replayed out of order on a
+    stream with B-frames, an erase lands before the flip it was meant to end
+    and the screen shows the caption before last. The damage is wrong *text*,
+    not a wrong timestamp, which is why the reorder window is sized to
+    H.264's own maximum reorder depth and drained at every segment boundary.
+  - A caption has no end time on the wire — the wire says "erase" or "flip",
+    and whatever was on screen until then was the caption. Cue intervals are
+    synthesised from exactly those commands, split at segment boundaries, and
+    capped at ten seconds, the same cap the bitmap path uses so a caption
+    whose erase never arrives cannot stand for the rest of the film.
+  - Sources without captions pay nothing in the copy loop: a bounded packet
+    scan before the first segment settles the question, and the per-packet tap
+    is never installed when the answer is no. Absence cannot be proven more
+    cheaply than that — nothing in a container declares that its video has no
+    captions — so the scan is capped at 28 video packets, stops early on the
+    first printed character, and is skipped entirely for a codec with no SEI
+    or an input that could not be rewound afterwards.
+  - New fuzz target `a53-captions` over the SEI walk, the T.35 message loop
+    and the terminal, with invariants on the cues (ordered, capped, non-empty,
+    WebVTT-safe), plus its seed.
+- **CEA-708 is deliberately declined, not half-decoded.** DTVCC packets are
+  recognised in `cc_data` and skipped. A service decode means the window model
+  — up to eight windows with their own anchors, sizes, pen states and row
+  locks — and a partial one draws text in the wrong place while presenting
+  itself as a working caption track. On real content it costs nothing, since
+  effectively every 708 encoder emits the 608 compatibility bytes too; a
+  stream carrying only 708 gets no rendition rather than a broken one. Said
+  out loud in the README and in `ClosedCaptionReader`.
+
 ## [2.3.0] — 2026-09-16
 
 ### Added

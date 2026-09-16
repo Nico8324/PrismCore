@@ -494,11 +494,41 @@ final class HLSRemuxer: @unchecked Sendable {
         }
         let videoIndex = Int32(videoTrack.streamIndex)
 
+        // Closed captions ride inside the video, so the only way to know they
+        // exist is to look at packets — and it has to happen now, because the
+        // master playlist below is written before the copy loop and a
+        // rendition cannot be added to a manifest AVPlayer has already read.
+        // The scan is bounded and leaves the read position where it stopped,
+        // which is why it forces the rewind below. See `ClosedCaptionScout`
+        // for the cost this adds and why absence cannot be proven cheaper.
+        var closedCaptions: ClosedCaptionScout.Finding?
+        if let pb = input.pointee.pb, pb.pointee.seekable != 0,
+           let carriage = ClosedCaptionScout.carriage(
+               codecID: input.pointee.streams[Int(videoIndex)]!.pointee.codecpar.pointee.codec_id,
+               nalUnitLengthSize: videoTrack.nalUnitLengthSize
+           ) {
+            closedCaptions = ClosedCaptionScout.scan(
+                input: input, videoStreamIndex: videoIndex,
+                framing: carriage.framing, codec: carriage.codec
+            )
+            needsRewindToHead = true
+        }
+
         // Subtitle renditions are set up before the muxer: their packets never
         // reach it (in-band timed text is not HLS-conformant — muxing it in
         // gets the whole stream rejected by AVPlayer), they become WebVTT files
         // alongside the fMP4 segments.
-        let subtitleStreams = try subtitles.prepare(input: input)
+        let subtitleStreams = try subtitles.prepare(
+            input: input,
+            closedCaptions: closedCaptions,
+            // Captions have no metadata of their own; the video stream's
+            // language tag is the only declaration a container ever makes
+            // about them, and it is usually right for CC1.
+            closedCaptionLanguage: avMetadataValue(
+                input.pointee.streams[Int(videoIndex)]!.pointee.metadata, "language"
+            )
+        )
+        let tapsClosedCaptions = subtitles.hasClosedCaptions
 
         let candidates = audioCandidates(input)
         let bestAudio = av_find_best_stream(input, AVMEDIA_TYPE_AUDIO, -1, videoIndex, nil, 0)
@@ -1215,6 +1245,17 @@ final class HLSRemuxer: @unchecked Sendable {
                             }
                         }
                         lastVideoEndPTS = pts + max(packet.pointee.duration, 0)
+                        // Closed captions, on the PTS — not the DTS the packet
+                        // arrived in order of. Gated on a boolean the scout
+                        // settled before the first packet, so a source without
+                        // captions never reaches the NAL walk.
+                        if tapsClosedCaptions, let data = packet.pointee.data,
+                           packet.pointee.size > 0 {
+                            subtitles.ingestVideoPacket(
+                                UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)),
+                                presentationSeconds: Double(pts) * tickSeconds
+                            )
+                        }
                     }
                     // P7 → 8.1: rewrite the RPUs and drop the enhancement layer
                     // before the bits reach the muxer. Returns nil for a packet
@@ -1328,6 +1369,13 @@ final class HLSRemuxer: @unchecked Sendable {
             // trailer's tail bytes, is one segment. A sub-6s source cuts here for
             // the first time, so this can also mint the init segment.
             let closingPTS = lastVideoEndPTS ?? nextBoundaryPTS
+            // Before the last cut: the caption reorder window still holds the
+            // final frames, and the caption on screen at EOF has no end
+            // command coming. Both have to be settled while there is still a
+            // segment to write them into.
+            if tapsClosedCaptions {
+                subtitles.flushClosedCaptions(endSeconds: Double(closingPTS) * tickSeconds)
+            }
             let (initSegment, media) = try writer.cutSegment()
             if let initSegment, !initSegment.isEmpty {
                 try writeInitSegmentIfAbsent(initSegment)

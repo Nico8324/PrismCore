@@ -72,25 +72,53 @@ public actor PrismCoreSession {
         /// after it. Silently ignoring it would leave a subtitle track the host
         /// believes exists but that no rendition backs.
         case alreadyStarted
+        /// A second successor was asked of a session that already minted one.
+        /// Successors chain, they do not fan out — see `makeSession(changing:)`.
+        case alreadySuperseded
     }
 
-    /// Everything the session was built from, kept verbatim so
-    /// `makeMuxedFallbackSession()` can mint a faithful clone. A session is
-    /// single-use, so "retry differently" has to mean "a new session with the
-    /// same inputs".
-    private struct Configuration {
-        var url: URL
-        var httpHeaders: [String: String]
-        var display: DisplayCapabilities
-        var segmentCacheBytes: Int?
-        var forceMuxedShape: Bool
-        var keyframeIndexCacheDirectory: URL?
-        var dialogueBoost: [DialogueBoostLevel]
-        var audioDelaySeconds: Double
-        var coordinatedHTTP: Bool
+    /// Everything the session was built from, kept verbatim so a successor can
+    /// be a faithful clone. A session is single-use, so "play this differently"
+    /// — a rejected master, a dialogue-boost level the viewer just asked for —
+    /// has to mean "a new session with the same inputs, one value moved".
+    ///
+    /// Read it off a session with `options`, hand a mutated copy back through
+    /// `makeSession(changing:)`.
+    public struct Options: Sendable, Equatable {
+        /// The media this session plays. Not settable through a clone: a
+        /// successor is the *same* title with one setting moved, and it
+        /// inherits this session's external-subtitle registrations and cue
+        /// handler — replaying those onto a different file would attach
+        /// somebody else's captions to it.
+        public private(set) var sourceURL: URL
+        /// Request headers for a remote source, unchangeable for the same
+        /// reason: they are how the source is reached, not how it is played.
+        public private(set) var httpHeaders: [String: String]
+        /// What the display can present. Clamping `isDolbyVisionCapable` is
+        /// what the DV-less rejection tier does.
+        public var display: DisplayCapabilities
+        /// Disk budget for produced segments; `nil` keeps everything. A
+        /// successor gets its own directory, so this budget applies to it
+        /// alone — see `makeSession(changing:)` on stopping the predecessor.
+        public var segmentCacheBytes: Int?
+        /// Mux the one best audio track into the variant (v0 shape) instead of
+        /// serving a master with renditions.
+        public var forceMuxedShape: Bool
+        public var keyframeIndexCacheDirectory: URL?
+        public var dialogueBoost: [DialogueBoostLevel]
+        /// Clamped to ±2 s when the session is built, so a value read back here
+        /// is the one in force, not the one asked for.
+        public var audioDelaySeconds: Double
+        public var coordinatedHTTP: Bool
     }
 
-    private let configuration: Configuration
+    /// What this session was built from — the starting point for
+    /// `makeSession(changing:)`.
+    public var options: Options { configuration }
+
+    private let configuration: Options
+    /// A session mints at most one successor (`makeSession(changing:)`).
+    private var hasSuccessor = false
     /// External subtitle registrations, replayed onto a fallback session.
     private var externalSubtitles: [(url: URL, language: String?, name: String?, isForced: Bool)] = []
     /// The host's cue sink, replayed onto a fallback session the same way —
@@ -302,8 +330,8 @@ public actor PrismCoreSession {
         audioDelaySeconds: Double = 0,
         coordinatedHTTP: Bool = false
     ) throws {
-        self.configuration = Configuration(
-            url: url,
+        self.configuration = Options(
+            sourceURL: url,
             httpHeaders: httpHeaders,
             display: display,
             segmentCacheBytes: segmentCacheBytes,
@@ -404,6 +432,97 @@ public actor PrismCoreSession {
         MasterRejection.matches(error)
     }
 
+    /// A successor over the same source with one or more `Options` moved: the
+    /// single door for "play this title again, differently".
+    ///
+    /// ```swift
+    /// let boosted = try await session.makeSession { $0.dialogueBoost = [.medium] }
+    /// let playlist = try await boosted.start()
+    /// player.replaceCurrentItem(with: AVPlayerItem(url: playlist))
+    /// await player.seek(to: resumeTime)
+    /// await session.stop()                       // the caller's job, see below
+    /// ```
+    ///
+    /// A session is single-use — the served shape is decided before the first
+    /// packet and the output layout follows from it — so every setting that
+    /// reaches the remux can only be changed by building another session. This
+    /// method spares the host re-stating what it already told this one:
+    /// registered external subtitles and the timed-text cue handler are
+    /// replayed onto the successor, and every option the closure leaves alone
+    /// (the audio delay included) is carried verbatim. `sourceURL` and
+    /// `httpHeaders` are deliberately not settable; the replay is what makes
+    /// them part of this session's identity.
+    ///
+    /// **This is not a seamless swap.** Nothing is transplanted: the successor
+    /// starts from zero, and the host replaces its `AVPlayerItem` and seeks the
+    /// new one to wherever it wants to resume. There is no shared playhead and
+    /// no continuity of playback; expecting one is how a "toggle" ends up
+    /// looking like a crash.
+    ///
+    /// ## Lifecycle
+    ///
+    /// - The caller still owns `stop()` on the predecessor, and still has to
+    ///   call it. Nothing here stops it: at the moment of the call the host's
+    ///   player may still be drawing frames off it, and a factory that killed
+    ///   the item under the player would be the worse surprise. Stop it as
+    ///   soon as the successor's playlist is loaded.
+    /// - The successor **never** shares the predecessor's work directory. Two
+    ///   live sessions over one directory means two producers writing segment
+    ///   files under the same names and two `segmentCacheBytes` sweepers
+    ///   deleting each other's output, which reads as random mid-title stalls;
+    ///   and the predecessor's `stop()` removes the whole directory out from
+    ///   under a successor that is still serving from it. Each session mints
+    ///   its own (the initializer takes no directory), which also means the
+    ///   disk budget applies per session — one more reason to stop the
+    ///   predecessor promptly rather than leave it producing.
+    /// - A session mints **at most one** successor; a second call throws
+    ///   `SessionError.alreadySuperseded`. Successors chain — clone the
+    ///   session you are playing, not the one you left behind — because every
+    ///   session carries a producer reading the source and a server on its own
+    ///   port, and fanning out from one long-lived session is how a host ends
+    ///   up with several of each on one title.
+    ///
+    /// `async` only because replaying the registrations means calling into the
+    /// successor's actor.
+    public func makeSession(changing: (inout Options) -> Void) async throws -> PrismCoreSession {
+        var options = configuration
+        changing(&options)
+        return try await makeSuccessor(with: options)
+    }
+
+    /// The one clone path: `makeSession(changing:)` and both master-rejection
+    /// fallbacks come through here, so the replay and the lifecycle rules
+    /// cannot drift apart from each other.
+    private func makeSuccessor(with options: Options) async throws -> PrismCoreSession {
+        guard !hasSuccessor else { throw SessionError.alreadySuperseded }
+        let successor = try PrismCoreSession(
+            url: options.sourceURL,
+            httpHeaders: options.httpHeaders,
+            display: options.display,
+            segmentCacheBytes: options.segmentCacheBytes,
+            forceMuxedShape: options.forceMuxedShape,
+            // No `probed`: this session consumed the probe it was handed, and
+            // an already-read context cannot open a second remux.
+            probed: nil,
+            keyframeIndexCacheDirectory: options.keyframeIndexCacheDirectory,
+            dialogueBoost: options.dialogueBoost,
+            audioDelaySeconds: options.audioDelaySeconds,
+            coordinatedHTTP: options.coordinatedHTTP
+        )
+        // A tripwire, not a doubt about today's initializer: the day someone
+        // adds a work-directory parameter for a test or a cache, this is the
+        // invariant that must not be quietly given up (see Lifecycle above).
+        precondition(
+            successor.workDirectory != workDirectory,
+            "a successor session must not share its predecessor's work directory"
+        )
+        // Only after the successor exists: a throwing build leaves this session
+        // clonable, so a host that hits a transient error can try again.
+        hasSuccessor = true
+        try await replayExternalSubtitles(onto: successor)
+        return successor
+    }
+
     /// A fresh session over the same source with `forceMuxedShape` set: no
     /// master, the one best audio track muxed into the variant, media playlist
     /// served directly.
@@ -419,24 +538,17 @@ public actor PrismCoreSession {
     /// equivalent new session rather than refusing — a rejection here means
     /// something other than the shape was wrong, and the caller's own retry
     /// policy is the right place to stop, not this factory.
-    /// `async` only because replaying the subtitle registrations means calling
-    /// into the new session's actor.
+    ///
+    /// Lifecycle as `makeSession(changing:)`: the caller stops the predecessor,
+    /// and this counts as that session's one successor.
     public func makeMuxedFallbackSession() async throws -> PrismCoreSession {
-        let fallback = try PrismCoreSession(
-            url: configuration.url,
-            httpHeaders: configuration.httpHeaders,
-            display: configuration.display,
-            segmentCacheBytes: configuration.segmentCacheBytes,
-            forceMuxedShape: true,
-            keyframeIndexCacheDirectory: configuration.keyframeIndexCacheDirectory,
-            // Carried for fidelity, though the muxed shape can't serve it:
-            // boost renditions live in a master, and this shape has none.
-            dialogueBoost: configuration.dialogueBoost,
-            audioDelaySeconds: configuration.audioDelaySeconds,
-            coordinatedHTTP: configuration.coordinatedHTTP
-        )
-        try await replayExternalSubtitles(onto: fallback)
-        return fallback
+        try await makeSession { options in
+            options.forceMuxedShape = true
+            // `dialogueBoost` is carried for fidelity though this shape cannot
+            // serve it: boost renditions live in a master, and this shape has
+            // none. Dropping it here would instead make the next clone off the
+            // fallback session silently forget the host ever asked.
+        }
     }
 
     /// The next session to try after AVPlayer refused this one's master —
@@ -460,11 +572,9 @@ public actor PrismCoreSession {
         guard remuxer.masterDeclaresDolbyVision else {
             return try await makeMuxedFallbackSession()
         }
-        let display = configuration.display
-        let fallback = try PrismCoreSession(
-            url: configuration.url,
-            httpHeaders: configuration.httpHeaders,
-            display: DisplayCapabilities(
+        return try await makeSession { options in
+            let display = options.display
+            options.display = DisplayCapabilities(
                 isHDRReady: display.isHDRReady,
                 // The one clamp of this tier: no DV may be claimed, however
                 // capable the link says the panel is — capability is exactly
@@ -472,16 +582,10 @@ public actor PrismCoreSession {
                 isDolbyVisionCapable: false,
                 panelIsCurrentlyHDR: display.panelIsCurrentlyHDR,
                 source: display.source
-            ),
-            segmentCacheBytes: configuration.segmentCacheBytes,
-            forceMuxedShape: false,
-            keyframeIndexCacheDirectory: configuration.keyframeIndexCacheDirectory,
-            dialogueBoost: configuration.dialogueBoost,
-            audioDelaySeconds: configuration.audioDelaySeconds,
-            coordinatedHTTP: configuration.coordinatedHTTP
-        )
-        try await replayExternalSubtitles(onto: fallback)
-        return fallback
+            )
+            // This tier keeps the master; only the claim goes.
+            options.forceMuxedShape = false
+        }
     }
 
     /// Registered external subtitles are part of the source's identity as far

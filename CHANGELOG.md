@@ -6,6 +6,50 @@ All notable changes to PrismCore. The format follows
 usual pre-1.0 caveat: **minor** bumps could break API, **patch** bumps stayed
 source-compatible.)
 
+## [Unreleased]
+
+### Added
+
+- **Text subtitle styling and placement survive the conversion.** The text
+  converter used to strip every ASS override block and drop WebVTT cue
+  settings, so `{\an8}` dialogue authored at the top of the frame — to keep
+  off a burned-in sign or a second speaker — landed on top of it, and
+  `{\i1}` italics vanished. Now `\i` / `\b` / `\u` become balanced WebVTT
+  `<i>` / `<b>` / `<u>` tags (opened lazily, re-nested rather than crossed,
+  closed at the cue's end); `\an` and legacy `\a` become a numpad alignment;
+  `\pos` becomes an anchor normalized against the script's `PlayResX`/`Y`
+  (libass's 384×288 when the header omits them; dropped for non-ASS payloads,
+  where it has no unit). The served rendition carries the result as cue
+  settings on the timing line — bare `line:NN%` / `position:NN%` /
+  `align:start|end` only, the subset every renderer has always accepted — and
+  a WebVTT track's own settings (`AV_PKT_DATA_WEBVTT_SETTINGS`, or the timing
+  line of a `.vtt` sidecar) pass through reduced to the five defined settings
+  with a value charset that cannot carry a newline or `-->`. SRT payloads and
+  sidecars honour the `{\an8}` authors paste in. Colours, fonts, karaoke and
+  drawing are still dropped: the system caption renderer applies the viewer's
+  style regardless.
+- `TimedTextCue.placement` (`TextCuePlacement`: `alignment` 1–9, optional
+  normalized `anchor`, `row` / `column`) on both the remux cue callback and the
+  software path's `activeSubtitleCues`, for hosts that draw text themselves.
+  `nil` means the host's default placement; a host that ignores the field
+  draws exactly what it drew before. Additive: the initializer defaults it.
+
+### Validation and limits
+
+- Value tests pin the tag balancing (overlap, `\r`, a tag across `\N`, a
+  style over whitespace only), the alignment → settings table, `\pos`
+  normalization with and without a resolution, header parsing, settings
+  sanitization, settings → placement read-back, and the rendered timing line
+  with a boundary clamp. The `text-subtitles` fuzz target now also checks
+  balanced translated tags, settings safety and placement sanity; the ASS seed
+  carries `\an`, `\pos` and an italic toggle so a mutation reaches all three
+  (60 s hunt, 675 840 executions, no violation). On-device rendering of the
+  settings by AVPlayer's caption renderer is not in this change's evidence: the
+  mapping deliberately avoids the line-alignment suffix so a renderer that
+  ignores an unknown form still gets the bare `line:` percentage. A bottom-row
+  `\pos` names a baseline where WebVTT names a box top, so a nominal two-line
+  height is subtracted; a `\pos` in the bottom band prints as the default.
+
 ## [2.2.0] — 2026-09-13
 
 ### Added
@@ -1422,6 +1466,7 @@ HTTP server, with:
 - **Software path** — libavcodec into `AVSampleBufferDisplayLayer` for the video
   AVPlayer cannot decode at all.
 
+[Unreleased]: https://github.com/Wenzlik/PrismCore/compare/2.2.0...HEAD
 [2.2.0]: https://github.com/Wenzlik/PrismCore/compare/2.1.1...2.2.0
 [2.1.1]: https://github.com/Wenzlik/PrismCore/compare/2.1.0...2.1.1
 [2.1.0]: https://github.com/Wenzlik/PrismCore/compare/2.0.2...2.1.0

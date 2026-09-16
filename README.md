@@ -73,6 +73,7 @@ Shipping something on PrismCore? Open an issue and it gets listed here.
 | Display | tvOS HDMI handshake driven by the engine: `preferredDisplayCriteria` programmed and settled **before** the item is loaded, which is the only ordering tvOS accepts for HDR HLS |
 | Scrub previews | `SeekPreviewService` decodes the keyframe covering any position into a `CGImage` for a custom player HUD — its own context, CPU-only, cached per keyframe, and independent of which engine is playing. The trick-play answer for sources with no server-generated previews |
 | Streaming | HTTP headers ride the demux connection (a Plex token, a WebDAV authorization), reconnect on dropped connections |
+| Custom input | A host that holds the bytes itself — an SMB mount through its own client, a debrid/torrent session, an encrypted store, a file inside a disc image — implements `PrismCoreInput` (`read` / `seek` / `length`) and passes a factory as `input:` to the session, the probe or `SeekPreviewService`. One instance per open, so the probe, the producer and a scrub preview never share a cursor; host errors surface as `PrismCoreInputError`. An input with no `length` is refused (`.notSeekable`) rather than serving a plan it cannot honour. Omit it and the engine reads exactly as before |
 
 ## Quick start
 

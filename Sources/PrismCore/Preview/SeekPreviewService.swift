@@ -53,6 +53,11 @@ public actor SeekPreviewService {
     private let url: URL
     private let httpHeaders: [String: String]
     private let coordinatedHTTP: Bool
+    /// The host's byte source, when it supplies one. This service opens its
+    /// OWN context, so it takes its own instance: a preview seeks all over
+    /// the file while the producer reads forward, and one shared cursor
+    /// between them would corrupt both.
+    private let inputFactory: PrismCoreInputFactory?
     /// The cross-session keyframe map, when the host gave the session one —
     /// same directory, same identity, so a file that played once resolves
     /// scrub positions without touching the demuxer.
@@ -90,9 +95,11 @@ public actor SeekPreviewService {
         httpHeaders: [String: String] = [:],
         maxDimension: Int = 320,
         keyframeIndexCacheDirectory: URL? = nil,
-        coordinatedHTTP: Bool = false
+        coordinatedHTTP: Bool = false,
+        input: PrismCoreInputFactory? = nil
     ) {
         self.url = url
+        self.inputFactory = input
         self.httpHeaders = httpHeaders
         self.coordinatedHTTP = coordinatedHTTP
         self.maxDimension = max(32, maxDimension)
@@ -264,17 +271,26 @@ public actor SeekPreviewService {
         let interruptGuard = ReadInterruptGuard()
         self.interruptGuard = interruptGuard
         var context = interruptGuard.makeContext()
-        if coordinatedHTTP, ["http", "https"].contains(url.scheme?.lowercased() ?? ""), let context {
+        // Host bytes win over the coordinated HTTP reader — both would claim
+        // `pb`, and only one of them is what the host asked for.
+        if let inputFactory, let context {
+            do { try interruptGuard.installCustomInput(on: context, factory: inputFactory) }
+            catch { avformat_free_context(context); throw error }
+        } else if coordinatedHTTP, ["http", "https"].contains(url.scheme?.lowercased() ?? ""), let context {
             do { try interruptGuard.installHTTPInput(on: context, url: url, headers: httpHeaders) }
             catch { avformat_free_context(context); throw error }
         }
         interruptGuard.arm(budget: SourceOpenTuning.probeBudget)
         defer { interruptGuard.disarm() }
         let sourceSpec = url.isFileURL ? url.path : url.absoluteString
-        try FFmpegError.check(
-            avformat_open_input(&context, sourceSpec, nil, &openOptions),
-            "avformat_open_input(preview)"
-        )
+        do {
+            try FFmpegError.check(
+                avformat_open_input(&context, sourceSpec, nil, &openOptions),
+                "avformat_open_input(preview)"
+            )
+        } catch {
+            throw interruptGuard.customInputFailure ?? error
+        }
         guard let context else { throw Failure.undecodable("open failed") }
         input = context
         try FFmpegError.check(

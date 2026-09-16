@@ -208,10 +208,12 @@ extension PrismCoreError {
             switch session {
             case .startupTimedOut(let underlying):
                 return underlying.map(classify) ?? .startupBudgetExpired
-            case .alreadyStarted:
-                // A misuse of the API, not a failure of a source or an origin.
-                // Giving it a taxonomy case would invite hosts to handle it at
-                // runtime instead of fixing the call order.
+            case .alreadyStarted, .alreadySuperseded:
+                // Misuses of the API, not failures of a source or an origin:
+                // one is a registration after `start()`, the other a second
+                // successor off one session. Giving either a taxonomy case
+                // would invite hosts to handle it at runtime instead of fixing
+                // the call order.
                 return .unknown(underlying: error)
             }
 

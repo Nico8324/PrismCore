@@ -51,6 +51,13 @@ public final class ProbedSource: @unchecked Sendable {
     /// fallback session, whose context was already taken) knows what to open.
     public let url: URL
     let httpHeaders: [String: String]
+    /// The host-supplied byte source this was probed through, when there was
+    /// one — travelling for the same reason the headers do: whoever re-opens
+    /// (the remuxer whose adopted context was already consumed, a muxed
+    /// fallback session) has to reach the same bytes, and only the host can
+    /// produce them. It is a FACTORY, so each of those opens gets its own
+    /// cursor.
+    let inputFactory: PrismCoreInputFactory?
 
     /// The interrupt guard the context was OPENED with — the callback is
     /// baked into the URLContext at creation and cannot be added later (issue
@@ -73,6 +80,7 @@ public final class ProbedSource: @unchecked Sendable {
         info: SourceInfo,
         url: URL,
         httpHeaders: [String: String],
+        inputFactory: PrismCoreInputFactory? = nil,
         context: UnsafeMutablePointer<AVFormatContext>,
         interruptGuard: ReadInterruptGuard,
         timing: ProbeTiming
@@ -80,6 +88,7 @@ public final class ProbedSource: @unchecked Sendable {
         self.info = info
         self.url = url
         self.httpHeaders = httpHeaders
+        self.inputFactory = inputFactory
         self.context = context
         self.interruptGuard = interruptGuard
         self.timing = timing

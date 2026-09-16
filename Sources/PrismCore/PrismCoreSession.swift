@@ -117,6 +117,11 @@ public actor PrismCoreSession {
     public var options: Options { configuration }
 
     private let configuration: Options
+    /// How this session's bytes are fetched, when the host supplies them.
+    /// Deliberately NOT in `Options`: it belongs with `sourceURL` — a clone is
+    /// the same title reached the same way, one *playback* setting moved — and
+    /// a closure cannot be `Equatable`, which `Options` is.
+    private let inputFactory: PrismCoreInputFactory?
     /// A session mints at most one successor (`makeSession(changing:)`).
     private var hasSuccessor = false
     /// External subtitle registrations, replayed onto a fallback session.
@@ -285,7 +290,8 @@ public actor PrismCoreSession {
         keyframeIndexCacheDirectory: URL? = nil,
         dialogueBoost: [DialogueBoostLevel] = [],
         audioDelaySeconds: Double = 0,
-        coordinatedHTTP: Bool = false
+        coordinatedHTTP: Bool = false,
+        input: PrismCoreInputFactory? = nil
     ) throws {
         try self.init(
             url: url,
@@ -299,7 +305,8 @@ public actor PrismCoreSession {
             keyframeIndexCacheDirectory: keyframeIndexCacheDirectory,
             dialogueBoost: dialogueBoost,
             audioDelaySeconds: audioDelaySeconds,
-            coordinatedHTTP: coordinatedHTTP
+            coordinatedHTTP: coordinatedHTTP,
+            input: input
         )
     }
 
@@ -337,7 +344,8 @@ public actor PrismCoreSession {
         keyframeIndexCacheDirectory: URL? = nil,
         dialogueBoost: [DialogueBoostLevel] = [],
         audioDelaySeconds: Double = 0,
-        coordinatedHTTP: Bool = false
+        coordinatedHTTP: Bool = false,
+        input: PrismCoreInputFactory? = nil
     ) throws {
         self.configuration = Options(
             sourceURL: url,
@@ -350,6 +358,10 @@ public actor PrismCoreSession {
             audioDelaySeconds: AudioDelay.normalized(audioDelaySeconds),
             coordinatedHTTP: coordinatedHTTP || probed?.interruptGuard.usesCoordinatedHTTP == true
         )
+        // A `ProbedSource` that was probed through a host input carries its
+        // factory; a session built from one must not have to be told twice
+        // where its bytes come from.
+        self.inputFactory = input ?? probed?.inputFactory
 
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("PrismCore-\(UUID().uuidString)", isDirectory: true)
@@ -376,6 +388,7 @@ public actor PrismCoreSession {
             forceMuxed: forceMuxedShape,
             dialogueBoost: dialogueBoost,
             probed: probed,
+            input: inputFactory,
             keyframeCacheDirectory: keyframeIndexCacheDirectory,
             landed: landed
         )
@@ -413,7 +426,8 @@ public actor PrismCoreSession {
         keyframeIndexCacheDirectory: URL? = nil,
         dialogueBoost: [DialogueBoostLevel] = [],
         audioDelaySeconds: Double = 0,
-        coordinatedHTTP: Bool = false
+        coordinatedHTTP: Bool = false,
+        input: PrismCoreInputFactory? = nil
     ) throws -> PrismCoreSession {
         try PrismCoreSession(
             url: url,
@@ -424,7 +438,8 @@ public actor PrismCoreSession {
             keyframeIndexCacheDirectory: keyframeIndexCacheDirectory,
             dialogueBoost: dialogueBoost,
             audioDelaySeconds: audioDelaySeconds,
-            coordinatedHTTP: coordinatedHTTP
+            coordinatedHTTP: coordinatedHTTP,
+            input: input
         )
     }
 
@@ -516,7 +531,10 @@ public actor PrismCoreSession {
             keyframeIndexCacheDirectory: options.keyframeIndexCacheDirectory,
             dialogueBoost: options.dialogueBoost,
             audioDelaySeconds: options.audioDelaySeconds,
-            coordinatedHTTP: options.coordinatedHTTP
+            coordinatedHTTP: options.coordinatedHTTP,
+            // Carried, never chosen: a successor that quietly went back to
+            // native I/O would fail to open a source only the host can read.
+            input: inputFactory
         )
         // A tripwire, not a doubt about today's initializer: the day someone
         // adds a work-directory parameter for a test or a cache, this is the

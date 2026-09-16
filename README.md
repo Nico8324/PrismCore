@@ -503,10 +503,11 @@ output during priming is normal. A terminal, completely drained silent bridge
 raises `AudioBridgeFailure.producedNoAudio` through the session error path.
 The software pipeline exposes `.decoded` only after its decoder opens.
 
-Audio delay is fixed at construction and preserved by fallback factories.
-Changing it during playback requires a replacement session and a host-managed
-handover at the current position. Both positive and negative offsets are bounded
-to two seconds; this does not add an AVPlayer transport controller to PrismCore.
+Audio delay is fixed at construction and carried by every clone. Changing it
+mid-title means a replacement session and a host-managed handover at the current
+position — see *Changing a setting mid-title* below. Both positive and negative
+offsets are bounded to two seconds; this does not add an AVPlayer transport
+controller to PrismCore.
 
 `coordinatedHTTP` is also available on `PrismCoreEngine.open`,
 `SourceProbe.open/openDetached`, `SeekPreviewService` and software `load(url:)`.
@@ -529,6 +530,50 @@ PRISMCORE_RENDERED_SEEK=1 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Develop
 The committed `seek_clock.mkv` has a reproducible generator beside it and runs
 through a throttled, Range-capable test origin. The check reads actual decoded
 frame numbers after seeks; it does not infer success from muxer timestamps.
+
+## Changing a setting mid-title
+
+A session is single-use: the served shape is decided before the first packet and
+the output layout follows from it. "Play this differently" — the viewer turns
+dialogue boost on, a smaller disk budget, a refused master — therefore means a
+new session over the same source. `makeSession(changing:)` mints one from what
+this session was built with, so the host does not have to restate it:
+
+```swift
+let boosted = try await session.makeSession { $0.dialogueBoost = [.medium] }
+let playlist = try await boosted.start()
+player.replaceCurrentItem(with: AVPlayerItem(url: playlist))
+await player.seek(to: resumeTime)
+await session.stop()                       // the caller's job
+```
+
+`PrismCoreSession.Options` carries everything the initializers take. Registered
+external subtitles and the timed-text cue handler are replayed onto the
+successor, and every option the closure leaves alone — the audio delay included
+— is carried verbatim. `sourceURL` and `httpHeaders` are read-only: the replay
+is what makes them part of a session's identity, and attaching one title's
+captions to another file is not a clone.
+
+Three rules, enforced rather than merely documented:
+
+- **Nothing is seamless.** The successor starts from zero. There is no shared
+  playhead and no continuity of playback; the host replaces its `AVPlayerItem`
+  and seeks to where it wants to resume.
+- **The caller still stops the predecessor.** Nothing is stopped for you — at
+  the moment of the call the player may still be drawing frames off it. Stop it
+  as soon as the successor's playlist is loaded: every live session carries a
+  producer reading the source, a server on its own port, and its own
+  `segmentCacheBytes` budget.
+- **A session mints one successor**; a second call throws
+  `SessionError.alreadySuperseded`. Clone the session you are playing, not the
+  one you left behind. The successor never inherits the predecessor's work
+  directory, which is what keeps two producers from writing the same segment
+  names — and keeps `stop()` from deleting a directory somebody is still
+  serving from.
+
+`makeMuxedFallbackSession()` and `makeMasterRejectionFallbackSession()` are the
+same mechanism with the option preset, and count as that session's one
+successor.
 
 ## Support
 

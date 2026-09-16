@@ -8,6 +8,43 @@ source-compatible.)
 
 ## [Unreleased]
 
+### Added
+
+- **`PrismCoreSession.makeSession(changing:)` — one public door for "same
+  title, one option different".** A session is single-use, so every setting
+  that reaches the remux could until now only be changed by building a new
+  session by hand and re-registering everything the old one knew. The clone
+  takes `PrismCoreSession.Options` (everything the initializers take: display
+  capabilities, `segmentCacheBytes`, `forceMuxedShape`, the keyframe index
+  cache, `dialogueBoost`, `audioDelaySeconds`, `coordinatedHTTP`), applies the
+  host's mutation, and replays the registered external subtitles and the
+  timed-text cue handler onto the successor. `sourceURL` and `httpHeaders` are
+  read-only in `Options`: the replay is what makes them part of a session's
+  identity. Read the current values with `PrismCoreSession.options`.
+  Explicitly **not** a seamless swap — nothing is transplanted, and the host
+  replaces its `AVPlayerItem` and seeks the successor to where it wants to
+  resume.
+- The lifecycle contract is now stated and enforced: the caller still owns
+  `stop()` on the predecessor (the factory cannot stop a session whose frames
+  the player may still be drawing), a successor never inherits the
+  predecessor's work directory (two producers on one directory write the same
+  segment names, and the predecessor's `stop()` deletes the directory out from
+  under a successor serving from it), and a session mints **at most one**
+  successor — a second call throws the new `SessionError.alreadySuperseded`.
+  Successors chain; fanning out from one long-lived session is how a host ends
+  up with several producers and several servers on one title. Hosts that
+  `switch` exhaustively over `SessionError` need the new case.
+
+### Changed
+
+- `makeMuxedFallbackSession()` and `makeMasterRejectionFallbackSession()` now
+  go *through* `makeSession(changing:)` instead of each minting their own
+  clone. Same behaviour, same signatures — but the replay of subtitles and cue
+  handler, and the lifecycle rules, now live in one place and cannot drift
+  apart from the public path. The muxed fallback keeps carrying `dialogueBoost`
+  it cannot serve, so a clone taken off the fallback session does not silently
+  forget the host ever asked for it.
+
 ## [2.3.0] — 2026-09-16
 
 ### Added

@@ -8,6 +8,19 @@ source-compatible.)
 
 ## [Unreleased]
 
+## [3.0.1] — 2026-09-16
+
+Five of the six defects a review pass found over 3.0.0. All are internal — no
+signature moves, nothing a 3.0.0 host calls changes shape. The audio-delay one
+matters most: a host following the documented pattern could hear the old offset
+and be told the change had landed.
+
+The sixth is not here. A host-supplied input's blocking read cannot be
+interrupted — `PrismCoreInput` exposes neither a cancellation hook nor a
+deadline, so the guard can only look between calls and a wedged host read can
+outlive a probe budget. Fixing that means adding to the protocol, which is a
+minor, not a patch.
+
 ### Fixed
 
 - **A host-supplied input that dies AFTER startup now reaches the host as its
@@ -26,7 +39,6 @@ source-compatible.)
   order. Covered by two tests that fail without the change: a host that
   survives startup and throws mid-production, and a probe whose host throws
   and then stalls past its budget.
-### Fixed — 3.0.1
 
 - **An interrupted transfer is retryable again.** When an origin answered a
   range request with 206 and the connection then died *during the body*,
@@ -45,10 +57,6 @@ source-compatible.)
   exist — and the four argued verdicts (`originRefused` permanent,
   `originRateLimited` retryable, 5xx retryable, 4xx permanent) are untouched,
   now with a test of their own that says so.
-Two CEA-608 caption defects, both of them wrong text on screen rather than
-wrong timing. Next release is a 3.0.1 patch: no signature moves.
-
-### Fixed
 
 - **A caption whose erase never arrived was re-emitted for the rest of the
   programme.** Open captions are capped at ten seconds so an unterminated one
@@ -79,9 +87,6 @@ wrong timing. Next release is a 3.0.1 patch: no signature moves.
   between captions and resumes later under a continuation class code. Field 1
   carries no XDS and runs no packet state. A field-2 XDS seed joins the fuzz
   corpus so mutations reach the new state machine.
-Patch release 3.0.1.
-
-### Fixed
 
 - **A runtime audio-delay change no longer has a window in which the old
   offset is still servable.** 3.0.0's re-anchor discarded every segment muxed
@@ -1955,6 +1960,8 @@ HTTP server, with:
   AVPlayer cannot decode at all.
 
 [Unreleased]: https://github.com/Wenzlik/PrismCore/compare/2.3.0...HEAD
+[3.0.1]: https://github.com/Wenzlik/PrismCore/compare/3.0.0...3.0.1
+[3.0.0]: https://github.com/Wenzlik/PrismCore/compare/2.3.0...3.0.0
 [2.3.0]: https://github.com/Wenzlik/PrismCore/compare/2.2.0...2.3.0
 [2.2.0]: https://github.com/Wenzlik/PrismCore/compare/2.1.1...2.2.0
 [2.1.1]: https://github.com/Wenzlik/PrismCore/compare/2.1.0...2.1.1

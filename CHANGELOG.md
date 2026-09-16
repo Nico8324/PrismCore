@@ -8,6 +8,36 @@ source-compatible.)
 
 ## [Unreleased]
 
+### Added
+
+- **`PrismCoreSession.startupCheckpoints()` — the stages of `start()`, as they
+  happen.** `start(startupTimeout: .seconds(20))` was a black box for up to
+  twenty seconds: a host could show a spinner and nothing else, unable to tell
+  "still opening a slow origin over SMB" from "probed fine, muxing the first
+  segment", and unable to give up early on the one that is actually hopeless.
+  It now hands back an `AsyncStream<StartupCheckpoint>` carrying the five
+  stages the session already passed through — `.sourceOpened` (open +
+  `find_stream_info` returned), `.streamInfoResolved(SourceInfo)` (the probe's
+  verdict, published even for a source the remux is about to refuse),
+  `.segmentPlanReady(origin:segments:)`, `.firstVideoSegmentWritten(index:)`
+  and `.playlistServable(URL)` — each stamped with the time since the `start()`
+  call, at the moment it happened. A stream, not a handler (the `cue handler`
+  precedent), because startup has a terminus and the terminus is the point: it
+  finishes on success, on failure, and on `stop()`, so a spinner always has
+  something that ends it.
+  - `origin` distinguishes a plan taken from `KeyframeIndexCache` (which also
+    skips the index-load seek) from one built here and from a source that got
+    no trustworthy plan at all — three very different costs a host may want to
+    explain.
+  - Deliberately **no percentage**: nobody knows in advance how long a probe
+    over a slow origin takes, so a fraction would be a number invented to fill
+    a bar. Stages with timestamps are things that happened.
+  - Registration must precede `start()` (`SessionError.alreadyStarted`
+    otherwise), and is *not* replayed onto `makeMuxedFallbackSession()` /
+    `makeMasterRejectionFallbackSession()` — a fallback's startup is its own,
+    and the host registers again on the clone. Costs nothing when nobody
+    registers: the producer's sink stays `nil`.
+
 ## [2.3.0] — 2026-09-16
 
 ### Added

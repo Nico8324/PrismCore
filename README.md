@@ -119,6 +119,37 @@ The URL is a **master** playlist when the source has audio (that is where the
 selectable renditions live) and a media playlist when it hasn't. Treat it as
 opaque: the shape is a property of the source, not of the API.
 
+### Watching startup happen
+
+`start()` can take seconds on a slow origin. Register **before** it and you get
+the stages as they land, each with the time since the call:
+
+```swift
+let session = try PrismCoreSession(url: mkvURL, display: .current())
+
+let checkpoints = try await session.startupCheckpoints()   // before start()
+Task {
+    for await mark in checkpoints {
+        switch mark.phase {
+        case .sourceOpened:                      status = "Opening…"
+        case .streamInfoResolved(let info):      status = info.video?.codecName ?? "…"
+        case .segmentPlanReady(let origin, _):   status = origin == .sequential
+                                                     ? "Indexing on first play…" : "Preparing…"
+        case .firstVideoSegmentWritten:          status = "Starting playback…"
+        case .playlistServable:                  break
+        }
+        log("\(mark.elapsed) \(mark.phase)")    // where the twenty seconds went
+    }
+    // The stream ends here — on success, on failure, and on stop().
+}
+
+let playlistURL = try await session.start()
+```
+
+There is no percentage, on purpose: nothing can know in advance how long a probe
+over a slow origin takes, and this engine does not report numbers it cannot
+measure. Stages with timestamps are things that happened.
+
 `PrismCoreEngine.decide(for:)` is exposed separately, so a host can ask which
 path a source would take — and unit-test its own routing — without standing up
 either engine.

@@ -943,8 +943,19 @@ public actor PrismCoreSession {
     }
 
     /// Start the loopback server and the remux, and return the playlist URL
-    /// once everything that playlist references exists on disk — the point where
-    /// AVPlayer can be pointed at it without racing an empty directory.
+    /// once it is servable — the point where AVPlayer can be pointed at it
+    /// without racing an empty directory.
+    ///
+    /// **Servable is not "every referenced file exists".** In the planned-VOD
+    /// shape the complete playlist, every `#EXTINF` of it, is written before
+    /// the first packet is read, so readiness turns on the init segment alone —
+    /// and the init is written *before* the first media segment, deliberately,
+    /// so a reader that saw the manifest can always fetch what it references.
+    /// Between those two writes the playlist is servable and no media segment
+    /// exists. That is covered by design, not by luck: a fetch goes through
+    /// `PlanSegmentProvider`, which answers a miss by asking for production and
+    /// waiting. A caller that bypasses the server and reads the work directory
+    /// gets no such guarantee and must wait for the file itself.
     public func start(startupTimeout: Duration = .seconds(20)) async throws -> URL {
         precondition(!started, "PrismCoreSession is single-use — make a new one per load")
         started = true

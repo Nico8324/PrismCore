@@ -250,11 +250,13 @@ final class SubtitleRenditionSet: @unchecked Sendable {
         // How many subtitle streams share each language — `isForcedRendition` needs to know
         // whether a forced track has a full sibling before it may be hidden as forced.
         var languageCounts: [String: Int] = [:]
+        var hasTextTrack = false
         for index in 0..<Int32(input.pointee.nb_streams) {
             guard let stream = input.pointee.streams[Int(index)],
                   stream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE
             else { continue }
             languageCounts[avMetadataValue(stream.pointee.metadata, "language") ?? "", default: 0] += 1
+            if Self.kind(for: stream.pointee.codecpar.pointee.codec_id) != nil { hasTextTrack = true }
         }
 
         for index in 0..<Int32(input.pointee.nb_streams) {
@@ -266,13 +268,17 @@ final class SubtitleRenditionSet: @unchecked Sendable {
             let converter: Track.Converter
             if let kind = Self.kind(for: par.codec_id) {
                 converter = .text(kind)
-            } else if Self.ocrCodecs.contains(par.codec_id), SubtitleOCR.isAvailable,
+            } else if Self.ocrCodecs.contains(par.codec_id), !hasTextTrack, SubtitleOCR.isAvailable,
                       let decoder = try? BitmapSubtitleDecoder(
                         codecpar: stream.pointee.codecpar, timeBase: stream.pointee.time_base
                       ) {
                 // A bitmap track becomes a rendition through on-device OCR —
                 // lossy by design (typography dies, text survives), but it is
                 // the only form that rides PiP, AirPlay and the system menu.
+                // Only when the source has no text track at all: beside a real
+                // SRT, four unlabelled OCR readings of the same dialogue are
+                // menu noise that hides the one worth choosing (a Vision Pro
+                // menu of "English-SRT, Subtitles 2, 3, 4, 5" — 2026-09-06).
                 // A build without Vision, or a decoder this build lacks,
                 // leaves the track host-only exactly as before.
                 converter = .bitmap(BitmapRenditionTrack(decoder: decoder, language: language))
@@ -294,9 +300,11 @@ final class SubtitleRenditionSet: @unchecked Sendable {
             )
             descriptions.append(
                 MasterPlaylistBuilder.SubtitleRendition(
-                    name: avMetadataValue(stream.pointee.metadata, "title")
-                        ?? language
-                        ?? "Subtitles \(ordinal + 1)",
+                    name: Self.renditionName(
+                        language: language,
+                        title: avMetadataValue(stream.pointee.metadata, "title"),
+                        ordinal: ordinal
+                    ),
                     language: language,
                     uri: "\(Self.directoryName(ordinal))/index.m3u8",
                     isForced: Self.isForcedRendition(
@@ -353,6 +361,28 @@ final class SubtitleRenditionSet: @unchecked Sendable {
     /// `eng`, and the forced one lost. It was invisible from the playlist text,
     /// which listed both lines correctly, `FORCED=YES` and all.
     ///
+    /// What the player's menu calls a rendition.
+    ///
+    /// The language, in its own name, the way Apple's playlists and the converted files do:
+    /// "English", "Français". A muxer's title is usually noise ("English-SRT") and is dropped —
+    /// unless it says what *kind* of track this is (SDH, forced, signs), which the language alone
+    /// cannot, and then it rides along: "English (Signs & Songs)". No language, no title: an
+    /// ordinal, and `withUniqueNames` keeps collisions apart.
+    static func renditionName(language: String?, title: String?, ordinal: Int) -> String {
+        let endonym = language.flatMap { code -> String? in
+            let locale = Locale(identifier: code)
+            return locale.localizedString(forLanguageCode: code)?.capitalized(with: locale)
+        }
+        let kindWords = ["sdh", "cc", "hearing", "forced", "signs", "songs", "commentary"]
+        let describes = title.map { t in kindWords.contains { t.lowercased().contains($0) } } ?? false
+        switch (endonym, title) {
+        case (let name?, let t?) where describes: return "\(name) (\(t))"
+        case (let name?, _): return name
+        case (nil, let t?): return t
+        case (nil, nil): return "Subtitles \(ordinal + 1)"
+        }
+    }
+
     /// Whether a subtitle stream should be declared `FORCED=YES`.
     ///
     /// AVKit never lists a forced rendition in its subtitle menu — it shows one only on its own

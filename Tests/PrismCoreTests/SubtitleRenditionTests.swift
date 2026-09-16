@@ -78,7 +78,9 @@ struct SubtitleRenditionTests {
         #expect(renditions.count == 1)
         #expect(rendition.uri == "subs0/index.m3u8")
         #expect(rendition.language == "ces")
-        #expect(rendition.name == "Czech")   // the container's title metadata
+        // The language in its own name, as Apple's playlists do; the container's title ("Czech")
+        // is dropped because it only repeats the language — see `renditionName`.
+        #expect(rendition.name == "Čeština")
 
         // The SERVED master — the one AVPlayer actually reads — carries the
         // rendition and points the variant at its group. Asserted against the
@@ -363,6 +365,15 @@ struct ForcedSubtitleRenditionTests {
         #expect(SubtitleRenditionSet.isForcedRendition(disposition: forced, sameLanguageTracks: 2))
         #expect(!SubtitleRenditionSet.isForcedRendition(disposition: forced, sameLanguageTracks: 1))
         #expect(!SubtitleRenditionSet.isForcedRendition(disposition: AV_DISPOSITION_DEFAULT, sameLanguageTracks: 2))
+    }
+
+    @Test("A rendition is named by its language, and a muxer title is noise unless it says the kind")
+    func renditionNames() {
+        #expect(SubtitleRenditionSet.renditionName(language: "eng", title: "English-SRT", ordinal: 0) == "English")
+        #expect(SubtitleRenditionSet.renditionName(language: "fra", title: nil, ordinal: 0) == "Français")
+        #expect(SubtitleRenditionSet.renditionName(language: "eng", title: "Signs & Songs", ordinal: 0) == "English (Signs & Songs)")
+        #expect(SubtitleRenditionSet.renditionName(language: nil, title: "Commentary", ordinal: 3) == "Commentary")
+        #expect(SubtitleRenditionSet.renditionName(language: nil, title: nil, ordinal: 3) == "Subtitles 4")
     }
 
     @Test("AVFoundation keeps both options, and knows which one is forced")

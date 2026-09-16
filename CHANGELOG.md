@@ -8,6 +8,8 @@ source-compatible.)
 
 ## [Unreleased]
 
+## [2.3.0] — 2026-09-16
+
 ### Added
 
 - **Text subtitle styling and placement survive the conversion.** The text
@@ -33,6 +35,49 @@ source-compatible.)
   software path's `activeSubtitleCues`, for hosts that draw text themselves.
   `nil` means the host's default placement; a host that ignores the field
   draws exactly what it drew before. Additive: the initializer defaults it.
+- `FFmpegBuild.Capabilities.audioBridgeEncoder` — `eac3`, `aac`, or `nil` in a
+  build with neither, where non-copyable audio still goes to the software path
+  (#85). `hasEAC3Encoder` keeps its name but narrows its meaning: it now answers
+  only whether the bridged track could be passed through to an AVR as a
+  bitstream, not whether a source can remux at all. `FFmpegBuild`'s printed
+  summary gained an `audio bridge:` line to match.
+
+### Changed
+
+- **The audio bridge targets AAC where the build has no `eac3` encoder (#85).**
+  Stock MPVKit — a common way to get FFmpeg onto Apple platforms — ships `aac`
+  and no `eac3`, so with EAC3 as the only target every DTS or TrueHD source
+  answered `canBridge` false and left the remux path entirely. That is most of
+  a disc rip library. The target is now chosen once from what the build has,
+  and everything downstream follows it: the master playlist's `CODECS`, the
+  init segment's sample entry, and `FFmpegBuild`. AAC 5.1 is a real downgrade
+  from EAC3 — a bed mix, no bitstream passthrough — and is preferred over the
+  alternative on those builds, which is no audio at all. Where `eac3` exists,
+  nothing changes.
+- **Subtitle renditions are named by their language, in that language's own
+  name (#86)**, the convention Apple's own playlists follow, instead of taking
+  the muxer's track title verbatim — which is how a menu came to read
+  `English-SRT` or `eng`. A title rides along only when it says something the
+  language cannot: SDH, forced, signs, commentary ("English (Signs & Songs)").
+  No language and no title still falls back to an ordinal.
+- **Bitmap tracks are OCR'd into renditions only when the source has no text
+  track at all (#86).** A disc rip with one SRT and four PGS tracks used to
+  produce four extra entries around the one worth choosing. The bitmap tracks
+  are still present for a host that wants them; they stop competing in the
+  menu. A source with only bitmap subtitles is unaffected — that is exactly
+  when OCR still runs.
+- **`chooseAudio` reads the container's dispositions (#87).**
+  `AV_DISPOSITION_ORIGINAL` now outranks everything: it is a statement about
+  the film rather than about the encode, and the only language signal readable
+  without asking a metadata service what the picture was shot in. Ranking by
+  copyability alone is what opened a dual-audio release in whichever track had
+  the better bits, usually the dub. `AV_DISPOSITION_DEFAULT` was added *below*
+  the best copyable and bridgeable track — a market-specific disc flags its dub
+  default — but above container order, which is what the fallback rungs used.
+  Both rungs are additive: a source that marks neither gets exactly the order
+  it got before, so this cannot cost an Atmos track. Preferring a *language*
+  is deliberately not done; a host that knows the picture's language can
+  select over the top of this.
 
 ### Validation and limits
 
@@ -49,6 +94,23 @@ source-compatible.)
   ignores an unknown form still gets the bare `line:` percentage. A bottom-row
   `\pos` names a baseline where WebVTT names a box top, so a nominal two-line
   height is subtracted; a `\pos` in the bottom band prints as the default.
+- The bridge target is covered on both builds: tests drive the whole
+  decode/resample/FIFO/encode chain through the encoder the linked FFmpeg
+  actually has, and assert the playlist `CODECS`, the sample entry and
+  `FFmpegBuild`'s report agree with it. AAC 5.1 output has not been listened
+  to on a device; it is the path a build without `eac3` takes instead of
+  silence (#85).
+- The rendition namer is tested as a pure function over language-only, a noise
+  title, a kind-bearing title and neither, plus an endonym through the built
+  rendition set (#86). The OCR suppression has no test of its own: it is a
+  one-line guard on a path that needs Vision and a real bitmap decoder, and it
+  was checked by reading the built set on a rip with one SRT and four PGS
+  tracks. Rendition names are only as good as the container's language code;
+  a mislabelled track is named by its lie.
+- Both new `chooseAudio` rungs were watched to fail before the fix, and a test
+  asserts a source marking neither disposition keeps its previous order (#87).
+  `AV_DISPOSITION_ORIGINAL` is rare in the wild, so how often this helps is
+  not measured — only that it costs nothing when absent.
 
 ## [2.2.0] — 2026-09-13
 
@@ -1466,7 +1528,8 @@ HTTP server, with:
 - **Software path** — libavcodec into `AVSampleBufferDisplayLayer` for the video
   AVPlayer cannot decode at all.
 
-[Unreleased]: https://github.com/Wenzlik/PrismCore/compare/2.2.0...HEAD
+[Unreleased]: https://github.com/Wenzlik/PrismCore/compare/2.3.0...HEAD
+[2.3.0]: https://github.com/Wenzlik/PrismCore/compare/2.2.0...2.3.0
 [2.2.0]: https://github.com/Wenzlik/PrismCore/compare/2.1.1...2.2.0
 [2.1.1]: https://github.com/Wenzlik/PrismCore/compare/2.1.0...2.1.1
 [2.1.0]: https://github.com/Wenzlik/PrismCore/compare/2.0.2...2.1.0

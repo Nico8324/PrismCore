@@ -32,6 +32,14 @@ final class ReadInterruptGuard: @unchecked Sendable {
     private var httpInput: HTTPRangeInput?
     var usesCoordinatedHTTP: Bool { httpInput != nil }
 
+    /// What the origin last said, when this context reads over the coordinated
+    /// HTTP input — the classification an FFmpeg code cannot carry (the reader
+    /// can only answer libavformat in errno). A failing open or read asks for
+    /// this *first*: it outranks the libav* code, because when both exist the
+    /// code is the consequence (`-EIO`, or the `AVERROR_EXIT` of a budget that
+    /// expired while the origin was busy throttling us) and this is the cause.
+    var originFailure: PrismCoreError? { httpInput?.lastOriginFailure }
+
     func installHTTPInput(on context: UnsafeMutablePointer<AVFormatContext>, url: URL,
                           headers: [String: String]) throws {
         let input = HTTPRangeInput(url: url, headers: headers, interrupted: { [weak self] in

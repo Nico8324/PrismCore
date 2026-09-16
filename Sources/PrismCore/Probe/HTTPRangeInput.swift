@@ -16,6 +16,18 @@ final class HTTPRangeInput {
     private var buffer = Data()
     private var bufferStart: Int64 = 0
     private var io: UnsafeMutablePointer<AVIOContext>?
+    /// What the origin last said, kept because the only thing this reader can
+    /// hand libavformat is an errno: `read` returns `-EIO` and every status —
+    /// 403, 429, the connection that died — arrives at the open site as
+    /// "Input/output error". The open sites ask for this instead, which is the
+    /// whole reason a host can tell an expired token from a full disk.
+    ///
+    /// Locked because the open site reads it from the thread that ran the
+    /// blocking open while nothing guarantees the reader thread is done.
+    private let failureLock = NSLock()
+    private var latchedFailure: PrismCoreError?
+    var lastOriginFailure: PrismCoreError? { failureLock.withLock { latchedFailure } }
+    private func latch(_ failure: PrismCoreError?) { failureLock.withLock { latchedFailure = failure } }
 
     init(url: URL, headers: [String: String], interrupted: @escaping () -> Bool) {
         self.url = url
@@ -94,13 +106,17 @@ final class HTTPRangeInput {
             } catch { HTTPOriginCoordinator.shared.release(origin); throw error }
             let status = response.response?.statusCode ?? 0
             if response.error != nil && (status == 0 || status == 206) {
+                latch(.originUnreachable(status: status == 0 ? nil : status, url: url,
+                    underlying: response.error))
                 HTTPOriginCoordinator.shared.refuse(origin, retryAfter: "0.25")
                 HTTPOriginCoordinator.shared.release(origin)
                 continue
             }
             if [429, 503, 509].contains(status) {
-                HTTPOriginCoordinator.shared.refuse(origin,
-                    retryAfter: response.response?.value(forHTTPHeaderField: "Retry-After"))
+                let retryAfter = response.response?.value(forHTTPHeaderField: "Retry-After")
+                latch(.originRateLimited(status: status,
+                    retryAfter: HTTPOriginCoordinator.retryDelay(retryAfter), url: url))
+                HTTPOriginCoordinator.shared.refuse(origin, retryAfter: retryAfter)
                 HTTPOriginCoordinator.shared.release(origin)
                 continue
             }
@@ -118,6 +134,15 @@ final class HTTPRangeInput {
                 url = next
                 continue
             }
+            // Only 4xx/5xx: a bare 200 here means a server that ignored the
+            // Range header and had its body cancelled, which is a capability
+            // problem, not a refusal — naming it one would send a host off
+            // re-authenticating against an origin that is answering fine.
+            if status >= 400 {
+                latch([401, 403, 407].contains(status)
+                    ? .originRefused(status: status, url: url)
+                    : .originUnreachable(status: status, url: url, underlying: nil))
+            }
             guard status == 206, response.error == nil,
                   let raw = response.response?.value(forHTTPHeaderField: "Content-Range"),
                   let range = Self.contentRange(raw), range.start == position,
@@ -132,6 +157,10 @@ final class HTTPRangeInput {
             length = range.total
             bufferStart = position
             buffer = response.data
+            // A refusal the retry loop rode out must not outlive it: a session
+            // that was throttled at minute one and dies of something else at
+            // minute forty would otherwise be reported as rate-limited.
+            latch(nil)
             return
         }
         throw Failure.request

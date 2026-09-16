@@ -128,10 +128,18 @@ final class HLSRemuxer: @unchecked Sendable {
     }
 
     enum Failure: Error {
+        /// The source was opened and described, and its stream list holds no
+        /// video. A fact about the source — which is why the "we got handed no
+        /// context" guards below no longer share this case: they used to, and a
+        /// host reading the taxonomy would have been told an audio-only verdict
+        /// about a source whose streams were never enumerated.
         case noVideoStream
         /// The video codec can't ride AVPlayer's HLS-fMP4 pipeline (VP9,
         /// MPEG-2, …) — the caller should route this source to Prism/libmpv.
-        case videoCodecNotNativelyPlayable(String)
+        case videoCodecNotNativelyPlayable(String, streamIndex: Int)
+        /// `avformat_open_input` reported success and left no context, or an
+        /// adopted one went missing. Not a verdict about anything.
+        case openProducedNoContext
     }
 
     static let masterPlaylistFileName = "master.m3u8"
@@ -451,14 +459,21 @@ final class HLSRemuxer: @unchecked Sendable {
             // throws and the session surfaces a startup error instead.
             interruptGuard.arm(budget: SourceOpenTuning.probeBudget)
             let sourceSpec = sourceURL.isFileURL ? sourceURL.path : sourceURL.absoluteString
-            try FFmpegError.check(
-                avformat_open_input(&input, sourceSpec, nil, &openOptions),
-                "avformat_open_input"
-            )
-            guard let opened = input else { throw Failure.noVideoStream }
-            try FFmpegError.check(
-                avformat_find_stream_info(opened, nil), "avformat_find_stream_info"
-            )
+            do {
+                try FFmpegError.check(
+                    avformat_open_input(&input, sourceSpec, nil, &openOptions),
+                    "avformat_open_input"
+                )
+                guard let opened = input else { throw Failure.openProducedNoContext }
+                try FFmpegError.check(
+                    avformat_find_stream_info(opened, nil), "avformat_find_stream_info"
+                )
+            } catch {
+                // Over the coordinated reader every transport verdict reaches
+                // libavformat as an errno, so the guard holds the only copy of
+                // what the origin actually said (see `ReadInterruptGuard`).
+                throw interruptGuard.originFailure ?? error
+            }
             interruptGuard.disarm()
             adoptedInfo = nil
         }
@@ -474,7 +489,7 @@ final class HLSRemuxer: @unchecked Sendable {
             activeGuardLock.withLock { activeGuard = nil }
             withExtendedLifetime(interruptGuard) {}
         }
-        guard let input else { throw Failure.noVideoStream }
+        guard let input else { throw Failure.openProducedNoContext }
 
         // The probe already reads everything both decisions below need — which
         // streams exist, what they are, whether they copy, their languages and
@@ -490,7 +505,7 @@ final class HLSRemuxer: @unchecked Sendable {
         chaptersLock.withLock { storedChapters = info.chapters }
         guard let videoTrack = info.video else { throw Failure.noVideoStream }
         guard videoTrack.copyability == .streamCopy else {
-            throw Failure.videoCodecNotNativelyPlayable(videoTrack.codecName)
+            throw Failure.videoCodecNotNativelyPlayable(videoTrack.codecName, streamIndex: videoTrack.streamIndex)
         }
         let videoIndex = Int32(videoTrack.streamIndex)
 
@@ -1113,7 +1128,12 @@ final class HLSRemuxer: @unchecked Sendable {
                     // options above handle the socket; anything that still
                     // surfaces here ends the remux (the playlists stay valid up
                     // to the last written segment).
-                    throw FFmpegError(code: readResult, operation: "av_read_frame")
+                    // An origin that went away mid-session is the most common
+                    // way to arrive here, and over the coordinated reader it
+                    // arrives as `-EIO` — ask the guard what it really was
+                    // before reporting a symptom.
+                    throw interruptGuard.originFailure
+                        ?? FFmpegError(code: readResult, operation: "av_read_frame")
                 }
                 countSourceBytes(packet.pointee.size)
                 defer { av_packet_unref(packet) }

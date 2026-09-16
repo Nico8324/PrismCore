@@ -200,7 +200,7 @@ struct EngineRoutingTests {
         defer { Task { await session.stop() } }
         #expect(playlist.isFileURL == false)
         #expect(playlist.lastPathComponent.hasSuffix(".m3u8"))
-        let (data, response) = try await URLSession.shared.data(from: playlist)
+        let (data, response) = try await URLSession.uncached.data(from: playlist)
         #expect((response as? HTTPURLResponse)?.statusCode == 200)
         #expect(String(decoding: data, as: UTF8.self).hasPrefix("#EXTM3U"))
     }

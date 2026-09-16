@@ -184,10 +184,10 @@ struct FirstSegmentReadinessTests {
         let playlist = try await session.start()
         defer { Task { await session.stop() } }
 
-        let (data, _) = try await URLSession.shared.data(from: playlist)
+        let (data, _) = try await URLSession.uncached.data(from: playlist)
         let masterText = String(decoding: data, as: UTF8.self)
         let variant = try #require(PrismCoreSession.playlistURIs(inMaster: masterText).last)
-        let (variantData, _) = try await URLSession.shared.data(
+        let (variantData, _) = try await URLSession.uncached.data(
             from: playlist.deletingLastPathComponent().appendingPathComponent(variant)
         )
         let durations = String(decoding: variantData, as: UTF8.self).split(separator: "\n")
@@ -202,7 +202,7 @@ struct FirstSegmentReadinessTests {
         // The URL came back with the head segment playable — and the audio
         // rendition's head fetch succeeds too, produced or pending.
         let base = playlist.deletingLastPathComponent()
-        let (audioSeg, response) = try await URLSession.shared.data(
+        let (audioSeg, response) = try await URLSession.uncached.data(
             from: base.appendingPathComponent("audio0/seg00000.m4s")
         )
         #expect((response as? HTTPURLResponse)?.statusCode == 200)

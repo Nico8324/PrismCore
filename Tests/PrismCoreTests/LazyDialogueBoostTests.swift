@@ -265,12 +265,12 @@ struct LazyDialogueBoostTests {
         // (2) The first fetch under audio1/ arms it: the request re-anchors
         // production at the demanded segment and the segment is served
         // complete, with an init that carries the EAC3 sample entry.
-        let (boostSeg, response) = try await URLSession.shared.data(
+        let (boostSeg, response) = try await URLSession.uncached.data(
             from: base.appendingPathComponent("audio1/seg00001.m4s")
         )
         #expect((response as? HTTPURLResponse)?.statusCode == 200)
         #expect(boostSeg.range(of: Data("moof".utf8)) != nil)
-        let (boostInit, initResponse) = try await URLSession.shared.data(
+        let (boostInit, initResponse) = try await URLSession.uncached.data(
             from: base.appendingPathComponent("audio1/init.mp4")
         )
         #expect((initResponse as? HTTPURLResponse)?.statusCode == 200)
@@ -283,7 +283,7 @@ struct LazyDialogueBoostTests {
 
         // (3) The stream-copied default rendition is what it was: its
         // segment of the same index still serves, and its init is AC3's.
-        let (baseSeg, baseResponse) = try await URLSession.shared.data(
+        let (baseSeg, baseResponse) = try await URLSession.uncached.data(
             from: base.appendingPathComponent("audio0/seg00001.m4s")
         )
         #expect((baseResponse as? HTTPURLResponse)?.statusCode == 200)

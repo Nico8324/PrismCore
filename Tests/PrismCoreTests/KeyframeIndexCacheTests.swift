@@ -143,7 +143,7 @@ struct KeyframeIndexCacheTests {
         )
         let secondPlaylist = try await second.start()
         defer { Task { await second.stop() } }
-        let (secondData, _) = try await URLSession.shared.data(from: secondPlaylist)
+        let (secondData, _) = try await URLSession.uncached.data(from: secondPlaylist)
         let secondText = String(decoding: secondData, as: UTF8.self)
         #expect(secondText.contains("#EXT-X-PLAYLIST-TYPE:VOD"))
         #expect(secondText.contains("#EXT-X-ENDLIST"))
@@ -155,7 +155,7 @@ struct KeyframeIndexCacheTests {
             .filter { $0.hasSuffix(".m4s") }.map(String.init)
         #expect(segments.count >= 4)
         let base = secondPlaylist.deletingLastPathComponent()
-        let (media, response) = try await URLSession.shared.data(
+        let (media, response) = try await URLSession.uncached.data(
             from: base.appendingPathComponent(try #require(segments.last))
         )
         #expect((response as? HTTPURLResponse)?.statusCode == 200)
@@ -212,7 +212,7 @@ struct KeyframeIndexCacheTests {
         defer { Task { await second.stop() } }
         // The TS fixture has Annex-B extradata → no CODECS → the muxed shape,
         // whose media playlist is served directly.
-        let (data, _) = try await URLSession.shared.data(from: playlist)
+        let (data, _) = try await URLSession.uncached.data(from: playlist)
         let text = String(decoding: data, as: UTF8.self)
         #expect(text.contains("#EXT-X-PLAYLIST-TYPE:VOD"), "a partial map must still plan")
         let durations = text.split(separator: "\n").filter { $0.hasPrefix("#EXTINF:") }
@@ -222,7 +222,7 @@ struct KeyframeIndexCacheTests {
         // And a tail segment — past the covered prefix — is still producible
         // on demand (the time-target boundary cuts at the next keyframe).
         let segments = text.split(separator: "\n").filter { $0.hasSuffix(".m4s") }.map(String.init)
-        let (media, response) = try await URLSession.shared.data(
+        let (media, response) = try await URLSession.uncached.data(
             from: playlist.deletingLastPathComponent().appendingPathComponent(try #require(segments.last))
         )
         #expect((response as? HTTPURLResponse)?.statusCode == 200)

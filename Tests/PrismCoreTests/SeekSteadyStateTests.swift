@@ -123,7 +123,7 @@ struct SeekSteadyStateTests {
         defer { Task { await server.stop() } }
 
         func fetch(_ name: String) async throws -> (Data, HTTPURLResponse) {
-            let (data, response) = try await URLSession.shared.data(from: base.appendingPathComponent(name))
+            let (data, response) = try await URLSession.uncached.data(from: base.appendingPathComponent(name))
             return (data, try #require(response as? HTTPURLResponse))
         }
         let (playlistData, playlistResponse) = try await fetch("index.m3u8")
@@ -140,7 +140,7 @@ struct SeekSteadyStateTests {
         // HEAD: header only, length of the body it would have sent.
         var head = URLRequest(url: base.appendingPathComponent("seg00000.m4s"))
         head.httpMethod = "HEAD"
-        let (headBody, headResponse) = try await URLSession.shared.data(for: head)
+        let (headBody, headResponse) = try await URLSession.uncached.data(for: head)
         #expect(headBody.isEmpty)
         #expect((headResponse as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Length") == "\(media.count)")
     }

@@ -51,7 +51,7 @@ struct RemuxIntegrationTests {
     }
 
     private func fetch(_ url: URL) async throws -> String {
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, _) = try await URLSession.uncached.data(from: url)
         return String(decoding: data, as: UTF8.self)
     }
 
@@ -137,7 +137,7 @@ struct RemuxIntegrationTests {
             mediaURL = playlist.deletingLastPathComponent().appendingPathComponent(variant)
         }
         let initURL = mediaURL.deletingLastPathComponent().appendingPathComponent(mapURI)
-        let (initSegment, _) = try await URLSession.shared.data(from: initURL)
+        let (initSegment, _) = try await URLSession.uncached.data(from: initURL)
         #expect(paspRatios(in: initSegment) == [[64, 45]])
     }
 

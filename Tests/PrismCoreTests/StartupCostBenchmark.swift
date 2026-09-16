@@ -134,11 +134,11 @@ struct StartupCostBenchmark {
         if let playlist {
             let base = playlist.deletingLastPathComponent()
             let initMs = try await ms {
-                _ = try await URLSession.shared.data(from: base.appendingPathComponent("init.mp4"))
+                _ = try await URLSession.uncached.data(from: base.appendingPathComponent("init.mp4"))
             }
             lines.append("fetch init.mp4: \(initMs) ms")
             let segMs = try await ms {
-                _ = try await URLSession.shared.data(from: base.appendingPathComponent("seg00000.m4s"))
+                _ = try await URLSession.uncached.data(from: base.appendingPathComponent("seg00000.m4s"))
             }
             lines.append("fetch seg00000.m4s: \(segMs) ms")
 
@@ -154,7 +154,7 @@ struct StartupCostBenchmark {
                 if segments.count > 4 {
                     let target = String(segments[(segments.count * 2) / 3])
                     let seekMs = try await ms {
-                        _ = try await URLSession.shared.data(from: base.appendingPathComponent(target))
+                        _ = try await URLSession.uncached.data(from: base.appendingPathComponent(target))
                     }
                     lines.append("cold seek (\(target), demand path): \(seekMs) ms")
                 }
@@ -192,7 +192,7 @@ struct StartupCostBenchmark {
             }) {
                 let name = String(format: "seg%05d.m4s", victim)
                 let parkedSeekMs = try await ms {
-                    _ = try await URLSession.shared.data(from: base2.appendingPathComponent(name))
+                    _ = try await URLSession.uncached.data(from: base2.appendingPathComponent(name))
                 }
                 lines.append("parked cold seek (\(name), evicted → re-anchor): \(parkedSeekMs) ms")
             } else {

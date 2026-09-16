@@ -19,7 +19,7 @@ struct ProbedSourceReuseTests {
 
     private func waitForFinished(_ playlist: URL, timeout: Duration = .seconds(30)) async throws {
         var mediaURL = playlist
-        let (first, _) = try await URLSession.shared.data(from: playlist)
+        let (first, _) = try await URLSession.uncached.data(from: playlist)
         let master = String(decoding: first, as: UTF8.self)
         if master.contains("#EXT-X-STREAM-INF") {
             let variant = try #require(PrismCoreSession.playlistURIs(inMaster: master).last)
@@ -27,7 +27,7 @@ struct ProbedSourceReuseTests {
         }
         let deadline = ContinuousClock.now.advanced(by: timeout)
         while ContinuousClock.now < deadline {
-            let (data, _) = try await URLSession.shared.data(from: mediaURL)
+            let (data, _) = try await URLSession.uncached.data(from: mediaURL)
             if String(decoding: data, as: UTF8.self).contains("#EXT-X-ENDLIST") { return }
             try await Task.sleep(for: .milliseconds(100))
         }
@@ -92,11 +92,11 @@ struct ProbedSourceReuseTests {
         let playlist = try await session.start()
         defer { Task { await session.stop() } }
         let base = playlist.deletingLastPathComponent()
-        let (variantData, _) = try await URLSession.shared.data(from: base.appendingPathComponent("index.m3u8"))
+        let (variantData, _) = try await URLSession.uncached.data(from: base.appendingPathComponent("index.m3u8"))
         let durations = String(decoding: variantData, as: UTF8.self).split(separator: "\n")
             .filter { $0.hasPrefix("#EXTINF:") }.compactMap { Double($0.dropFirst(8).dropLast()) }
         #expect(durations.count == 6, "\(durations)")
-        let (head, response) = try await URLSession.shared.data(from: base.appendingPathComponent("seg00000.m4s"))
+        let (head, response) = try await URLSession.uncached.data(from: base.appendingPathComponent("seg00000.m4s"))
         #expect((response as? HTTPURLResponse)?.statusCode == 200)
         // The head segment's tfdt is 0: production started at the head, not
         // at the 20 s the probe left it.
@@ -128,7 +128,7 @@ struct ProbedSourceReuseTests {
         )
         let cachedPlaylist = try await cached.start()
         defer { Task { await cached.stop() } }
-        let (head2, _) = try await URLSession.shared.data(
+        let (head2, _) = try await URLSession.uncached.data(
             from: cachedPlaylist.deletingLastPathComponent().appendingPathComponent("seg00000.m4s")
         )
         let tfdt2 = try #require(head2.range(of: Data("tfdt".utf8)))

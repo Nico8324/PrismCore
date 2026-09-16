@@ -47,6 +47,41 @@ struct PlaybackObservabilityTests {
             #expect(shifted.clock == baseline.clock)
         }
     }
+
+    /// The lowest-numbered segment the producer has landed in `directory`,
+    /// waiting for the cut if it has not landed yet.
+    ///
+    /// `start()` returning does NOT mean segment 0 is on disk. In the
+    /// demand-driven shape the whole planned playlist is written before the
+    /// first packet is read, so the readiness gate's remaining condition is
+    /// the init segment — and `HLSRemuxer` writes the init BEFORE the media
+    /// bytes of the same cut, deliberately, so a reader of the manifest can
+    /// always fetch what it references. Between those two writes the work
+    /// directory holds a servable playlist and no `.m4s` at all, which is
+    /// exactly what this test used to trip over under parallel load (twice in
+    /// twenty full runs). A host never sees that window: its segment fetch
+    /// goes through `PlanSegmentProvider`, which answers `.pending` and
+    /// serves the file when the producer lands it. This test reads the
+    /// directory instead of the server, so it has to do that seam's waiting
+    /// itself — the wait is the missing synchronisation with an asynchronous
+    /// producer, not slack added to an assertion: nothing below is relaxed,
+    /// and a cut that never comes still fails the test.
+    ///
+    /// Segments are written `.atomic`, so a name that has appeared is a
+    /// complete file.
+    private static func firstLandedSegment(
+        in directory: URL, timeout: Duration = .seconds(20)
+    ) async -> String? {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while true {
+            let segments = (try? FileManager.default.contentsOfDirectory(atPath: directory.path))?
+                .filter { $0.hasPrefix("seg") && $0.hasSuffix(".m4s") }.sorted() ?? []
+            if let first = segments.first { return first }
+            guard ContinuousClock.now < deadline else { return nil }
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+    }
+
     @Test(arguments: [true, false]) func muxedDelaySurvivesContainerWriting(muxed: Bool) async throws {
         let fixture = try #require(Bundle.module.url(forResource: "h264_aac_30s", withExtension: "mkv", subdirectory: "Fixtures"))
         /// Every packet timestamp in the first PRODUCED segment of each output,
@@ -60,9 +95,10 @@ struct PlaybackObservabilityTests {
                 let root = await session.workDirectory
                 var result: [Libavutil.AVMediaType: [Double]] = [:]
                 for directory in muxed ? [root] : [root, root.appendingPathComponent("audio0")] {
-                    let segments = try FileManager.default.contentsOfDirectory(atPath: directory.path)
-                        .filter { $0.hasPrefix("seg") && $0.hasSuffix(".m4s") }.sorted()
-                    let first = try #require(segments.first)
+                    let first = try #require(
+                        await Self.firstLandedSegment(in: directory),
+                        "no segment landed in \(directory.lastPathComponent)"
+                    )
                     let data = try Data(contentsOf: directory.appendingPathComponent("init.mp4"))
                         + Data(contentsOf: directory.appendingPathComponent(first))
                     let file = root.appendingPathComponent("delay-test.mp4")

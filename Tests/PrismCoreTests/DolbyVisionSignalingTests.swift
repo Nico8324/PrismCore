@@ -460,7 +460,7 @@ struct HVCCNormalizationIntegrationTests {
         let deadline = ContinuousClock.now.advanced(by: .seconds(20))
         var initSegment = Data()
         while ContinuousClock.now < deadline {
-            if let (data, response) = try? await URLSession.shared.data(from: initURL),
+            if let (data, response) = try? await URLSession.uncached.data(from: initURL),
                (response as? HTTPURLResponse)?.statusCode == 200, !data.isEmpty {
                 initSegment = data
                 break
@@ -716,7 +716,7 @@ struct EAC3ConfigurationTests {
         let deadline = ContinuousClock.now.advanced(by: .seconds(20))
         while ContinuousClock.now < deadline, box == nil {
             for candidate in candidates {
-                if let (data, response) = try? await URLSession.shared.data(
+                if let (data, response) = try? await URLSession.uncached.data(
                        from: base.appendingPathComponent(candidate)
                    ),
                    (response as? HTTPURLResponse)?.statusCode == 200,

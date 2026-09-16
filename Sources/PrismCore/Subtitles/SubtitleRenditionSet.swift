@@ -244,7 +244,10 @@ final class SubtitleRenditionSet: @unchecked Sendable {
     /// (in stream order), then registered external files. Returns the set of
     /// input stream indices whose packets `ingest` wants.
     @discardableResult
-    func prepare(input: UnsafeMutablePointer<AVFormatContext>) throws -> Set<Int32> {
+    func prepare(
+        input: UnsafeMutablePointer<AVFormatContext>,
+        preferredLanguage: String? = nil
+    ) throws -> Set<Int32> {
         var built: [Track] = []
         var descriptions: [MasterPlaylistBuilder.SubtitleRendition] = []
 
@@ -341,7 +344,10 @@ final class SubtitleRenditionSet: @unchecked Sendable {
 
         lock.withLock {
             tracks = built
-            storedRenditions = Self.withUniqueNames(descriptions)
+            storedRenditions = Self.applyingPreferredDefault(
+                Self.withUniqueNames(descriptions),
+                preferredLanguage: preferredLanguage
+            )
         }
         return Set(built.compactMap(\.inputIndex))
     }
@@ -419,6 +425,38 @@ final class SubtitleRenditionSet: @unchecked Sendable {
             unique.name = name
             return unique
         }
+    }
+
+    /// Mark the rendition that answers the host's `preferredSubtitleLanguage`
+    /// as the group's `DEFAULT`, leaving every other flag alone.
+    ///
+    /// Three properties this deliberately has:
+    ///
+    /// - **No match is a no-op.** An unmatched preference (or none at all)
+    ///   returns the descriptions untouched — `DEFAULT=NO` everywhere, the
+    ///   pre-existing behaviour, never an error and never an empty group.
+    /// - **Nothing is dropped.** Every rendition is still declared and still
+    ///   selectable; this moves one flag, it does not filter the menu.
+    /// - **Forced semantics are untouched.** `isForced` is computed from the
+    ///   container's disposition (see `isForcedRendition`) and is not read or
+    ///   written here. It only breaks *ties*: between a full and a forced
+    ///   rendition of the same language the full one wins the DEFAULT, because
+    ///   a viewer who asked for Czech subtitles and got the foreign-dialogue
+    ///   track would see almost nothing and conclude the preference did not
+    ///   work. A forced rendition can still take it when it is the only match.
+    static func applyingPreferredDefault(
+        _ descriptions: [MasterPlaylistBuilder.SubtitleRendition],
+        preferredLanguage: String?
+    ) -> [MasterPlaylistBuilder.SubtitleRendition] {
+        guard let index = LanguageMatch.bestIndex(
+            in: descriptions,
+            preferred: preferredLanguage,
+            language: \.language,
+            bonus: { $0.isForced ? 0 : 1 }
+        ) else { return descriptions }
+        var updated = descriptions
+        updated[index].isDefault = true
+        return updated
     }
 
     // MARK: - Lazy arming

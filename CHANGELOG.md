@@ -8,6 +8,38 @@ source-compatible.)
 
 ## [Unreleased]
 
+### Added
+
+- **`preferredAudioLanguage:` / `preferredSubtitleLanguage:` at session
+  construction.** Which rendition carried `DEFAULT` was decided by the source's
+  own ordering, so a viewer who wants Czech audio mounted the item, heard
+  English, and switched — a visible wrong-language moment at every start, and
+  on the remux path a track switch is not free. The hints steer three things
+  and only those three: which audio rendition is flagged `DEFAULT` (`chooseAudio`
+  gains a rung above the container's *original* and *default* flags), which
+  subtitle rendition is flagged `DEFAULT=YES,AUTOSELECT=YES` (the one exception
+  to the blanket `NO` those renditions otherwise carry — the ban exists so AVKit
+  does not turn subtitles on for people who never asked, and a host passing this
+  parameter is the person having asked), and — because dialogue boost derives
+  from the default track — which track a boost level is built from.
+
+  Matching is tolerant, because container tags are a mess: 639-2/B (`cze`),
+  639-2/T (`ces`) and 639-1 (`cs`) are one language, a bare tag matches a
+  regioned one (`pt` ↔ `pt-BR`) with an exact region scoring higher, case and
+  underscores are normalized, and `und` / empty are not languages. No table
+  was written for it: `Locale.canonicalLanguageIdentifier(from:)` folds every
+  one of those cases honestly (probed on this toolchain before it was trusted).
+  The obvious alternative does not —
+  `Locale.Language(identifier: "cze").languageCode?.identifier(.alpha2)` returns
+  **nil**, so a matcher built on `Locale.Language` silently fails on exactly the
+  bibliographic tags that made tolerant matching necessary.
+
+  A no-match is a no-op, never an error and never an empty selection: the
+  source's own default stands. No track is dropped — every viable track is still
+  an alternate rendition — and no decode, bridge or stream-copy decision changes;
+  a preferred track this build can neither copy nor bridge is passed over, since
+  a rendition AVPlayer cannot play is worse than the wrong language.
+
 ## [2.3.0] — 2026-09-16
 
 ### Added

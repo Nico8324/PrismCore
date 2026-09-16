@@ -64,8 +64,8 @@ Shipping something on PrismCore? Open an issue and it gets listed here.
 | Dolby Atmos | EAC3+JOC **stream-copied**, and the `dec3` box's TS 103 420 type-A extension re-applied to the init segment — without it AVFoundation plays the same bitstream as plain DD+ |
 | Audio (copy) | AAC, AC3, EAC3, FLAC, ALAC — bit-for-bit |
 | Audio (bridge) | TrueHD / MLP / DTS / DTS-HD MA / MP3 / MP2 / Opus / Vorbis / PCM → EAC3 5.1, 128 kbps per channel. Needs an FFmpeg build with the **`eac3` encoder**; without it those sources take the software path instead, which decodes them itself |
-| Multi-audio | Every viable track becomes an HLS alternate rendition with its language, name and channel count, so AVPlayer gets a real `AVMediaSelectionGroup` to switch on. The software path switches too: `SoftwarePlaybackPipeline.selectAudioTrack(streamIndex:)` swaps the decoder mid-playback without touching the clock or the picture |
-| Dialogue boost | Opt-in (`dialogueBoost:` on the session): extra "Dialogue Boost" renditions derived from the default track — decoded, centre channel favoured (bed −6 dB / −12 dB), re-encoded to EAC3 — marked `public.accessibility.enhances-speech-intelligibility` so hosts find them by characteristic. Engine-side because AVFoundation ignores `audioMix`/audio taps on HLS items. The base track stays bit-for-bit (Atmos included). Needs the `eac3` encoder and a centre-channel source; stereo would need `dialoguenhance`, which current builds don't ship |
+| Multi-audio | Every viable track becomes an HLS alternate rendition with its language, name and channel count, so AVPlayer gets a real `AVMediaSelectionGroup` to switch on. `preferredAudioLanguage:` decides which one is `DEFAULT`, so playback starts in the right language instead of switching visibly after it. The software path switches too: `SoftwarePlaybackPipeline.selectAudioTrack(streamIndex:)` swaps the decoder mid-playback without touching the clock or the picture |
+| Dialogue boost | Opt-in (`dialogueBoost:` on the session): extra "Dialogue Boost" renditions derived from the default track — which is the `preferredAudioLanguage:` track when one matched — decoded, centre channel favoured (bed −6 dB / −12 dB), re-encoded to EAC3 — marked `public.accessibility.enhances-speech-intelligibility` so hosts find them by characteristic. Engine-side because AVFoundation ignores `audioMix`/audio taps on HLS items. The base track stays bit-for-bit (Atmos included). Needs the `eac3` encoder and a centre-channel source; stereo would need `dialoguenhance`, which current builds don't ship |
 | Subtitles (text) | SubRip / ASS / SSA / WebVTT / mov_text converted during the remux read into segmented WebVTT renditions, cut on the video's own boundaries — so text survives PiP and AirPlay instead of living in a host overlay. ASS inline italics / bold / underline become WebVTT tags; `\an` / `\pos` placement and a WebVTT track's own cue settings ride the timing line, so a caption authored at the top of the frame stays there. External `.srt` / `.vtt` register as first-class renditions |
 | Subtitles (bitmap) | PGS / DVB / DVD read by on-device Vision OCR into the same rendition machinery. Lossy by design — typography dies, text survives — and the raw tracks stay surfaced for a host that wants to draw them pixel-accurately |
 | Seek & cache | Keyframe-aligned segment plan published upfront, demand-driven production with re-anchoring, absolute-`tfdt` continuity across restarts, byte-budgeted retention (1 GiB default; an evicted segment is reproduced on demand, so the budget bounds disk, not seekability) |
@@ -122,6 +122,46 @@ opaque: the shape is a property of the source, not of the API.
 `PrismCoreEngine.decide(for:)` is exposed separately, so a host can ask which
 path a source would take — and unit-test its own routing — without standing up
 either engine.
+
+### Preferred audio and subtitle language
+
+A host that knows which language the viewer wants says so when it builds the
+session, and the served master starts in it:
+
+```swift
+let session = try PrismCoreSession(
+    url: mkvURL,
+    display: .current(),
+    preferredAudioLanguage: "cs",        // "cze", "ces", "cs-CZ" mean the same
+    preferredSubtitleLanguage: "cs"
+)
+```
+
+Without them the rendition that carries `DEFAULT` is whichever track the
+*source* listed first, so a viewer who wants Czech mounts the item, hears
+English, and switches — a visible wrong-language moment at every start, and on
+the remux path a switch also costs a rendition fetch.
+
+- **Audio.** The matching track becomes the master's `DEFAULT` rendition, above
+  every other signal the engine uses to guess (the container's *original* and
+  *default* flags, the demuxer's "best stream"). Because dialogue boost derives
+  from the default track, it derives from this one.
+- **Subtitles.** The matching rendition is the only one ever marked
+  `DEFAULT=YES,AUTOSELECT=YES`, which is what makes AVKit engage it at load
+  rather than starting with subtitles off. A full rendition wins the flag over
+  a forced one of the same language; `FORCED` itself is untouched. Don't pass
+  this together with `setTimedTextCueHandler` unless the host suppresses its
+  own overlay — otherwise AVKit and the host both draw the cues.
+- **Matching is tolerant.** ISO 639-2/B (`cze`), 639-2/T (`ces`) and 639-1
+  (`cs`) are one language; a bare tag matches a regioned one (`pt` ↔ `pt-BR`)
+  and an exact region wins over a bare one; `und` and an empty tag are not
+  languages and match nothing.
+- **A no-match is a no-op**, never an error and never an empty selection: the
+  source's own default stands. Nothing is ever dropped — every viable track is
+  still an alternate rendition — and no decode, bridge or stream-copy decision
+  changes. A preferred track this build can neither copy nor bridge is passed
+  over, because a rendition AVPlayer cannot play is worse than the wrong
+  language.
 
 ### Software track menus and captions
 

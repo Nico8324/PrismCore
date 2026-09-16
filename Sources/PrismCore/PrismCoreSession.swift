@@ -86,6 +86,8 @@ public actor PrismCoreSession {
         var forceMuxedShape: Bool
         var keyframeIndexCacheDirectory: URL?
         var dialogueBoost: [DialogueBoostLevel]
+        var preferredAudioLanguage: String?
+        var preferredSubtitleLanguage: String?
         var audioDelaySeconds: Double
         var coordinatedHTTP: Bool
     }
@@ -247,6 +249,8 @@ public actor PrismCoreSession {
         forceMuxedShape: Bool = false,
         keyframeIndexCacheDirectory: URL? = nil,
         dialogueBoost: [DialogueBoostLevel] = [],
+        preferredAudioLanguage: String? = nil,
+        preferredSubtitleLanguage: String? = nil,
         audioDelaySeconds: Double = 0,
         coordinatedHTTP: Bool = false
     ) throws {
@@ -261,6 +265,8 @@ public actor PrismCoreSession {
             forceMuxedShape: forceMuxedShape,
             keyframeIndexCacheDirectory: keyframeIndexCacheDirectory,
             dialogueBoost: dialogueBoost,
+            preferredAudioLanguage: preferredAudioLanguage,
+            preferredSubtitleLanguage: preferredSubtitleLanguage,
             audioDelaySeconds: audioDelaySeconds,
             coordinatedHTTP: coordinatedHTTP
         )
@@ -290,6 +296,35 @@ public actor PrismCoreSession {
     ///   are skipped, and `dialogueBoostRenditions` reports what actually
     ///   made it into the served master. Renditions live only in a master, so
     ///   the muxed fallback shape drops them.
+    /// - Parameter preferredAudioLanguage: the language the viewer wants to
+    ///   hear, as a BCP-47 / ISO-639 tag (`"cs"`, `"ces"`, `"cze"` and
+    ///   `"cs-CZ"` all mean the same thing — see `LanguageMatch`). The
+    ///   matching track becomes the master's `DEFAULT` rendition, and — since
+    ///   dialogue boost derives from the default track — the track a boost
+    ///   level is built from.
+    ///
+    ///   This exists because selecting afterwards is visible: without it the
+    ///   DEFAULT is whichever track the *source* ordered first, so a viewer
+    ///   who wants Czech audio mounts the item, hears English, and switches —
+    ///   one wrong-language moment at every start, and on the remux path a
+    ///   switch also costs a rendition fetch.
+    ///
+    ///   What it does **not** do: it drops no track (every viable track is
+    ///   still an alternate rendition the host can select), and it changes no
+    ///   decode, bridge or stream-copy decision — a preferred track that this
+    ///   build can neither copy nor bridge is passed over exactly as it would
+    ///   be otherwise. No match at all is a no-op, never an error: the
+    ///   source's own default stands.
+    /// - Parameter preferredSubtitleLanguage: the language the viewer wants to
+    ///   read, matched the same way. The matching rendition is the only one
+    ///   ever marked `DEFAULT=YES,AUTOSELECT=YES`, which is what makes AVKit
+    ///   engage it at load instead of starting with subtitles off. A full
+    ///   rendition wins the flag over a forced one of the same language;
+    ///   `FORCED` itself is untouched, and so is every other rendition.
+    ///
+    ///   Do **not** pass this together with `setTimedTextCueHandler` unless
+    ///   the host suppresses its own overlay: engaging the rendition means
+    ///   AVKit draws the cues, and the handler draws them again.
     public init(
         url: URL,
         httpHeaders: [String: String] = [:],
@@ -299,6 +334,8 @@ public actor PrismCoreSession {
         probed: ProbedSource? = nil,
         keyframeIndexCacheDirectory: URL? = nil,
         dialogueBoost: [DialogueBoostLevel] = [],
+        preferredAudioLanguage: String? = nil,
+        preferredSubtitleLanguage: String? = nil,
         audioDelaySeconds: Double = 0,
         coordinatedHTTP: Bool = false
     ) throws {
@@ -310,6 +347,8 @@ public actor PrismCoreSession {
             forceMuxedShape: forceMuxedShape,
             keyframeIndexCacheDirectory: keyframeIndexCacheDirectory,
             dialogueBoost: dialogueBoost,
+            preferredAudioLanguage: preferredAudioLanguage,
+            preferredSubtitleLanguage: preferredSubtitleLanguage,
             audioDelaySeconds: AudioDelay.normalized(audioDelaySeconds),
             coordinatedHTTP: coordinatedHTTP || probed?.interruptGuard.usesCoordinatedHTTP == true
         )
@@ -338,6 +377,8 @@ public actor PrismCoreSession {
             segmentCacheBytes: segmentCacheBytes,
             forceMuxed: forceMuxedShape,
             dialogueBoost: dialogueBoost,
+            preferredAudioLanguage: preferredAudioLanguage,
+            preferredSubtitleLanguage: preferredSubtitleLanguage,
             probed: probed,
             keyframeCacheDirectory: keyframeIndexCacheDirectory,
             landed: landed
@@ -375,6 +416,8 @@ public actor PrismCoreSession {
         forceMuxedShape: Bool = false,
         keyframeIndexCacheDirectory: URL? = nil,
         dialogueBoost: [DialogueBoostLevel] = [],
+        preferredAudioLanguage: String? = nil,
+        preferredSubtitleLanguage: String? = nil,
         audioDelaySeconds: Double = 0,
         coordinatedHTTP: Bool = false
     ) throws -> PrismCoreSession {
@@ -386,6 +429,8 @@ public actor PrismCoreSession {
             forceMuxedShape: forceMuxedShape,
             keyframeIndexCacheDirectory: keyframeIndexCacheDirectory,
             dialogueBoost: dialogueBoost,
+            preferredAudioLanguage: preferredAudioLanguage,
+            preferredSubtitleLanguage: preferredSubtitleLanguage,
             audioDelaySeconds: audioDelaySeconds,
             coordinatedHTTP: coordinatedHTTP
         )
@@ -432,6 +477,8 @@ public actor PrismCoreSession {
             // Carried for fidelity, though the muxed shape can't serve it:
             // boost renditions live in a master, and this shape has none.
             dialogueBoost: configuration.dialogueBoost,
+            preferredAudioLanguage: configuration.preferredAudioLanguage,
+            preferredSubtitleLanguage: configuration.preferredSubtitleLanguage,
             audioDelaySeconds: configuration.audioDelaySeconds,
             coordinatedHTTP: configuration.coordinatedHTTP
         )
@@ -477,6 +524,8 @@ public actor PrismCoreSession {
             forceMuxedShape: false,
             keyframeIndexCacheDirectory: configuration.keyframeIndexCacheDirectory,
             dialogueBoost: configuration.dialogueBoost,
+            preferredAudioLanguage: configuration.preferredAudioLanguage,
+            preferredSubtitleLanguage: configuration.preferredSubtitleLanguage,
             audioDelaySeconds: configuration.audioDelaySeconds,
             coordinatedHTTP: configuration.coordinatedHTTP
         )

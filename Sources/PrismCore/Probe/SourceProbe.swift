@@ -833,11 +833,15 @@ public enum SourceProbe {
         // The clock is the honest witness — still-armed and expired means the
         // analysis cannot be trusted, whatever it returned.
         if interruptGuard.shouldInterrupt {
-            // An origin that spent the whole budget refusing us gets named as
-            // the refusal it was: the expiry is the symptom, the 429 is the
-            // reason, and only one of the two tells a host when to come back.
+            // A transport that spent the whole budget failing gets named as
+            // the failure it was: the expiry is the symptom, the host's own
+            // error or the origin's 429 is the reason, and only the reason
+            // tells a host what to do next. Most specific first — the host's
+            // thrown error outranks the origin's classification, which
+            // outranks the expiry — as on every other exit from this open.
             throw closeAndThrow(Failure.openFailed(
-                interruptGuard.originFailure
+                interruptGuard.customInputFailure
+                    ?? interruptGuard.originFailure
                     ?? FFmpegError(code: swift_AVERROR_EXIT(), operation: "probe budget exhausted")
             ))
         }

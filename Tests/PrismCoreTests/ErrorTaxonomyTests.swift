@@ -84,6 +84,33 @@ struct ErrorTaxonomyTests {
         }
     }
 
+    @Test func interruptedTransferIsRetryableDespiteTheSuccessfulStatus() async throws {
+        // 206 headers, a Content-Range, a Content-Length the origin means — and
+        // then the socket dies mid-body, every time. The origin is answering
+        // perfectly; only the transfer fails.
+        let server = try RangeFixtureServer(media: try Data(contentsOf: fixture("h264_aac", "mkv")),
+                                            truncations: 99)
+        let url = try await server.start()
+        defer { server.stop() }
+        do {
+            _ = try await SourceProbe.openDetached(url: url, budget: .seconds(2), coordinatedHTTP: true)
+            Issue.record("An origin that never finishes a body produced a probe result")
+        } catch {
+            let classified = PrismCoreError.classify(error)
+            guard case .originUnreachable(let status, _, let underlying) = classified else {
+                Issue.record("an interrupted transfer classified as \(classified)")
+                return
+            }
+            // The 206 described the response, which succeeded. Recording it as
+            // the failure's status made `retryability` answer `.permanent`
+            // (non-nil, below 500) and tell the host not to retry a dropped
+            // socket on an origin that is perfectly healthy.
+            #expect(status == nil)
+            #expect(underlying != nil)
+            #expect(classified.retryability == .retryable)
+        }
+    }
+
     @Test func aRefusalRiddenOutLeavesNoFailureBehind() async throws {
         let server = try RangeFixtureServer(media: try Data(contentsOf: fixture("h264_aac_30s", "mkv")),
                                             refusals: 1, retryAfter: "0")
@@ -287,6 +314,28 @@ struct ErrorTaxonomyTests {
             PrismCoreSession.SessionError.startupTimedOut(underlying: nil)) else {
             Issue.record("a bare startup timeout lost its meaning")
             return
+        }
+    }
+
+    /// The fix for the interrupted transfer moved one *recording site*; these
+    /// verdicts were each argued for in `retryability` and none may move with
+    /// it. Written by construction on purpose — this asserts the verdict table
+    /// itself, not that an origin can be made to produce every row.
+    @Test func theArguedVerdictsSurvive() {
+        // A refusal stays permanent: the same request with the same credentials
+        // earns the same answer.
+        #expect(PrismCoreError.originRefused(status: 403, url: nil).retryability == .permanent)
+        #expect(PrismCoreError.originRefused(status: nil, url: nil).retryability == .permanent)
+        // A rate limit stays retryable — that is precisely what the status means.
+        #expect(PrismCoreError.originRateLimited(status: 429, retryAfter: 1, url: nil).retryability == .retryable)
+        // 4xx is the origin answering about this request, 5xx about itself.
+        for permanent in [400, 404, 410, 451] {
+            #expect(PrismCoreError.originUnreachable(status: permanent, url: nil, underlying: nil)
+                .retryability == .permanent)
+        }
+        for retryable in [500, 502, 504] {
+            #expect(PrismCoreError.originUnreachable(status: retryable, url: nil, underlying: nil)
+                .retryability == .retryable)
         }
     }
 

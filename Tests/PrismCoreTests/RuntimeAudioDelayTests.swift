@@ -236,7 +236,7 @@ struct RuntimeAudioDelayTests {
     }
 
     @Test("Discarding the segments written with the old offset leaves nothing to serve")
-    func retireAllRemovesEverySegmentFile() throws {
+    func supersedeAllRemovesEverySegmentFile() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("PrismCoreRuntimeDelay-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -246,11 +246,135 @@ struct RuntimeAudioDelayTests {
             try store.publish(index: index, start: Double(index) * 6, end: Double(index + 1) * 6,
                               data: Data([UInt8(index)]), root: root)
         }
-        let retired = store.retireAll().sorted()
+        let retired = store.supersedeAll().sorted()
         #expect(retired == [0, 1, 2])
         #expect(store.ranges.isEmpty)
+        // Unservable BEFORE unlinked: the deletion runs off the producer's
+        // thread, so the files are still here for as long as that queue takes,
+        // and the serving path has to know that from the store.
+        #expect(segmentIndexes(root: root) == [0, 1, 2])
+        #expect(retired.allSatisfy { store.isSuperseded(index: $0) })
         for index in retired { store.unlinkRetired(index: index, directories: [root]) }
         #expect(segmentIndexes(root: root).isEmpty)
+        #expect(retired.allSatisfy { !store.isSuperseded(index: $0) },
+                "nothing left on disk to protect against")
+    }
+
+    /// The defect this pins: `supersedeAll` clears the in-memory entries and
+    /// the files are unlinked afterwards, asynchronously — but the serving
+    /// path reads the filesystem. Between the two, a fetch was answered with
+    /// segments muxed at the offset the viewer just corrected away from, and
+    /// AVPlayer caches that answer past the deletion.
+    @Test("A superseded segment is not served while its file is still on disk")
+    func supersededSegmentIsNotServedFromDisk() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PrismCoreSuperseded-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("audio0"), withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let store = ResidentSegmentStore()
+        let oldBytes = Data("segment muxed at the old offset".utf8)
+        try store.publish(index: 0, start: 0, end: 6, data: oldBytes, root: root)
+        try oldBytes.write(to: root.appendingPathComponent("audio0/seg00000.m4s"))
+
+        let coordinator = DemandCoordinator()
+        coordinator.publish(plan: SegmentPlan(
+            entries: (0..<4).map { .init(startPTS: Int64($0) * 6000, duration: 6.0) },
+            basis: .keyframeIndex, timeBaseNum: 1, timeBaseDen: 1000
+        ))
+        var provider = PlanSegmentProvider(root: root, coordinator: coordinator)
+        provider.isSuperseded = { [store] index in store.isSuperseded(index: index) }
+        // No producer behind this provider, so a pending serve can only run
+        // out its window; shortened so the suite does not wait 15 s twice.
+        provider.productionTimeout = .milliseconds(300)
+
+        guard case .data(let hit, _) = await provider.data(forPath: "seg00000.m4s"), hit == oldBytes else {
+            Issue.record("the fixture must be servable before the offset changes")
+            return
+        }
+
+        #expect(store.supersedeAll() == [0])
+        // Deliberately NOT unlinked: this is the window the defect lived in.
+        #expect(FileManager.default.fileExists(
+            atPath: root.appendingPathComponent("seg00000.m4s").path))
+
+        for path in ["seg00000.m4s", "audio0/seg00000.m4s"] {
+            guard case .pending(let pending) = await provider.data(forPath: path) else {
+                Issue.record("\(path) was served off disk after it was superseded")
+                return
+            }
+            // The wait must not pick the lingering file up either — it is
+            // still there, and "it exists" is not "it is the right bytes".
+            guard case .notFound = await pending.resolve() else {
+                Issue.record("the pending serve fell back on the superseded \(path)")
+                return
+            }
+        }
+
+        // …and a superseded index is not a permanent 404: rewritten at the new
+        // offset, it serves again.
+        let newBytes = Data("segment muxed at the new offset".utf8)
+        try store.publish(index: 0, start: 0, end: 6, data: newBytes, root: root)
+        store.markProduced(index: 0)
+        guard case .data(let served, _) = await provider.data(forPath: "seg00000.m4s") else {
+            Issue.record("the rewritten segment must serve")
+            return
+        }
+        #expect(served == newBytes)
+    }
+
+    /// The same claim end to end, on the timing a host actually uses: watch
+    /// `pendingAudioDelaySeconds`, refresh the player the moment it clears.
+    /// That fetch must never be answered with the pre-change segment.
+    ///
+    /// The deterministic proof of the window is the provider test above — a
+    /// 6 s fixture rewrites its first segment so fast that the race is hard to
+    /// lose here. This one pins the whole path, cache policy included, so a
+    /// regression anywhere between the flag and the socket is visible.
+    @Test("A fetch made the instant the pending delay clears cannot get the old bytes")
+    func fetchWhenPendingClearsNeverServesTheOldSegment() async throws {
+        let session = try PrismCoreSession(url: try fixture("h264_aac_30s.mkv"), forceMuxedShape: true)
+        do {
+            let playlist = try await session.start()
+            let root = await session.workDirectory
+            let segment0 = playlist.deletingLastPathComponent().appendingPathComponent("seg00000.m4s")
+            let before = try await uncachedFetch(segment0)
+            let baselineAudio = try #require(
+                try segmentTimestamps(root: root, index: 0)[AVMEDIA_TYPE_AUDIO])
+
+            let delay = -0.5
+            try #require(await session.setAudioDelaySeconds(delay) == .pendingReanchor)
+            // Spun, not polled: the window between the flag clearing and the
+            // old files being unlinked is milliseconds wide, and a sleep
+            // between checks is exactly what would hide the defect.
+            let deadline = ContinuousClock.now + .seconds(10)
+            while await session.pendingAudioDelaySeconds != nil, ContinuousClock.now < deadline {
+                await Task.yield()
+            }
+            try #require(await session.pendingAudioDelaySeconds == nil,
+                         "the producer never took the request up")
+            #expect(await session.audioDelaySeconds == delay)
+
+            let after = try await uncachedFetch(segment0)
+            #expect(after != before,
+                    "the fetch a host makes when pending clears was served the pre-change segment")
+            // Not merely different — the bytes carry the offset the engine is
+            // now reporting as in force.
+            let servedAudio = try #require(
+                try segmentTimestamps(root: root, index: 0)[AVMEDIA_TYPE_AUDIO])
+            #expect(abs(servedAudio.last! - (baselineAudio.last! + delay)) <= audioFrameSeconds)
+            await session.stop()
+        } catch { await session.stop(); throw error }
+    }
+
+    /// A fetch with every cache defeated — this suite is asking what the
+    /// SERVER answers, not what URLSession remembers.
+    private func uncachedFetch(_ url: URL) async throws -> Data {
+        var request = URLRequest(url: url)
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        return try await URLSession.shared.data(for: request).0
     }
 
     @Test("Before start() the change is in force at once; after stop() it is refused")

@@ -106,8 +106,18 @@ final class HTTPRangeInput {
             } catch { HTTPOriginCoordinator.shared.release(origin); throw error }
             let status = response.response?.statusCode ?? 0
             if response.error != nil && (status == 0 || status == 206) {
-                latch(.originUnreachable(status: status == 0 ? nil : status, url: url,
-                    underlying: response.error))
+                // No status, even when the origin answered 206 first. The two
+                // are about different things: the status describes a *response*
+                // that succeeded, the error describes a *transfer* that did
+                // not, and only the second one failed. Carrying the 206 here
+                // made `retryability` read "non-nil status below 500" as
+                // `.permanent` and tell hosts not to retry a dropped socket on
+                // a healthy origin. Fixed at the recording site rather than by
+                // teaching `retryability` about success codes, because a
+                // failure carrying a success status is a state that should not
+                // exist — the transfer error is the whole evidence, and it
+                // rides along in `underlying`.
+                latch(.originUnreachable(status: nil, url: url, underlying: response.error))
                 HTTPOriginCoordinator.shared.refuse(origin, retryAfter: "0.25")
                 HTTPOriginCoordinator.shared.release(origin)
                 continue

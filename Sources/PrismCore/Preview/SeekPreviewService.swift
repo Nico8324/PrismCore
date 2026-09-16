@@ -289,13 +289,21 @@ public actor SeekPreviewService {
                 "avformat_open_input(preview)"
             )
         } catch {
-            throw interruptGuard.customInputFailure ?? error
+            throw interruptGuard.customInputFailure ?? interruptGuard.originFailure ?? error
         }
         guard let context else { throw Failure.undecodable("open failed") }
         input = context
-        try FFmpegError.check(
-            avformat_find_stream_info(context, nil), "avformat_find_stream_info(preview)"
-        )
+        do {
+            try FFmpegError.check(
+                avformat_find_stream_info(context, nil), "avformat_find_stream_info(preview)"
+            )
+        } catch {
+            // The analysis reads too, and a host or origin that dies here dies
+            // exactly as it would have during the open — same order, same
+            // answer: whoever supplied the bytes knows more than the errno
+            // they were reduced to.
+            throw interruptGuard.customInputFailure ?? interruptGuard.originFailure ?? error
+        }
 
         let best = av_find_best_stream(context, AVMEDIA_TYPE_VIDEO, -1, -1, nil, 0)
         guard best >= 0, let stream = context.pointee.streams[Int(best)] else {

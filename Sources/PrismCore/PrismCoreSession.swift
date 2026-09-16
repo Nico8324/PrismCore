@@ -46,7 +46,72 @@ import CoreGraphics
 public actor PrismCoreSession {
     private let cachedPreview = CachedSegmentPreview()
     private var stopped = false
-    public var audioDelaySeconds: Double { configuration.audioDelaySeconds }
+    /// The audio offset the producer is muxing with right now, in seconds —
+    /// what a host should show as the current lip-sync correction.
+    ///
+    /// Not necessarily the last value handed to `setAudioDelaySeconds(_:)`:
+    /// see `pendingAudioDelaySeconds` and the contract on that method.
+    public var audioDelaySeconds: Double { remuxer.audioDelaySeconds }
+
+    /// A requested offset the producer has not taken up yet, or `nil` when
+    /// there is none. Non-nil means what is being served still carries
+    /// `audioDelaySeconds`.
+    public var pendingAudioDelaySeconds: Double? { remuxer.pendingAudioDelaySeconds }
+
+    /// What `setAudioDelaySeconds(_:)` did.
+    public enum AudioDelayChange: Sendable, Equatable {
+        /// In force before the call returned. Only happens before `start()`,
+        /// when no segment has been written with the old value.
+        case inForce
+        /// Accepted, and a producer re-anchor has been asked for. Segments
+        /// muxed with the old offset are discarded as it lands, so nothing
+        /// stale can be served afterwards — but AVPlayer plays what it has
+        /// ALREADY buffered (several seconds) at the old offset, and only
+        /// hears the new one once that drains or the host seeks. Poll
+        /// `pendingAudioDelaySeconds` for the moment it takes effect.
+        case pendingReanchor
+        /// This session cannot change the offset: its source could not be
+        /// planned (live, or a container with no usable index), so the
+        /// producer runs once head-to-EOF and never re-anchors. The request
+        /// is NOT stored — a new session is the only way. Nothing changed.
+        case unsupported
+        /// The session is stopped. Nothing changed.
+        case sessionStopped
+    }
+
+    /// Change the audio offset while the title is playing — lip-sync
+    /// correction is something a viewer turns with the picture in front of
+    /// them, not a value chosen before the first frame.
+    ///
+    /// Clamped to +/-2 s; a non-finite value becomes zero. Video, subtitles
+    /// and the source clock are untouched.
+    ///
+    /// **When it takes effect.** On this (remux) path, never immediately: the
+    /// engine serves fMP4 segments that were written with the previous offset,
+    /// and the offset moves audio dts, which cannot step backwards inside a
+    /// fragment the muxer is already writing. The call asks the producer to
+    /// re-anchor at the playhead; at that re-anchor the new offset goes in
+    /// force and every segment written with the old one is discarded, so a
+    /// later seek cannot serve audio at the offset the viewer corrected away
+    /// from. The cost is visible: the picture re-buffers while production
+    /// catches up, and the host should tell the viewer so. The return value
+    /// and `pendingAudioDelaySeconds` are the honest report of where the
+    /// change stands — `audioDelaySeconds` only ever names what is in force.
+    ///
+    /// The software path answers a different question with the same name:
+    /// `SoftwarePlaybackPipeline.setAudioDelaySeconds(_:completion:)` takes
+    /// effect at the renderer, within the queue's depth, with no re-buffer.
+    @discardableResult
+    public func setAudioDelaySeconds(_ seconds: Double) -> AudioDelayChange {
+        guard !stopped else { return .sessionStopped }
+        guard started else {
+            // Nothing is on disk yet, so there is nothing to invalidate and
+            // no re-anchor to wait for.
+            remuxer.audioDelaySeconds = seconds
+            return .inForce
+        }
+        return remuxer.requestAudioDelay(seconds) ? .pendingReanchor : .unsupported
+    }
     /// Summary of usable base audio routes. Inspect audioTrackDeliveries when
     /// multiple renditions have different outcomes; the host owns selection.
     public nonisolated var audioDelivery: AudioDelivery { remuxer.audioDeliveryStore.summary }
@@ -86,11 +151,17 @@ public actor PrismCoreSession {
         var forceMuxedShape: Bool
         var keyframeIndexCacheDirectory: URL?
         var dialogueBoost: [DialogueBoostLevel]
-        var audioDelaySeconds: Double
         var coordinatedHTTP: Bool
     }
 
     private let configuration: Configuration
+    /// What a clone (fallback session) carries: the value the host last asked
+    /// for, pending or not. A fresh session writes every segment itself, so a
+    /// request this one could not take up yet is in force there from the
+    /// first packet.
+    private var audioDelayForClone: Double {
+        remuxer.pendingAudioDelaySeconds ?? remuxer.audioDelaySeconds
+    }
     /// External subtitle registrations, replayed onto a fallback session.
     private var externalSubtitles: [(url: URL, language: String?, name: String?, isForced: Bool)] = []
     /// The host's cue sink, replayed onto a fallback session the same way —
@@ -310,7 +381,6 @@ public actor PrismCoreSession {
             forceMuxedShape: forceMuxedShape,
             keyframeIndexCacheDirectory: keyframeIndexCacheDirectory,
             dialogueBoost: dialogueBoost,
-            audioDelaySeconds: AudioDelay.normalized(audioDelaySeconds),
             coordinatedHTTP: coordinatedHTTP || probed?.interruptGuard.usesCoordinatedHTTP == true
         )
 
@@ -432,7 +502,7 @@ public actor PrismCoreSession {
             // Carried for fidelity, though the muxed shape can't serve it:
             // boost renditions live in a master, and this shape has none.
             dialogueBoost: configuration.dialogueBoost,
-            audioDelaySeconds: configuration.audioDelaySeconds,
+            audioDelaySeconds: audioDelayForClone,
             coordinatedHTTP: configuration.coordinatedHTTP
         )
         try await replayExternalSubtitles(onto: fallback)
@@ -477,7 +547,7 @@ public actor PrismCoreSession {
             forceMuxedShape: false,
             keyframeIndexCacheDirectory: configuration.keyframeIndexCacheDirectory,
             dialogueBoost: configuration.dialogueBoost,
-            audioDelaySeconds: configuration.audioDelaySeconds,
+            audioDelaySeconds: audioDelayForClone,
             coordinatedHTTP: configuration.coordinatedHTTP
         )
         try await replayExternalSubtitles(onto: fallback)

@@ -23,6 +23,17 @@ final class ResidentSegmentStore: @unchecked Sendable {
         }
     }
 
+    /// Retire everything recorded and say what was retired, so the caller can
+    /// unlink the files. One step under the lock: a two-call read-then-retire
+    /// could miss a segment published between them and leave its file behind.
+    func retireAll() -> [Int] {
+        lock.withLock {
+            let indexes = Array(entries.keys)
+            entries.removeAll()
+            return indexes
+        }
+    }
+
     func retire(_ indexes: [Int]) {
         lock.withLock { for index in indexes { entries.removeValue(forKey: index) } }
     }

@@ -8,6 +8,53 @@ source-compatible.)
 
 ## [Unreleased]
 
+### Added
+
+- **The audio delay can be changed while the title is playing.** It is a
+  lip-sync control — a viewer turns it with the picture in front of them — and
+  a value fixed at construction was the one shape the feature could not have.
+  The clamp is unchanged (+/-2 s, non-finite becomes zero), and video,
+  subtitles and the source clock stay untouched.
+
+  `SoftwarePlaybackPipeline.setAudioDelaySeconds(_:completion:)` is in force
+  when it has run: the offset is applied where a decoded buffer reaches the
+  renderer, so the call flushes the audio renderer and refills it from the
+  source at the playhead — the move a track switch already made, now shared
+  between the two. The cost is a gap of decode-to-playhead time; the clock and
+  the video renderer never see it. Setting the offset it already has is a
+  no-op that reports success, so a slider settling back on its old value
+  costs no gap.
+
+  `PrismCoreSession.setAudioDelaySeconds(_:)` cannot be, and says so. The
+  engine is serving fMP4 segments that were written with the previous offset,
+  and the offset moves audio dts, which cannot step backwards inside a
+  fragment the muxer is already writing (`av_interleaved_write_frame` refuses
+  it). The call therefore asks the producer to re-anchor at the playhead and
+  returns `.pendingReanchor`; at that re-anchor the new offset goes in force
+  and **every segment written with the old one is discarded**, so a later
+  backward seek cannot serve audio at the offset the viewer just corrected
+  away from. `audioDelaySeconds` keeps naming what is actually being served
+  and `pendingAudioDelaySeconds` names a request that has not landed yet, so a
+  host can report the re-buffer honestly instead of showing a correction that
+  has not happened. A session whose source could not be planned (live, or a
+  container with no usable index) never re-anchors: it answers `.unsupported`
+  and stores nothing, because a request that can never arrive is worse than a
+  refusal. Fallback sessions carry the value the host last asked for.
+
+### Validation and limits
+
+- Synthetic macOS tests cover the software change at negative, zero-crossing
+  and positive offsets (the refilled audio presents AT the playhead, which
+  fails by the whole offset if either the rewind or the shift misses it), the
+  runtime clamp, the no-op, a refusal after stop, and on the remux path: the
+  pending report, the adoption at the re-anchor, the re-anchored segment's
+  bytes carrying the new offset, the discarded old segments, and a negative
+  offset still writing nothing below the timeline's origin.
+- What is NOT covered: AVPlayer's own buffer draining at the old offset, and
+  whether the result is audibly in sync — both need a device. The re-anchor
+  reproduces from the playhead, so a delay change costs the same re-buffer a
+  seek does.
+
 ## [2.3.0] — 2026-09-16
 
 ### Added

@@ -503,10 +503,40 @@ output during priming is normal. A terminal, completely drained silent bridge
 raises `AudioBridgeFailure.producedNoAudio` through the session error path.
 The software pipeline exposes `.decoded` only after its decoder opens.
 
-Audio delay is fixed at construction and preserved by fallback factories.
-Changing it during playback requires a replacement session and a host-managed
-handover at the current position. Both positive and negative offsets are bounded
-to two seconds; this does not add an AVPlayer transport controller to PrismCore.
+Audio delay can be changed while the title plays — it is a lip-sync control —
+and is preserved by fallback factories. Both positive and negative offsets are
+bounded to two seconds, and a non-finite value becomes zero. The two paths take
+a new value up differently, and each reports which:
+
+```swift
+switch session.setAudioDelaySeconds(0.2) {        // remux path
+case .pendingReanchor: break   // accepted; in force at the producer's re-anchor
+case .inForce: break           // only before start()
+case .unsupported: break       // no plan (live, or no usable index): unchanged
+case .sessionStopped: break
+}
+session.audioDelaySeconds          // what is being SERVED right now
+session.pendingAudioDelaySeconds   // a request not yet in force, else nil
+
+pipeline.setAudioDelaySeconds(0.2) // software path: in force when it has run
+```
+
+On the remux path the engine is serving fMP4 segments written with the previous
+offset, and the offset moves audio dts — which cannot step backwards inside a
+fragment the muxer is already writing. So the call asks the producer to
+re-anchor at the playhead; at that re-anchor the new offset goes in force and
+every segment written with the old one is discarded, so a later seek cannot
+serve audio at the offset the viewer corrected away from. The picture re-buffers
+while production catches up, and AVPlayer plays whatever it had already buffered
+at the old offset first — the host should say so in its UI. `audioDelaySeconds`
+names only what is in force.
+
+On the software path the offset is applied where a decoded buffer reaches the
+renderer: the call flushes the audio renderer and refills it from the source at
+the playhead, so the new value is in force as soon as the call has run. The cost
+is a gap of decode-to-playhead time, not a re-buffer. The clock, the picture and
+the subtitles are untouched on both paths; this does not add an AVPlayer
+transport controller to PrismCore.
 
 `coordinatedHTTP` is also available on `PrismCoreEngine.open`,
 `SourceProbe.open/openDetached`, `SeekPreviewService` and software `load(url:)`.

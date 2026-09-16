@@ -172,12 +172,24 @@ final class HLSRemuxer: @unchecked Sendable {
         /// default, so trusting this above all else is what opens an English
         /// film in Russian.
         var isDefault: Bool = false
+        /// The container's language tag, verbatim — `cze`, `ces`, `cs`,
+        /// `pt-BR`, `und`, or nothing at all. Normalized only at the point of
+        /// comparison (`LanguageMatch`), never on the way in: what the
+        /// container said is also what the master playlist prints.
+        var language: String?
 
-        init(index: Int32, codecID: AVCodecID, isOriginal: Bool = false, isDefault: Bool = false) {
+        init(
+            index: Int32,
+            codecID: AVCodecID,
+            isOriginal: Bool = false,
+            isDefault: Bool = false,
+            language: String? = nil
+        ) {
             self.index = index
             self.codecID = codecID
             self.isOriginal = isOriginal
             self.isDefault = isDefault
+            self.language = language
         }
     }
 
@@ -260,6 +272,11 @@ final class HLSRemuxer: @unchecked Sendable {
     /// the renditions shape can carry them — a boost lives in the master's
     /// audio group, and the muxed shape has no master.
     private let dialogueBoost: [DialogueBoostLevel]
+    /// The host's language hints, verbatim as it passed them. They steer which
+    /// rendition is DEFAULT and nothing else — no track is dropped, no decode
+    /// or bridge decision changes, and every track is still offered.
+    private let preferredAudioLanguage: String?
+    private let preferredSubtitleLanguage: String?
     /// Cross-session keyframe map (issue #34): consulted before the plan's
     /// index-load seek, fed by the sequential producer of a source whose own
     /// index couldn't be trusted. `nil` = no persistence, exactly as before.
@@ -442,6 +459,8 @@ final class HLSRemuxer: @unchecked Sendable {
         segmentCacheBytes: Int? = nil,
         forceMuxed: Bool = false,
         dialogueBoost: [DialogueBoostLevel] = [],
+        preferredAudioLanguage: String? = nil,
+        preferredSubtitleLanguage: String? = nil,
         probed: ProbedSource? = nil,
         input: PrismCoreInputFactory? = nil,
         keyframeCacheDirectory: URL? = nil,
@@ -468,6 +487,8 @@ final class HLSRemuxer: @unchecked Sendable {
         self.segmentCacheBytes = segmentCacheBytes
         self.forceMuxed = forceMuxed
         self.dialogueBoost = dialogueBoost
+        self.preferredAudioLanguage = preferredAudioLanguage
+        self.preferredSubtitleLanguage = preferredSubtitleLanguage
     }
 
     func cancel() {
@@ -591,11 +612,17 @@ final class HLSRemuxer: @unchecked Sendable {
         // reach it (in-band timed text is not HLS-conformant — muxing it in
         // gets the whole stream rejected by AVPlayer), they become WebVTT files
         // alongside the fMP4 segments.
-        let subtitleStreams = try subtitles.prepare(input: input)
+        let subtitleStreams = try subtitles.prepare(
+            input: input, preferredLanguage: preferredSubtitleLanguage
+        )
 
         let candidates = audioCandidates(input)
         let bestAudio = av_find_best_stream(input, AVMEDIA_TYPE_AUDIO, -1, videoIndex, nil, 0)
-        let routes = Self.routeAll(candidates: candidates, best: bestAudio >= 0 ? bestAudio : nil)
+        let routes = Self.routeAll(
+            candidates: candidates,
+            best: bestAudio >= 0 ? bestAudio : nil,
+            preferredLanguage: preferredAudioLanguage
+        )
 
         // Can this source be honestly wrapped in a master playlist at all? The
         // answer decides the whole output shape, so it is settled before a
@@ -639,7 +666,11 @@ final class HLSRemuxer: @unchecked Sendable {
 
         let shape: OutputShape = (!routes.isEmpty && masterIsPossible && !forceMuxed)
             ? .renditions(routes)
-            : .muxed(Self.chooseAudio(candidates: candidates, best: bestAudio >= 0 ? bestAudio : nil))
+            : .muxed(Self.chooseAudio(
+                candidates: candidates,
+                best: bestAudio >= 0 ? bestAudio : nil,
+                preferredLanguage: preferredAudioLanguage
+            ))
 
         // Demand-driven mode needs a trustworthy upfront segmentation. Only a
         // keyframe-based plan qualifies — uniform-plan boundaries are time
@@ -802,7 +833,9 @@ final class HLSRemuxer: @unchecked Sendable {
                 }
             }
             // Dialogue-boost renditions, derived from the DEFAULT track only
-            // (routes[0] — the one `chooseAudio` picked): the feature is "the
+            // (routes[0] — the one `chooseAudio` picked, which is the
+            // preferred-language track when one matched, so boost and DEFAULT
+            // can never name different tracks): the feature is "the
             // dialogue is hard to hear on the track I'm listening to", and one
             // extra decode→filter→encode chain per level is already real CPU;
             // one per level per TRACK would be a five-language MKV paying for
@@ -871,7 +904,10 @@ final class HLSRemuxer: @unchecked Sendable {
                 }
                 variant.audioRenditions = renditions.enumerated().map { ordinal, rendition in
                     // DEFAULT on the first rendition only, which is the track
-                    // `chooseAudio` would have picked (see `routeAll`).
+                    // `chooseAudio` would have picked (see `routeAll`) — and
+                    // therefore the host's `preferredAudioLanguage` when one
+                    // matched. Every other track is still declared and still
+                    // selectable; the preference moves the flag, not the menu.
                     rendition.rendition(groupID: Self.audioGroupID, isDefault: ordinal == 0)
                 }
                 // The WebVTT renditions `prepare` set up above. Declaring them
@@ -1565,7 +1601,8 @@ final class HLSRemuxer: @unchecked Sendable {
                 index: Int32(index),
                 codecID: par.codec_id,
                 isOriginal: disposition & AV_DISPOSITION_ORIGINAL != 0,
-                isDefault: disposition & AV_DISPOSITION_DEFAULT != 0
+                isDefault: disposition & AV_DISPOSITION_DEFAULT != 0,
+                language: avMetadataValue(input.pointee.streams[index]!.pointee.metadata, "language")
             ))
         }
         return candidates
@@ -1586,6 +1623,7 @@ final class HLSRemuxer: @unchecked Sendable {
     static func routeAll(
         candidates: [AudioCandidate],
         best: Int32?,
+        preferredLanguage: String? = nil,
         canBridge: (AVCodecID) -> Bool = { AudioBridge.canBridge(codecID: $0) }
     ) -> [AudioRoute] {
         let viable: [AudioRoute] = candidates.compactMap { candidate in
@@ -1597,7 +1635,12 @@ final class HLSRemuxer: @unchecked Sendable {
             }
             return nil
         }
-        guard let preferred = chooseAudio(candidates: candidates, best: best, canBridge: canBridge),
+        guard let preferred = chooseAudio(
+                  candidates: candidates,
+                  best: best,
+                  preferredLanguage: preferredLanguage,
+                  canBridge: canBridge
+              ),
               let position = viable.firstIndex(where: { $0.index == preferred.index })
         else { return viable }
         var ordered = viable
@@ -1642,6 +1685,14 @@ final class HLSRemuxer: @unchecked Sendable {
     ///
     /// Order of preference, and the reasoning:
     ///
+    /// -1. A track whose language matches the host's `preferredAudioLanguage`,
+    ///    when there is one. Above *everything* below, including the original
+    ///    soundtrack: the rungs below are the engine guessing what the viewer
+    ///    would want, and this rung is the viewer having said. Matching is
+    ///    tolerant (`LanguageMatch`), an exact region match beats a bare one,
+    ///    and a track that cannot be carried at all is still skipped — a
+    ///    rendition AVPlayer can't play is worse than the wrong language.
+    ///    No match changes nothing: the rungs below decide exactly as before.
     /// 0. A track the container marks as the film's **original** soundtrack.
     ///    Everything below this line ranks by what the audio *is* — codec,
     ///    channels, whether the bits can pass through untouched — and none of
@@ -1670,17 +1721,18 @@ final class HLSRemuxer: @unchecked Sendable {
     /// Rungs 0 and 3 are additive: a source that marks neither gets exactly the
     /// order it got before, which is why adding them cannot cost an Atmos track.
     ///
-    /// What this still cannot do is prefer a *language*. That needs to know what
-    /// the picture was shot in, which is a fact about the film that no container
-    /// reliably carries — a host that knows it (from a metadata service, or from
-    /// the person) is better placed, and can select over the top of the
-    /// `DEFAULT` this produces.
+    /// What this still cannot do *by itself* is prefer a language: which one a
+    /// film is meant to be heard in is a fact about the film that no container
+    /// reliably carries. A host that knows it — from a metadata service, or
+    /// from the person — passes it as `preferredAudioLanguage` and it becomes
+    /// rung -1; a host that doesn't gets exactly the order it always got.
     ///
     /// `canBridge` is injected so the decision can be exercised as a pure
     /// function in tests, independent of what the linked FFmpeg supports.
     static func chooseAudio(
         candidates: [AudioCandidate],
         best: Int32?,
+        preferredLanguage: String? = nil,
         canBridge: (AVCodecID) -> Bool = { AudioBridge.canBridge(codecID: $0) }
     ) -> AudioRoute? {
         /// How this track would be carried, or `nil` when it cannot be.
@@ -1692,6 +1744,23 @@ final class HLSRemuxer: @unchecked Sendable {
                 return AudioRoute(index: candidate.index, mode: .bridge)
             }
             return nil
+        }
+
+        // Rung -1. Only carriable candidates are offered to the matcher: a
+        // match on a track this build can neither copy nor bridge would hand
+        // back nothing and skip the remaining rungs entirely, turning a
+        // preference into silence.
+        let carriable = candidates.filter { route($0) != nil }
+        if let index = LanguageMatch.bestIndex(
+            in: carriable,
+            preferred: preferredLanguage,
+            language: \.language,
+            // Tie-break inside the asked-for language, in the same order the
+            // rungs below use: the original soundtrack, then the container's
+            // default flag, then container order.
+            bonus: { ($0.isOriginal ? 2 : 0) + ($0.isDefault ? 1 : 0) }
+        ), let route = route(carriable[index]) {
+            return route
         }
 
         if let original = candidates.first(where: \.isOriginal), let route = route(original) {

@@ -82,5 +82,12 @@ struct FuzzSmokeTests {
             TextSubtitleConverter.cueText(from: Data(FuzzSeeds.tx3gSample), kind: .movText)
                 == "Sample"
         )
+        // The caption seed must reach the terminal, not merely the SEI walk: a
+        // flipped-and-erased pop-on caption is the whole path in one packet.
+        let captionReader = ClosedCaptionReader(framing: .annexB, codec: .h264)
+        FuzzSeeds.captionedAccessUnit.withUnsafeBufferPointer {
+            captionReader.ingest($0, presentationSeconds: 1)
+        }
+        #expect(captionReader.flush(at: 2).first?.cue.text == "HI♪")
     }
 }

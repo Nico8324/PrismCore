@@ -64,6 +64,11 @@ final class SubtitleRenditionSet: @unchecked Sendable {
             /// Bitmap packets → composition → OCR → cue text. Class-typed:
             /// the pending-cue lifecycle is mutable state.
             case bitmap(BitmapRenditionTrack)
+            /// CEA-608 service riding inside the video elementary stream. Its
+            /// cues arrive from `ingestVideoPacket`, not from `ingest` — there
+            /// is no subtitle packet to hand over, which is exactly why closed
+            /// captions were invisible to this engine until now.
+            case closedCaption(channel: Int)
             /// External file, converted up front — `ingest` never sees it.
             case preloaded
         }
@@ -200,6 +205,14 @@ final class SubtitleRenditionSet: @unchecked Sendable {
     /// Set once the presentation origin is known; guards a flush that would
     /// otherwise print cues against origin 0.
     private var originSet = false
+    /// Built only when the scout found captions in the video stream. `nil` —
+    /// the overwhelmingly common case — is what keeps the copy loop's caption
+    /// tap free for every source that has none.
+    private var captionReader: ClosedCaptionReader?
+
+    /// Whether this session has any closed-caption rendition, so the copy loop
+    /// can skip the tap on one boolean rather than an optional chain per packet.
+    var hasClosedCaptions: Bool { captionReader != nil }
 
     // MARK: Host cue tap
 
@@ -241,12 +254,15 @@ final class SubtitleRenditionSet: @unchecked Sendable {
     // MARK: - Setup
 
     /// Create a rendition per convertible source: embedded text streams first
-    /// (in stream order), then registered external files. Returns the set of
-    /// input stream indices whose packets `ingest` wants.
+    /// (in stream order), then the closed-caption services the scout found in
+    /// the video, then registered external files. Returns the set of input
+    /// stream indices whose packets `ingest` wants.
     @discardableResult
     func prepare(
         input: UnsafeMutablePointer<AVFormatContext>,
-        preferredLanguage: String? = nil
+        preferredLanguage: String? = nil,
+        closedCaptions: ClosedCaptionScout.Finding? = nil,
+        closedCaptionLanguage: String? = nil
     ) throws -> Set<Int32> {
         var built: [Track] = []
         var descriptions: [MasterPlaylistBuilder.SubtitleRendition] = []
@@ -317,6 +333,41 @@ final class SubtitleRenditionSet: @unchecked Sendable {
                     )
                 )
             )
+        }
+
+        if let closedCaptions {
+            captionReader = ClosedCaptionReader(
+                framing: closedCaptions.framing, codec: closedCaptions.codec
+            )
+            for channel in closedCaptions.channels {
+                let ordinal = built.count
+                let writer = try WebVTTRenditionWriter(
+                    directory: outputDirectory.appendingPathComponent(
+                        Self.directoryName(ordinal), isDirectory: true
+                    )
+                )
+                built.append(
+                    Track(
+                        // No input stream index: captions have no stream of
+                        // their own, which is the whole difficulty.
+                        inputIndex: nil, timeBase: nil,
+                        converter: .closedCaption(channel: channel), writer: writer
+                    )
+                )
+                descriptions.append(
+                    MasterPlaylistBuilder.SubtitleRendition(
+                        name: ClosedCaptionReader.renditionName(
+                            channel: channel, language: closedCaptionLanguage
+                        ),
+                        language: closedCaptionLanguage,
+                        uri: "\(Self.directoryName(ordinal))/index.m3u8",
+                        // A caption service is never "forced": it carries the
+                        // whole programme's dialogue, and FORCED=YES would keep
+                        // AVKit from ever listing it.
+                        isForced: false
+                    )
+                )
+            }
         }
 
         for file in lock.withLock({ externalFiles }) {
@@ -589,7 +640,9 @@ final class SubtitleRenditionSet: @unchecked Sendable {
         guard let track = tracks.first(where: { $0.inputIndex == streamIndex }) else { return }
 
         switch track.converter {
-        case .preloaded:
+        // Neither has a source packet: an external file was converted in
+        // `prepare`, a caption service arrives through `ingestVideoPacket`.
+        case .preloaded, .closedCaption:
             return
         case .bitmap(let bitmap):
             // Bitmap events carry their own AV_TIME_BASE-derived times; the
@@ -629,9 +682,54 @@ final class SubtitleRenditionSet: @unchecked Sendable {
         }
     }
 
+    /// One **video** packet, for the closed captions riding inside it.
+    ///
+    /// `presentationSeconds` is the packet's PTS on the source's own axis —
+    /// the same axis `ingest` puts a text cue's start on, and the one
+    /// `flushSegment` cuts against. Using DTS here instead would drift every
+    /// caption on any stream with B-frames.
+    ///
+    /// No-op unless the scout found captions, so a source without them pays
+    /// nothing but the caller's own `hasClosedCaptions` check.
+    func ingestVideoPacket(_ bytes: UnsafeBufferPointer<UInt8>, presentationSeconds: Double) {
+        guard let captionReader else { return }
+        captionReader.ingest(bytes, presentationSeconds: presentationSeconds)
+        deliver(captionReader.drainCues())
+    }
+
+    /// End of stream: release the reorder window and close whatever caption is
+    /// still standing. Without this the last few frames of captions are still
+    /// in the window when the producer stops, and the caption on screen at EOF
+    /// never gets an end.
+    func flushClosedCaptions(endSeconds: Double) {
+        guard let captionReader else { return }
+        deliver(captionReader.flush(at: endSeconds))
+    }
+
+    private func deliver(_ cues: [ClosedCaptionReader.ChannelCue]) {
+        guard !cues.isEmpty else { return }
+        for entry in cues {
+            guard let track = tracks.first(where: {
+                if case .closedCaption(let channel) = $0.converter { return channel == entry.channel }
+                return false
+            }) else { continue }
+            track.writer.add(entry.cue)
+            // A caption has no source stream to name, so the host tap gets a
+            // synthetic negative index — CC1 is -1, CC4 is -4. Negative is the
+            // point: it can never collide with a real `SubtitleTrackInfo`
+            // index, so a host routing cues by index cannot mistake one for a
+            // demuxed track.
+            emitHostCue(streamIndex: Int32(-entry.channel), entry.cue)
+        }
+    }
+
     /// Cut every rendition on the video segment's own boundaries (source
     /// seconds), so segment N of a rendition covers segment N of the variant.
     func flushSegment(start: Double, end: Double) throws {
+        // Before anything is written: a caption standing across this cut has to
+        // become a cue up to the boundary, or the segment that was showing it
+        // ships without it.
+        if let captionReader { deliver(captionReader.advance(to: end)) }
         for track in tracks {
             // An open bitmap cue splits at the boundary: its first part is
             // written into this segment, its tail re-opens into the next —
@@ -664,6 +762,9 @@ final class SubtitleRenditionSet: @unchecked Sendable {
 
     /// Demand-driven jump on every rendition.
     func reanchor(segmentIndex: Int, startSeconds: Double) {
+        // The reorder window holds frames from before the seek and the 608
+        // terminal holds a screen that belongs to them; neither survives a jump.
+        captionReader?.reanchor()
         for track in tracks {
             if case .bitmap(let bitmap) = track.converter {
                 bitmap.reanchor()

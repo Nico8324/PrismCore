@@ -21,7 +21,58 @@ package enum FuzzSeeds {
         "text-subtitles": [
             Array(srtText.utf8), Array(vttText.utf8), Array(assEvent.utf8), tx3gSample,
         ],
+        "a53-captions": [captionedAccessUnit],
     ]
+
+    /// An H.264 Annex-B access unit carrying a complete A/53 caption SEI: a
+    /// pop-on caption loaded, addressed to row 15, printed and flipped onto the
+    /// screen, so a mutation anywhere in it lands somewhere the decoder
+    /// actually goes.
+    ///
+    /// No erase: every pair in one packet shares one timestamp, and an erase at
+    /// the same instant as the flip would close a zero-length interval and emit
+    /// nothing at all. The caption is left standing for the flush to close,
+    /// which is also the shape that exercises the open-cue cap.
+    package static let captionedAccessUnit: [UInt8] = {
+        // (cc_type, byte0, byte1), with odd parity as the wire carries it.
+        func parity(_ byte: UInt8) -> UInt8 {
+            let value = byte & 0x7F
+            return value.nonzeroBitCount % 2 == 0 ? value | 0x80 : value
+        }
+        let pairs: [(UInt8, UInt8)] = [
+            (0x14, 0x20),  // RCL — pop-on
+            (0x14, 0x2E),  // ENM
+            (0x14, 0x60),  // PAC: row 15, column 0
+            (0x48, 0x49),  // "HI"
+            (0x11, 0x37),  // special character: eighth note
+            (0x14, 0x2F),  // EOC — the flip
+        ]
+        var userData: [UInt8] = [0xB5, 0x00, 0x31, 0x47, 0x41, 0x39, 0x34, 0x03]
+        userData.append(0x40 | UInt8(pairs.count))  // process_cc_data_flag, cc_count
+        userData.append(0xFF)                       // em_data
+        for (byte0, byte1) in pairs {
+            userData += [0xFC, parity(byte0), parity(byte1)]  // valid, NTSC field 1
+        }
+
+        var rbsp: [UInt8] = [0x04, UInt8(userData.count)] + userData + [0x80]
+        // Emulation prevention, so the seed is a bitstream and not merely a
+        // buffer that happens to parse.
+        var escaped: [UInt8] = []
+        var zeroRun = 0
+        for byte in rbsp {
+            if zeroRun >= 2 && byte <= 0x03 {
+                escaped.append(0x03)
+                zeroRun = 0
+            }
+            zeroRun = byte == 0 ? zeroRun + 1 : 0
+            escaped.append(byte)
+        }
+        rbsp = escaped
+        // A slice NAL first: the SEI is not the first unit in a real access
+        // unit, and a walk that only ever sees it first is not being tested.
+        return [0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84]
+            + [0x00, 0x00, 0x01, 0x06] + rbsp
+    }()
 
     /// A `dec3` payload that declares the type-A extension — every field the
     /// parser walks, ending in `flag_ec3_extension_type_a = 1`, index 16.

@@ -79,6 +79,43 @@ wrong timing. Next release is a 3.0.1 patch: no signature moves.
   between captions and resumes later under a continuation class code. Field 1
   carries no XDS and runs no packet state. A field-2 XDS seed joins the fuzz
   corpus so mutations reach the new state machine.
+Patch release 3.0.1.
+
+### Fixed
+
+- **A runtime audio-delay change no longer has a window in which the old
+  offset is still servable.** 3.0.0's re-anchor discarded every segment muxed
+  with the previous offset, but it did so in two steps that were not in step
+  with each other: the in-memory entries were cleared at once, and the files
+  were unlinked afterwards on a background queue — while the serving path
+  reads the **filesystem**. `pendingAudioDelaySeconds` cleared at the first
+  step, so between the two the engine publicly reported the new offset as in
+  force and a fetch was still answered, as a hit, with bytes carrying the old
+  one. That is precisely the instant a host lands in: the documented way to
+  use this API is to watch `pendingAudioDelaySeconds` and refresh the player
+  when it clears, and AVPlayer then caches that stale answer for the rest of
+  the session — the correction looks applied and is not.
+
+  Retirement now reaches the serving path through `ResidentSegmentStore`
+  rather than through the filesystem: the re-anchor marks the whole cache
+  superseded **inside the same lock acquisition that clears the pending
+  request**, so the flag cannot clear before the old output is unservable, and
+  `PlanSegmentProvider` consults that state ahead of every media-segment disk
+  read (and again inside a pending serve's wait, since the lingering file
+  would otherwise satisfy it). The deletion stays on the unlink queue —
+  a whole cache's worth of `removeItem` calls does not belong on the producer
+  thread between a demuxer seek and the first packet of the new anchor.
+
+  A superseded index is a miss, never a 404: the fetch re-anchors production
+  there and waits for the rewritten segment, exactly as an evicted one does,
+  so nothing becomes unseekable. The flag is cleared again when the index has
+  been cut in full — variant **and** every rendition of that cut, because the
+  renditions are written after the variant and an `audioN/` fetch in between
+  would otherwise be answered with the old offset.
+
+  A host that waits for `pendingAudioDelaySeconds` to clear and then refreshes
+  is safe with no delay of its own; the first fetch after the change may wait
+  for production, which is the re-buffer the API already documents.
 
 ## [3.0.0] — 2026-09-16
 

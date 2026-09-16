@@ -154,6 +154,11 @@ struct ClosedCaptionTests {
     /// hold a two-row roll-up window.
     private static let addressRow4 = CaptionFixture.pair(0x12, 0x60)
 
+    /// The same pairs on the second 608 field, where CC3, CC4 and XDS live.
+    private static func field2(_ pairs: [CaptionFixture.Triplet]) -> [CaptionFixture.Triplet] {
+        pairs.map { CaptionFixture.Triplet(type: 1, byte0: $0.byte0, byte1: $0.byte1) }
+    }
+
     // MARK: - Carriage
 
     @Test("A/53 cc_data is found in an H.264 Annex-B access unit")
@@ -434,13 +439,10 @@ struct ClosedCaptionTests {
     @Test("Field 2 decodes as CC3")
     func secondFieldIsChannelThree() {
         let reader = makeReader()
-        func field2(_ pairs: [CaptionFixture.Triplet]) -> [CaptionFixture.Triplet] {
-            pairs.map { CaptionFixture.Triplet(type: 1, byte0: $0.byte0, byte1: $0.byte1) }
-        }
-        ingest(reader, field2([Self.resumeCaptionLoading, Self.addressRow15]
+        ingest(reader, Self.field2([Self.resumeCaptionLoading, Self.addressRow15]
             + CaptionFixture.text("ES")), at: 0.5)
-        ingest(reader, field2([Self.endOfCaption]), at: 1.0)
-        ingest(reader, field2([Self.eraseDisplayed]), at: 2.0)
+        ingest(reader, Self.field2([Self.endOfCaption]), at: 1.0)
+        ingest(reader, Self.field2([Self.eraseDisplayed]), at: 2.0)
 
         let cues = reader.flush(at: 3.0)
         #expect(cues.map(\.channel) == [3])
@@ -524,6 +526,110 @@ struct ClosedCaptionTests {
         #expect(cues.count == 1)
         #expect(cues.first?.cue.start == 1.0)
         #expect(cues.first?.cue.end == 1.0 + CEA608ChannelDecoder.maximumCueSeconds)
+    }
+
+    /// The cap is measured from when the caption was **displayed**, not from
+    /// the interval being closed. Tied to the interval, every `advance(to:)`
+    /// renewed the allowance: a caption displayed at 1 s and split at 6, 12,
+    /// 18 … was re-emitted for the rest of the programme by the very mechanism
+    /// meant to take it off screen. One flush never showed it, which is why the
+    /// cap test above passed while the defect shipped.
+    @Test("An unterminated caption expires once, not again at every segment boundary")
+    func unterminatedCaptionExpiresAcrossBoundaries() {
+        let reader = makeReader()
+        ingest(reader, [Self.resumeCaptionLoading, Self.addressRow15] + CaptionFixture.text("HI"), at: 0.5)
+        ingest(reader, [Self.endOfCaption], at: 1.0)
+        let expiry = 1.0 + CEA608ChannelDecoder.maximumCueSeconds
+
+        let first = reader.advance(to: 6.0)
+        #expect(first.map(\.cue.text) == ["HI"])
+        #expect(first.first?.cue.start == 1.0)
+        #expect(first.first?.cue.end == 6.0)
+
+        // Still standing, so the second boundary still emits — but only up to
+        // the caption's own expiry, not a fresh ten seconds from the boundary.
+        let second = reader.advance(to: 12.0)
+        #expect(second.map(\.cue.text) == ["HI"])
+        #expect(second.first?.cue.start == 6.0)
+        #expect(second.first?.cue.end == expiry)
+
+        // Past the expiry there is nothing left to emit, however many
+        // boundaries follow and however long the file runs.
+        #expect(reader.advance(to: 18.0).isEmpty)
+        #expect(reader.advance(to: 24.0).isEmpty)
+        #expect(reader.flush(at: 600.0).isEmpty)
+    }
+
+    /// Roll-up genuinely keeps text on screen for minutes at a time, and every
+    /// carriage return really does redisplay the rows it scrolls. So the cap
+    /// has to travel with the scroll — pinned to the first row instead, a news
+    /// broadcast would go silent ten seconds in.
+    @Test("Roll-up keeps emitting past the cap, because every scroll redisplays its rows")
+    func rollUpKeepsEmittingAcrossBoundaries() {
+        let reader = makeReader()
+        ingest(reader, [Self.rollUpTwoRows, Self.addressRow15], at: 0.0)
+        ingest(reader, CaptionFixture.text("AA"), at: 0.5)
+
+        var texts: [String] = []
+        for step in 1...6 {
+            let boundary = Double(step) * 4.0
+            ingest(reader, [Self.carriageReturn], at: boundary - 1.0)
+            ingest(reader, CaptionFixture.text("R\(step)"), at: boundary - 0.5)
+            texts += reader.advance(to: boundary).map(\.cue.text)
+        }
+        // Twenty-four seconds in, far past the first row's own ten-second
+        // allowance, and still producing the live window.
+        #expect(texts.last == "R5\nR6")
+        #expect(reader.flush(at: 26.0).map(\.cue.text) == ["R5\nR6"])
+    }
+
+    // MARK: - XDS
+
+    /// XDS — programme name, rating, time of day — shares field 2 with CC3 and
+    /// CC4, and only its framing pairs sit outside the printable range. The
+    /// payload between them is ordinary text, so rejecting pairs one at a time
+    /// dropped the brackets and printed the programme name into the captions.
+    @Test("XDS programme metadata never reaches a caption")
+    func xdsPayloadDoesNotLeakIntoCaptions() {
+        let reader = makeReader()
+        // Roll-up, because that is what live captioning — the content XDS rides
+        // with — uses, and because it writes straight to the displayed memory,
+        // which is where a leak is visible.
+        ingest(reader, Self.field2([Self.rollUpTwoRows, Self.addressRow15]), at: 0.0)
+        ingest(reader, Self.field2(CaptionFixture.text("HI")), at: 0.5)
+        // A complete XDS packet: class 0x01 / type 0x03 (current programme
+        // name), the name as printable pairs, then 0x0F and its checksum.
+        ingest(reader, Self.field2([CaptionFixture.pair(0x01, 0x03)]
+            + CaptionFixture.text("MOVIE!") + [CaptionFixture.pair(0x0F, 0x2A)]), at: 1.0)
+        ingest(reader, Self.field2([Self.eraseDisplayed]), at: 2.0)
+
+        let cues = reader.flush(at: 3.0)
+        #expect(cues.map(\.channel) == [3])
+        #expect(cues.map(\.cue.text) == ["HI"])
+    }
+
+    /// A caption control code may interrupt an XDS packet, and real streams do
+    /// it constantly — XDS fills the gaps between captions, and the rest of the
+    /// packet arrives later under a continuation class code. Suppressing until
+    /// `0x0F` regardless would swallow every caption after the first interrupted
+    /// packet; not resuming on the continuation would leak all over again.
+    @Test("A caption control code takes field 2 back from an unfinished XDS packet")
+    func captionControlInterruptsXDS() {
+        let reader = makeReader()
+        // An XDS packet opens and its payload starts arriving…
+        ingest(reader, Self.field2([CaptionFixture.pair(0x01, 0x03)]
+            + CaptionFixture.text("MO")), at: 0.5)
+        // …and a caption takes the wire back before it ever terminates.
+        ingest(reader, Self.field2([Self.rollUpTwoRows, Self.addressRow15]), at: 1.0)
+        ingest(reader, Self.field2(CaptionFixture.text("HI")), at: 1.5)
+        // The encoder resumes the packet under the even (continuation) class
+        // code; that payload is still not caption text.
+        ingest(reader, Self.field2([CaptionFixture.pair(0x02, 0x03)]
+            + CaptionFixture.text("RE") + [CaptionFixture.pair(0x0F, 0x2A)]), at: 2.0)
+        ingest(reader, Self.field2([Self.eraseDisplayed]), at: 2.5)
+
+        let cues = reader.flush(at: 3.0)
+        #expect(cues.map(\.cue.text) == ["HI"])
     }
 
     /// A demand-driven seek re-reads a different region: the screen and the

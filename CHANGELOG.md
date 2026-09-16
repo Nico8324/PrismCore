@@ -8,6 +8,41 @@ source-compatible.)
 
 ## [Unreleased]
 
+Two CEA-608 caption defects, both of them wrong text on screen rather than
+wrong timing. Next release is a 3.0.1 patch: no signature moves.
+
+### Fixed
+
+- **A caption whose erase never arrived was re-emitted for the rest of the
+  programme.** Open captions are capped at ten seconds so an unterminated one
+  cannot stand for the whole film — but the cap was measured from
+  `intervalStart`, which every segment boundary resets. A caption displayed at
+  second 1 and split at 6, 12, 18 … therefore renewed its allowance at each cut
+  and was written into every rendition file from there to the end: the exact
+  failure the cap exists to prevent, performed by the mechanism meant to
+  prevent it. The cap now runs from `displayedSince` — when the contents on
+  screen were *displayed* — which only a wholesale display change (`EOC`,
+  `EDM`, `CR`, a mode switch out of pop-on) moves. A segment split deliberately
+  leaves it alone, because a boundary is a cut in the rendition, not a caption
+  command. Roll-up is unaffected: every carriage return genuinely redisplays
+  the rows it scrolls, so a live broadcast keeps its window for as long as it
+  keeps scrolling. One flush never showed any of this, which is why the
+  existing cap test passed — the new one drives repeated `advance(to:)`
+  boundaries, and the `a53-captions` fuzz target now closes its input with a
+  boundary walk as well as a flush.
+- **XDS programme metadata could appear inside CC3/CC4 captions.** XDS — the
+  programme name, rating and time of day — shares field 2 with CC3 and CC4, and
+  **only its framing pairs (`0x01…0x0F`) sit outside the printable range**. The
+  payload between them is ordinary text. Judging each byte pair on its own, as
+  the field decoder did, therefore rejected the brackets and fed the programme
+  name straight into the caption memory a viewer is reading. Field 2 now tracks
+  the packet: once one opens, every pair belongs to it until `0x0F` closes it or
+  a caption control code takes the field back — an interruption the standard
+  allows and real broadcast relies on, since XDS is transmitted in the gaps
+  between captions and resumes later under a continuation class code. Field 1
+  carries no XDS and runs no packet state. A field-2 XDS seed joins the fuzz
+  corpus so mutations reach the new state machine.
+
 ## [3.0.0] — 2026-09-16
 
 Eight additions in one release: the host can supply the bytes, classify a

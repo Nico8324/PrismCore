@@ -170,6 +170,29 @@ package enum FuzzTargets {
                     fatalError("cue text would break the WebVTT it is written into")
                 }
             }
+
+            // The same bytes again, closed by a walk of segment boundaries
+            // instead of one flush. Nothing arrives after the single packet at
+            // `start`, so everything these boundaries cut across was displayed
+            // at `start` and has to expire exactly once. Measured from the
+            // interval rather than the display, each boundary handed an
+            // unterminated caption a fresh allowance and it was re-emitted for
+            // ever — invisible to a single flush, which is why the walk is here.
+            let split = ClosedCaptionReader(framing: framing, codec: codec)
+            bytes.withUnsafeBufferPointer { split.ingest($0, presentationSeconds: start) }
+            var walked: [ClosedCaptionReader.ChannelCue] = []
+            for step in 1...8 { walked += split.advance(to: start + Double(step) * 6) }
+            walked += split.flush(at: end)
+            let expiry = start + CEA608ChannelDecoder.maximumCueSeconds + 0.001
+            for entry in walked {
+                let cue = entry.cue
+                guard cue.end > cue.start else {
+                    fatalError("cue does not advance: \(cue.start) → \(cue.end)")
+                }
+                guard cue.end <= expiry else {
+                    fatalError("a caption renewed its cap at a boundary: ends \(cue.end)")
+                }
+            }
         }
     }
 

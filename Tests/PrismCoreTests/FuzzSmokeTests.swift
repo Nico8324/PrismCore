@@ -67,7 +67,17 @@ struct FuzzSmokeTests {
         // actually runs.
         #expect(HVCCNormalizer.normalize(hvcC: Data(FuzzSeeds.hvcCRecord)) != nil)
         #expect(!TextSubtitleConverter.cues(fromSRT: FuzzSeeds.srtText).isEmpty)
-        #expect(!TextSubtitleConverter.cues(fromWebVTT: FuzzSeeds.vttText).isEmpty)
+        // The VTT seed's `line:85%` must survive to the settings, or the
+        // settings-safety invariant never runs on a mutation of it.
+        #expect(TextSubtitleConverter.cues(fromWebVTT: FuzzSeeds.vttText).first?.settings == "line:85%")
+        // The ASS seed must reach the override translation: tag, alignment
+        // and a normalized anchor all present.
+        let ass = TextSubtitleConverter.convert(
+            Data(FuzzSeeds.assEvent.utf8), kind: .ass,
+            playResolution: .init(width: 8, height: 10)
+        )
+        #expect(ass?.text == "<i>Hi</i>\nthere")
+        #expect(ass?.placement == TextCuePlacement(alignment: 8, anchor: .init(x: 0.5, y: 0.5)))
         #expect(
             TextSubtitleConverter.cueText(from: Data(FuzzSeeds.tx3gSample), kind: .movText)
                 == "Sample"

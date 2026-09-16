@@ -58,8 +58,9 @@ final class SubtitleRenditionSet: @unchecked Sendable {
     /// One rendition being produced.
     private struct Track {
         enum Converter {
-            /// Text packets → cue text, directly.
-            case text(TextSubtitleConverter.Kind)
+            /// Text packets → cue text, directly. The play resolution is
+            /// the ASS script's (`nil` for the other kinds), for `\pos`.
+            case text(TextSubtitleConverter.Kind, playResolution: TextSubtitleConverter.PlayResolution?)
             /// Bitmap packets → composition → OCR → cue text. Class-typed:
             /// the pending-cue lifecycle is mutable state.
             case bitmap(BitmapRenditionTrack)
@@ -267,7 +268,7 @@ final class SubtitleRenditionSet: @unchecked Sendable {
 
             let converter: Track.Converter
             if let kind = Self.kind(for: par.codec_id) {
-                converter = .text(kind)
+                converter = .text(kind, playResolution: Self.playResolution(of: stream.pointee.codecpar, kind: kind))
             } else if Self.ocrCodecs.contains(par.codec_id), !hasTextTrack, SubtitleOCR.isAvailable,
                       let decoder = try? BitmapSubtitleDecoder(
                         codecpar: stream.pointee.codecpar, timeBase: stream.pointee.time_base
@@ -534,7 +535,9 @@ final class SubtitleRenditionSet: @unchecked Sendable {
         guard end > start else { return nil }
         let key = "\(streamIndex)|\(cue.start)|\(cue.end)|\(cue.text)"
         guard emittedKeys.insert(key).inserted else { return nil }
-        let rebased = TimedTextCue(streamIndex: streamIndex, start: start, end: end, text: cue.text)
+        let rebased = TimedTextCue(
+            streamIndex: streamIndex, start: start, end: end, text: cue.text, placement: cue.placement
+        )
         emittedCues.append(rebased)
         return rebased
     }
@@ -558,20 +561,31 @@ final class SubtitleRenditionSet: @unchecked Sendable {
                 track.writer.add(cue)
                 emitHostCue(streamIndex: streamIndex, cue)
             }
-        case .text(let kind):
+        case .text(let kind, let playResolution):
             guard let timeBase = track.timeBase,
                   packet.pointee.pts != swift_AV_NOPTS_VALUE(),
                   let data = packet.pointee.data, packet.pointee.size > 0
             else { return }
             let payload = Data(bytes: data, count: Int(packet.pointee.size))
-            guard let text = TextSubtitleConverter.cueText(from: payload, kind: kind) else { return }
+            guard let converted = TextSubtitleConverter.convert(payload, kind: kind, playResolution: playResolution)
+            else { return }
 
             let tick = av_q2d(timeBase)
             let start = Double(packet.pointee.pts) * tick
             let duration = packet.pointee.duration > 0
                 ? Double(packet.pointee.duration) * tick
                 : WebVTTRenditionWriter.fallbackCueSeconds
-            let cue = SubtitleCue(start: start, end: start + duration, text: text)
+            // A WebVTT track's own cue settings are the most faithful
+            // placement there is; they outrank anything read off the payload.
+            let sourceSettings = kind == .webvtt
+                ? Self.webVTTSettings(on: packet).flatMap(TextCuePlacement.sanitizedWebVTTSettings)
+                : nil
+            let placement = sourceSettings.flatMap(TextCuePlacement.init(webVTTSettings:)) ?? converted.placement
+            let cue = SubtitleCue(
+                start: start, end: start + duration, text: converted.text,
+                settings: sourceSettings ?? converted.placement?.webVTTSettings,
+                placement: placement
+            )
             track.writer.add(cue)
             emitHostCue(streamIndex: streamIndex, cue)
         }
@@ -641,6 +655,31 @@ final class SubtitleRenditionSet: @unchecked Sendable {
         case AV_CODEC_ID_MOV_TEXT: return .movText
         default: return nil
         }
+    }
+
+    /// The ASS script header's play resolution for an ASS/SSA stream (its
+    /// extradata is the `[Script Info]` block and styles); `nil` for the
+    /// other text kinds, whose `\pos` — if an author pasted one in — has no
+    /// unit to be measured in.
+    static func playResolution(
+        of codecpar: UnsafePointer<AVCodecParameters>, kind: TextSubtitleConverter.Kind
+    ) -> TextSubtitleConverter.PlayResolution? {
+        guard kind == .ass, let extradata = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0
+        else { return nil }
+        return TextSubtitleConverter.playResolution(
+            fromASSHeader: Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size))
+        )
+    }
+
+    /// The cue-settings string the demuxer attached to a WebVTT packet, if
+    /// any — verbatim, as it followed the timing line in the source. Both the
+    /// WebVTT and the Matroska demuxers attach it; the payload itself never
+    /// carries it.
+    static func webVTTSettings(on packet: UnsafeMutablePointer<AVPacket>) -> String? {
+        var size = 0
+        guard let raw = av_packet_get_side_data(packet, AV_PKT_DATA_WEBVTT_SETTINGS, &size), size > 0
+        else { return nil }
+        return String(bytes: UnsafeRawBufferPointer(start: raw, count: Int(size)), encoding: .utf8)
     }
 
     /// Read and convert a whole sidecar file. The extension picks the parser;

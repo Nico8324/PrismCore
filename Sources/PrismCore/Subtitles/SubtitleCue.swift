@@ -13,20 +13,29 @@ struct SubtitleCue: Equatable {
     var end: Double
     /// Cue payload, already WebVTT-safe (no `-->`, no blank lines).
     var text: String
+    /// WebVTT cue settings printed after the timing (`line:5% align:start`),
+    /// already reduced to the safe subset — a settings string shares the
+    /// timing line, so it has the payload's hazards without its escaping.
+    /// `nil` for the renderer's default placement, which is nearly every cue.
+    var settings: String? = nil
+    /// The placement the source asked for, for hosts that draw text
+    /// themselves; `settings` is its WebVTT rendering (or the source's own).
+    var placement: TextCuePlacement? = nil
 
     /// Clamped copy for a segment that only partially contains this cue.
     func clamped(to range: ClosedRange<Double>) -> SubtitleCue {
-        SubtitleCue(
-            start: Swift.max(start, range.lowerBound),
-            end: Swift.min(end, range.upperBound),
-            text: text
-        )
+        var copy = self
+        copy.start = Swift.max(start, range.lowerBound)
+        copy.end = Swift.min(end, range.upperBound)
+        return copy
     }
 
     /// Copy with a (usually earlier) known end — how an open-ended bitmap
     /// cue gets closed by the event that displaces it.
     func ending(at seconds: Double) -> SubtitleCue {
-        SubtitleCue(start: start, end: Swift.min(end, seconds), text: text)
+        var copy = self
+        copy.end = Swift.min(end, seconds)
+        return copy
     }
 
     var overlapsNothing: Bool { end <= start }

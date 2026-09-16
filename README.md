@@ -66,7 +66,7 @@ Shipping something on PrismCore? Open an issue and it gets listed here.
 | Audio (bridge) | TrueHD / MLP / DTS / DTS-HD MA / MP3 / MP2 / Opus / Vorbis / PCM → EAC3 5.1, 128 kbps per channel. Needs an FFmpeg build with the **`eac3` encoder**; without it those sources take the software path instead, which decodes them itself |
 | Multi-audio | Every viable track becomes an HLS alternate rendition with its language, name and channel count, so AVPlayer gets a real `AVMediaSelectionGroup` to switch on. The software path switches too: `SoftwarePlaybackPipeline.selectAudioTrack(streamIndex:)` swaps the decoder mid-playback without touching the clock or the picture |
 | Dialogue boost | Opt-in (`dialogueBoost:` on the session): extra "Dialogue Boost" renditions derived from the default track — decoded, centre channel favoured (bed −6 dB / −12 dB), re-encoded to EAC3 — marked `public.accessibility.enhances-speech-intelligibility` so hosts find them by characteristic. Engine-side because AVFoundation ignores `audioMix`/audio taps on HLS items. The base track stays bit-for-bit (Atmos included). Needs the `eac3` encoder and a centre-channel source; stereo would need `dialoguenhance`, which current builds don't ship |
-| Subtitles (text) | SubRip / ASS / SSA / WebVTT / mov_text converted during the remux read into segmented WebVTT renditions, cut on the video's own boundaries — so text survives PiP and AirPlay instead of living in a host overlay. External `.srt` / `.vtt` register as first-class renditions |
+| Subtitles (text) | SubRip / ASS / SSA / WebVTT / mov_text converted during the remux read into segmented WebVTT renditions, cut on the video's own boundaries — so text survives PiP and AirPlay instead of living in a host overlay. ASS inline italics / bold / underline become WebVTT tags; `\an` / `\pos` placement and a WebVTT track's own cue settings ride the timing line, so a caption authored at the top of the frame stays there. External `.srt` / `.vtt` register as first-class renditions |
 | Subtitles (bitmap) | PGS / DVB / DVD read by on-device Vision OCR into the same rendition machinery. Lossy by design — typography dies, text survives — and the raw tracks stay surfaced for a host that wants to draw them pixel-accurately |
 | Seek & cache | Keyframe-aligned segment plan published upfront, demand-driven production with re-anchoring, absolute-`tfdt` continuity across restarts, byte-budgeted retention (1 GiB default; an evicted segment is reproduced on demand, so the budget bounds disk, not seekability) |
 | Chapters | Matroska `Chapters` / MP4 chapter tracks reported as `SourceInfo.chapters` and `PrismCoreSession.chapters` (title + start/end seconds) — HLS cannot carry them, so they are the host's to draw as timeline markers and skip controls |
@@ -164,16 +164,20 @@ in a bounded look-ahead cache, so selecting an already-read caption (or Off)
 does not seek, flush A/V, or start a paused clock. `TimedTextCue` timestamps here
 use the **source axis**, matching `pipeline.currentTime`; remux cue callbacks
 use the origin-rebased AVPlayer axis. Cue payloads can contain WebVTT inline tags
-and entities; the host supplies rendering. Polling clears expired cues even at
-EOF or while the demuxer is waiting for data.
+and entities; the host supplies rendering. `TimedTextCue.placement` carries the
+placement the source asked for (`TextCuePlacement`: a numpad alignment, plus an
+anchor point from `\pos` or a WebVTT `line:`/`position:` pair) — `nil` for the
+host's default, which is what nearly every cue wants. Polling clears expired
+cues even at EOF or while the demuxer is waiting for data.
 
 The cache holds at most 1,024 cues / 1 MiB of UTF-8 text across all tracks;
 expired cues are removed and excess incoming cues are dropped. Cues need valid
 PTS and positive duration. Seeking clears the cache and repopulates from the
 landing keyframe: a long caption whose packet precedes that keyframe may be
 missing until the next cue. Bitmap/OCR and external subtitle selection remain
-outside this software surface. Original ASS positioning and advanced styling
-are not preserved by the text converter.
+outside this software surface. ASS colours, fonts, karaoke and drawing overrides
+are not preserved by the text converter — only the inline styles and placement
+WebVTT has words for.
 
 ### Host setup on tvOS
 

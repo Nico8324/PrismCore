@@ -147,8 +147,10 @@ package enum FuzzSeeds {
     Second
     """
 
+    /// Carries every override the translation reads: a `\pos` to normalize,
+    /// an `\an` to lift out, an italic toggle to turn into a tag.
     package static let assEvent =
-        "Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\\pos(4,5)}Hi\\Nthere"
+        "Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\\an8\\pos(4,5)}{\\i1}Hi{\\i0}\\Nthere"
 
     /// tx3g: 16-bit big-endian length, UTF-8 text, then a style box to ignore.
     package static let tx3gSample: [UInt8] = {

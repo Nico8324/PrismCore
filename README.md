@@ -47,8 +47,7 @@ MPEG-2, VC-1, interlaced H.264), there is a software path — libavcodec into
 - **[Aether](https://aetherplayer.com)** — a native media player for Apple
   platforms. PrismCore is the engine every non-Apple container routes through:
   ahead of libmpv, behind plain AVFoundation for the files it can already open.
-  Routing arrived in Aether 1.1.0 behind a developer toggle and is on by
-  default from 1.1.1.
+  The remux path is on by default there; the software path is opt-in.
 
 Shipping something on PrismCore? Open an issue and it gets listed here.
 
@@ -80,7 +79,7 @@ Shipping something on PrismCore? Open an issue and it gets listed here.
 ## Quick start
 
 ```swift
-.package(url: "https://github.com/Wenzlik/PrismCore.git", from: "1.0.0")
+.package(url: "https://github.com/Wenzlik/PrismCore.git", from: "3.0.0")
 ```
 
 One call probes the source, picks the path and hands back something already
@@ -562,7 +561,7 @@ not. Since 1.0.0 that contract is a promise: breaking changes bump the major,
 features the minor, fixes the patch — so the ordinary pin is the right one:
 
 ```swift
-.package(url: "https://github.com/Wenzlik/PrismCore.git", from: "1.0.0")
+.package(url: "https://github.com/Wenzlik/PrismCore.git", from: "3.0.0")
 ```
 
 Hosts that archive through Xcode Cloud (or any CI with automatic resolution

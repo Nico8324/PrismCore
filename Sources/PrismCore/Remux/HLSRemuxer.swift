@@ -1198,7 +1198,7 @@ final class HLSRemuxer: @unchecked Sendable {
                     // before the bits reach the muxer. Returns nil for a packet
                     // that needed neither, which is every packet of every other
                     // source — the cost there is one NAL walk, no copy.
-                    if let dolbyVisionConverter, let data = packet.pointee.data,
+                    if let dolbyVisionConverter, packet.pointee.data != nil,
                        packet.pointee.size > 0 {
                         // The walk runs on the packet's own buffer, and a changed
                         // packet is written ONCE into a fresh av_malloc'd buffer

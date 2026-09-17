@@ -64,6 +64,11 @@ public actor PrismCoreSession {
     /// `pendingReanchor` documents, not a stale correction.
     public var pendingAudioDelaySeconds: Double? { remuxer.pendingAudioDelaySeconds }
 
+    /// `audioDelaySeconds` and `pendingAudioDelaySeconds` sampled together.
+    /// Internal: only a caller asserting how the two RELATE needs them
+    /// atomic, and that caller is a test (see `HLSRemuxer.audioDelayReport`).
+    var audioDelayReport: (serving: Double, pending: Double?) { remuxer.audioDelayReport }
+
     /// What `setAudioDelaySeconds(_:)` did.
     public enum AudioDelayChange: Sendable, Equatable {
         /// In force before the call returned. Only happens before `start()`,
@@ -1050,6 +1055,12 @@ public actor PrismCoreSession {
     }
 
     /// Cancel the remux, stop serving, and remove the session's segments.
+    ///
+    /// **Bounded, and silent.** It returns within `producerStopGrace` even
+    /// when the producer does not — see the detach below — and it never
+    /// throws: there is nothing a host could do about a wedged transport from
+    /// a `catch`, and a teardown that can fail is a teardown every caller
+    /// wraps in an empty one.
     public func stop() async {
         stopped = true
         // Idempotent after a `start()` that already finished it; this covers
@@ -1059,15 +1070,73 @@ public actor PrismCoreSession {
         checkpoints?.finish()
         checkpoints = nil
         // `cancel()` is the only stop signal the producer has (it also wakes a
-        // parked one); the join then waits for the thread to notice, exactly as
-        // awaiting the task's value used to.
+        // parked one, and releases a conforming host input's blocked read);
+        // the join then waits for the thread to notice.
         remuxer.cancel()
-        await producer?.join()
+        let joined = await producer?.join(within: Self.producerStopGrace) ?? true
         remuxer.residentSegments.clear()
         await cachedPreview.clear()
         await server.stop()
         try? FileManager.default.removeItem(at: workDirectory)
+        if !joined, let producer {
+            // Deliberately leaked. The alternative is to keep waiting, and
+            // what the caller is waiting on is a thread parked inside a host's
+            // synchronous `read` that no signal can reach — a host input that
+            // does not conform to `CancellablePrismCoreInput`, or one that
+            // does and is not honouring it. `stop()` is called by a host
+            // leaving the player, often from the main actor; a hung `stop()`
+            // is a hung app, which is strictly worse than one thread the
+            // process never gets back.
+            //
+            // Nothing is thrown for it, on purpose: the host cannot fix its
+            // own wedged transport from the `catch`, so an error here buys an
+            // empty `catch` in every caller and nothing else. The notice is
+            // the honest channel.
+            PrismCoreLog.notice(
+                "stop(): producer still inside a host read after "
+                + "\(Self.producerStopGrace); detaching the thread and returning"
+            )
+            let directory = workDirectory
+            // The removal above races the leaked producer: it may create a
+            // segment file between the walk and the rmdir, which leaves the
+            // directory behind with bytes in it — a tmp leak that nothing
+            // else would ever come back for. So a second removal is queued
+            // behind the thread's real exit. Suspended, not blocked: it holds
+            // no pool thread while it waits, and if the host NEVER returns it
+            // simply never runs, which costs one suspended task.
+            Task.detached(priority: .utility) {
+                await producer.join()
+                try? FileManager.default.removeItem(at: directory)
+            }
+        }
     }
+
+    /// How long `stop()` waits for the producer before detaching it.
+    ///
+    /// The floor comes from a measurement, because detaching a producer that
+    /// was going to come back is not a saved teardown — it is the work
+    /// directory being deleted underneath a thread still muxing into it. Every
+    /// `stop()` in this suite was timed (2026-09-17, M4, debug build, whole
+    /// suite in parallel): **76 joins, all but one between 0.17 µs and
+    /// 235 ms**, median ~1.5 ms. The flag is checked once per packet, a parked
+    /// producer is woken on the coordinator, and since 3.1.0 one inside its
+    /// own open is aborted there too (`HLSRemuxer.run`). The one exception is
+    /// the test that wedges a host read on purpose.
+    ///
+    /// Two seconds is ~8.5× that worst observed case — the margin a slower
+    /// device, a big final fragment flush and a host's own cancellation round
+    /// trip deserve. It is also what caught the measurement's real finding: at
+    /// 2 s a starving-origin teardown was detaching at 2.3 s because `cancel()`
+    /// could not reach a guard the producer had not published yet. Fixing that
+    /// is what brought the worst case down to 235 ms; the grace was not raised
+    /// to hide it.
+    ///
+    /// The ceiling is the other side: `stop()` is awaited on the way out of a
+    /// player, frequently while the app is being backgrounded, and iOS gives a
+    /// suspending app only a few seconds before the watchdog. Two seconds
+    /// leaves room inside that and is short enough that a user who sees it
+    /// reads it as a slow dismissal rather than a freeze.
+    static let producerStopGrace: Duration = .seconds(2)
 
     // MARK: - Readiness
 

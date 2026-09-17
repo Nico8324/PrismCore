@@ -191,8 +191,22 @@ struct RuntimeAudioDelayTests {
                          "the fixture must plan, or there is no re-anchor to carry the change")
             // The honest half of the contract: until the producer adopts it,
             // `audioDelaySeconds` still names what is being served.
-            #expect(await session.audioDelaySeconds == 0)
-            #expect(await session.pendingAudioDelaySeconds == delay)
+            //
+            // Read as a PAIR, in one lock acquisition, and asserted as one of
+            // the two states that can exist. Two separate `await`s asserting
+            // "still pending" were asserting a window nothing holds open: the
+            // producer adopts the request at its next re-anchor, which it is
+            // entitled to reach between the two reads, and did — the
+            // adoption clears `pending` and sets `serving` together. What the
+            // contract actually forbids is the third state, a `pending` that
+            // has been cleared while the old offset is still what is being
+            // served: that is the report that would tell a viewer their
+            // correction had landed while the segments on disk carry the old
+            // one, and it is what this line pins.
+            let report = await session.audioDelayReport
+            #expect(report.serving == 0 && report.pending == delay
+                        || report.serving == delay && report.pending == nil,
+                    "serving \(report.serving) with \(String(describing: report.pending)) pending")
 
             let adopted = await waitUntil { await session.pendingAudioDelaySeconds == nil }
             #expect(adopted, "the producer never took the request up")

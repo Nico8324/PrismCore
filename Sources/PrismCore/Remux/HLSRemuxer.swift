@@ -82,6 +82,18 @@ final class HLSRemuxer: @unchecked Sendable {
         audioDelayLock.withLock { requestedAudioDelaySeconds }
     }
 
+    /// Both halves in ONE lock acquisition.
+    ///
+    /// Read separately they are two samples of a pair that moves atomically:
+    /// the producer adopts a request at a re-anchor, clearing `requested` and
+    /// setting `effective` under this lock, so a reader that takes them one at
+    /// a time can catch (0, nil) — a state that never existed. Only a caller
+    /// checking the *relationship* needs this; a host reporting one value at a
+    /// time is fine with the plain properties.
+    var audioDelayReport: (serving: Double, pending: Double?) {
+        audioDelayLock.withLock { (effectiveAudioDelaySeconds, requestedAudioDelaySeconds) }
+    }
+
     private let audioDelayLock = NSLock()
     private var effectiveAudioDelaySeconds: Double = 0
     private var requestedAudioDelaySeconds: Double?
@@ -572,6 +584,22 @@ final class HLSRemuxer: @unchecked Sendable {
                 do { try interruptGuard.installHTTPInput(on: input, url: sourceURL, headers: httpHeaders) }
                 catch { avformat_free_context(input); throw error }
             }
+            // Published BEFORE the open, not after it. `cancel()` can only
+            // reach a guard it can see, and until 3.1.0 this one became
+            // visible only once the open had returned — so a `stop()` that
+            // landed during the open bounced off, and the thread kept the
+            // whole `probeBudget` (10 s) for itself no matter who asked it to
+            // come back. Measured on `ErrorTaxonomyTests.starvedStartupIsTheBudget`
+            // (an origin that withholds the first byte for 3 s): the teardown
+            // took 2.3 s before this line and 4 ms after it.
+            //
+            // This is also the only way the host-input hook can reach an open
+            // that parked inside `read` — `installCustomInput` ran a few lines
+            // up, but the guard nobody can see cancels nobody.
+            activeGuardLock.withLock {
+                activeGuard = interruptGuard
+                if cancelled.isSet { interruptGuard.cancel() }
+            }
             // Bounded like the probe's open, and for the same reason: a
             // server that accepts and then starves the reads would otherwise
             // pin this producer forever — the session's startup timeout fires,
@@ -589,6 +617,21 @@ final class HLSRemuxer: @unchecked Sendable {
                     avformat_find_stream_info(opened, nil), "avformat_find_stream_info"
                 )
             } catch {
+                // The guard is unpublished on the way out: nothing owns this
+                // context any more, and a `cancel()` arriving later must not
+                // find a guard whose reads have already been closed.
+                activeGuardLock.withLock { activeGuard = nil }
+                // A cancellation is not a source failure, wherever it lands.
+                // Now that the guard is visible during the open, a `stop()`
+                // can abort the open itself — and `run()` already returns
+                // normally for a cancel anywhere in the copy loop, so it
+                // returns normally for this one too. Reporting it as an
+                // unopenable source would turn every teardown-during-startup
+                // into a spurious error in the host's log.
+                if cancelled.isSet {
+                    avformat_close_input(&input)
+                    return
+                }
                 // Over the coordinated reader every transport verdict reaches
                 // libavformat as an errno, so the guard holds the only copy of
                 // what the origin actually said (see `ReadInterruptGuard`).

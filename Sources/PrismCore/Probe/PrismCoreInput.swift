@@ -47,6 +47,65 @@ public protocol PrismCoreInput: Sendable {
     var length: Int64? { get }
 }
 
+/// A `PrismCoreInput` whose in-flight `read` or `seek` can be released from
+/// another thread.
+///
+/// The plain protocol has no way out of a blocked call. `ReadInterruptGuard`
+/// bounds blocking operations with FFmpeg's `interrupt_callback`, which FFmpeg
+/// polls *between* reads — so it reaches libavformat's own I/O and stops dead
+/// at the edge of a host's synchronous `read(into:)`. An SMB share whose
+/// server went away, or a debrid link that stopped feeding, therefore parks the
+/// calling thread for as long as the host's own transport takes to give up:
+/// minutes, or never. That thread is the probe's, or the producer's — and a
+/// parked producer is what used to make `PrismCoreSession.stop()` hang, which
+/// in a host app is a frozen UI.
+///
+/// Conforming is what gives the engine a way in.
+///
+/// **The contract, both halves.** The engine promises to call
+/// `cancelInFlightOperation()` whenever the read guard on this input's context
+/// becomes interrupted — an expired probe/index-load budget, or an explicit
+/// cancellation such as `stop()`. The host promises that the `read` or `seek`
+/// blocked at that moment then *returns*, promptly, in one of two ways the
+/// engine accepts equally:
+///
+/// - **throwing** — the usual shape, and the one that carries a reason. What
+///   is thrown is recorded as `PrismCoreInputError.readFailed` /
+///   `.seekFailed`, but on an interrupted context it is the abort, not the
+///   error, that decides the outcome, so a plain "cancelled" error is fine;
+/// - **a short count**, `0` included. Zero normally means end of stream —
+///   `read(into:)` says so — but a read released by a cancellation is read
+///   back as the abort it is and never as EOF, because the engine knows it
+///   asked. A short positive count is simply the bytes that did arrive.
+///
+/// Both are honoured only while the guard is interrupted. A host that returns
+/// `0` at any *other* moment is still declaring EOF.
+///
+/// Two requirements on the implementation:
+///
+/// - **it may be called concurrently with `read` or `seek`** — that is the
+///   whole point — so it must not take a lock those hold, and must not touch
+///   state they mutate without its own synchronization. Waking a socket,
+///   cancelling a `URLSessionTask`, setting an atomic flag: all fine;
+/// - **it may be called when nothing is in flight**, and must then do nothing.
+///   The engine cannot see inside the host, so it never guesses; a deadline
+///   that expires between two reads calls this against an idle input.
+///
+/// An input that does *not* conform keeps working exactly as before. The
+/// engine checks for this conformance once, when it installs the input, and
+/// leaves a notice in the unified log when it is absent — so a thread wedged
+/// an hour later has a breadcrumb instead of being a mystery.
+public protocol CancellablePrismCoreInput: PrismCoreInput {
+
+    /// Release whatever `read` or `seek` is blocked right now, if any.
+    ///
+    /// Called from a thread that is **not** the one inside `read`/`seek`, and
+    /// possibly when neither is running — in which case it must be a no-op.
+    /// It must return promptly: the engine calls it from a deadline timer and
+    /// from `stop()`, neither of which can afford to block.
+    func cancelInFlightOperation()
+}
+
 /// How a host hands its bytes over: **one call per open**.
 ///
 /// Deliberately a factory rather than an instance. A session opens the source
@@ -209,7 +268,17 @@ final class CustomInput {
             )
             // A host that over-reports would have libavformat read past the
             // buffer it just handed out; clamp rather than trust.
-            guard written > 0 else { return swift_AVERROR_EOF() }
+            //
+            // The interrupted branch is the short-count half of
+            // `CancellablePrismCoreInput`'s contract: a read we released from
+            // another thread is allowed to come back empty, and reporting that
+            // as EOF would tell the demuxer the file ended — a truncated
+            // container analysed as a complete one, which is a wrong answer
+            // rather than an aborted one. The guard asked for this, so it is
+            // read back as the abort it is.
+            guard written > 0 else {
+                return interrupted() ? swift_AVERROR_EXIT() : swift_AVERROR_EOF()
+            }
             let accepted = min(written, Int(count))
             position += Int64(accepted)
             hostPosition = position

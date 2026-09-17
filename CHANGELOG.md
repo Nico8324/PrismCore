@@ -8,6 +8,84 @@ source-compatible.)
 
 ## [Unreleased]
 
+The sixth defect 3.0.1 named and could not fix, because fixing it means adding
+to the protocol: a host-supplied input's blocking read could not be
+interrupted. This is that fix — new public API, nothing removed or moved, so a
+**minor** (3.1.0).
+
+### Added
+
+- **`CancellablePrismCoreInput`** — a `PrismCoreInput` whose in-flight `read`
+  or `seek` the engine can release from another thread.
+
+  `ReadInterruptGuard` bounds blocking operations with FFmpeg's
+  `interrupt_callback`, which FFmpeg polls *between* reads. A host's
+  `read(into:)` is synchronous and opaque, so nothing could reach a thread
+  parked inside one: a probe budget could not interrupt a stalled SMB or
+  debrid read, and `PrismCoreSession.stop()` could hang indefinitely joining a
+  producer parked in one — and a hung `stop()` is a hung host app.
+
+  A **separate protocol** rather than a method with a default implementation,
+  because the engine has to be able to *know*. A no-op default would silently
+  preserve today's behaviour on every existing conformance; a detectable one
+  lets the engine say so, once, at install time — so a thread wedged an hour
+  later leaves a breadcrumb in the unified log (subsystem
+  `cz.zmrhal.prismcore`) instead of being a mystery.
+
+  The contract: the engine calls `cancelInFlightOperation()` whenever the read
+  guard on that context becomes interrupted — an expired probe or index-load
+  budget, or an explicit cancellation such as `stop()` — and the host's
+  blocked call then returns, either by throwing or with a short count. `0` is
+  accepted there and read as the abort it is, never as the end of stream it
+  normally means. It may be called concurrently with `read`, and it may be
+  called when nothing is in flight, which must be a no-op.
+
+  A deadline that merely passes wakes nobody: `shouldInterrupt` is a poll, and
+  the only thing that polls it is the thread that is stuck. So an armed guard
+  with an interruptible input now also schedules a timer, and the timer is what
+  delivers the expiry. Scheduled only when there is a host that can listen —
+  FFmpeg's own reads gain nothing from it, and their behaviour is unchanged.
+
+  Existing `PrismCoreInput` conformances compile and behave exactly as before.
+
+### Changed
+
+- **`PrismCoreSession.stop()` is now bounded, and this half does not depend on
+  the host at all.** After cancelling, it gives the producer two seconds to
+  join; if it has not, it **detaches the thread and returns anyway**,
+  deliberately leaking it. It still returns silently: there is nothing a host
+  could do about its own wedged transport from a `catch`, so the notice goes
+  to the log.
+
+  The grace comes from a measurement rather than a guess. Every `stop()` in
+  the suite was timed: 76 joins, all but the deliberately wedged one between
+  0.17 µs and 235 ms, median ~1.5 ms — so two seconds is ~8.5× the worst
+  observed case, wide enough not to fire on a slow device mid-flush and short
+  enough to sit inside the few seconds iOS gives a backgrounding app before
+  the watchdog.
+
+  What a leaked producer can still touch is bounded by construction. Its work
+  directory is this session's own (`PrismCore-<UUID>` under `tmp`), so it can
+  disturb nothing else; `stop()` has already cancelled it, so the read it is
+  inside is the last thing it does; its segment-cache unlinks name files in
+  that same directory and a missing file is a no-op; and a second removal of
+  the work directory is queued behind the thread's real exit, so a file
+  created between the walk and the `rmdir` cannot leave an orphan behind. That
+  queued cleanup is a suspended task, not a held thread.
+
+- **The remuxer publishes its read guard before the open, not after.** Found
+  by the measurement above: `HLSRemuxer.cancel()` can only reach a guard it
+  can see, and until now a producer made its own guard visible only once
+  `avformat_open_input` and `find_stream_info` had returned. A `stop()` that
+  landed during a slow open therefore bounced off, and the thread kept the
+  whole 10 s `probeBudget` for itself. Measured on a starving origin
+  (`ErrorTaxonomyTests.starvedStartupIsTheBudget`, first byte withheld for
+  3 s): 2.3 s of teardown before, 4 ms after. It is also the only way the new
+  host-input hook can reach an open that parked inside `read`. A cancellation
+  that now aborts the open is reported the way a cancellation anywhere else in
+  the loop already was — `run()` returns normally, not as an unopenable
+  source.
+
 ## [3.0.1] — 2026-09-16
 
 Five of the six defects a review pass found over 3.0.0. All are internal — no

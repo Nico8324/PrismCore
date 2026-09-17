@@ -12,7 +12,11 @@ import Libavutil
 /// non-mutating (the engine holds one behind `any`), and `@unchecked Sendable`
 /// with a lock because the engine reads it from the probe and producer
 /// threads, never from the one that built it.
-private final class MemoryInput: PrismCoreInput, @unchecked Sendable {
+///
+/// `class`, not `final class`, since 3.1.0: `CancellableMemoryInput` below is
+/// the same transport with the interruption hook bolted on, and the tests that
+/// matter are the ones comparing the two shapes on identical bytes.
+private class MemoryInput: PrismCoreInput, @unchecked Sendable {
     private let bytes: [UInt8]
     private let lock = NSLock()
     private var position = 0
@@ -27,20 +31,59 @@ private final class MemoryInput: PrismCoreInput, @unchecked Sendable {
     private let failureStall: Duration?
     /// The most this input answers in one call — see `defaultChunk`.
     private let chunk: Int
+    /// Park the read — forever, until something releases it — once this many
+    /// bytes have been handed over. A share whose server went away or a debrid
+    /// link that stopped feeding: not an error, a call that does not return.
+    /// This is the shape nothing in 3.0.0 could get out of.
+    private let blockAfterBytes: Int?
+    /// How a released read answers, which is the half of
+    /// `CancellablePrismCoreInput`'s contract the engine has to tolerate both
+    /// ways round.
+    enum Release { case throwing, shortCount }
+    private let releaseAnswer: Release
+    /// The parked read's condition. Separate from `lock`: `cancelInFlightOperation`
+    /// runs while a read holds nothing but this, which is exactly the
+    /// concurrency the protocol requires a conformance to be safe for.
+    fileprivate let gate = NSCondition()
+    fileprivate var isReleased = false
+    fileprivate var isParked = false
     private var delivered = 0
     private var storedReads = 0
     private var storedSeeks = 0
     private var storedSawEOF = false
 
     struct Broken: Error {}
+    /// What a released read throws. Deliberately NOT `Broken`: a read the
+    /// engine itself asked to let go of is not a transport failure, and a test
+    /// that could not tell them apart would pass on the wrong one.
+    struct Released: Error {}
 
     init(data: Data, reportsLength: Bool = true, failAfterBytes: Int? = nil,
-         failureStall: Duration? = nil, chunk: Int = MemoryInput.defaultChunk) {
+         failureStall: Duration? = nil, chunk: Int = MemoryInput.defaultChunk,
+         blockAfterBytes: Int? = nil, releaseAnswer: Release = .throwing) {
         self.chunk = chunk
         self.bytes = [UInt8](data)
         self.reportsLength = reportsLength
         self.failAfterBytes = failAfterBytes
         self.failureStall = failureStall
+        self.blockAfterBytes = blockAfterBytes
+        self.releaseAnswer = releaseAnswer
+    }
+
+    /// Let a parked read go without the engine's hook — how a test cleans up
+    /// after a NON-conforming input, whose wedged thread would otherwise
+    /// outlive the test and keep the work directory alive.
+    func release() {
+        gate.lock()
+        isReleased = true
+        gate.broadcast()
+        gate.unlock()
+    }
+
+    /// Whether a read is parked right now.
+    var isBlocked: Bool {
+        gate.lock(); defer { gate.unlock() }
+        return isParked
     }
 
     var length: Int64? { reportsLength ? Int64(bytes.count) : nil }
@@ -72,6 +115,19 @@ private final class MemoryInput: PrismCoreInput, @unchecked Sendable {
         // socket: the engine is free to time the read out while it hangs.
         if let failureStall, let failAfterBytes, deliveredBytes >= failAfterBytes {
             blockingSleep(failureStall)
+        }
+        if let blockAfterBytes, deliveredBytes >= blockAfterBytes {
+            gate.lock()
+            isParked = true
+            while !isReleased { gate.wait() }
+            isParked = false
+            gate.unlock()
+            // Both answers are legal once the engine has asked for the read
+            // back; a short count is the one that used to read as EOF.
+            switch releaseAnswer {
+            case .throwing: throw Released()
+            case .shortCount: return 0
+            }
         }
         return try lock.withLock {
             storedReads += 1
@@ -116,7 +172,40 @@ private func absentURL(_ name: String) -> URL {
     URL(fileURLWithPath: "/prismcore-tests-no-such-directory/\(name)")
 }
 
-@Suite("Custom input")
+/// The same transport, conforming — the only difference between it and its
+/// superclass is the one the engine is allowed to detect.
+private final class CancellableMemoryInput: MemoryInput, CancellablePrismCoreInput {
+    private let calls = NSLock()
+    private var storedCancelCalls = 0
+    private var storedIdleCancelCalls = 0
+
+    var cancelCalls: Int { calls.withLock { storedCancelCalls } }
+    /// Calls that found nothing parked. The protocol requires those to be
+    /// no-ops, and the engine makes them: a deadline that expires between two
+    /// reads reaches an input with nothing to release.
+    var idleCancelCalls: Int { calls.withLock { storedIdleCancelCalls } }
+
+    func cancelInFlightOperation() {
+        // Takes the gate and nothing else — never the read lock. That lock is
+        // held by the very call this exists to release, so reaching for it
+        // would turn the rescue into a deadlock. This is the concurrency the
+        // protocol warns conformances about, written out.
+        gate.lock()
+        let wasParked = isParked
+        isReleased = true
+        gate.broadcast()
+        gate.unlock()
+        calls.withLock {
+            storedCancelCalls += 1
+            if !wasParked { storedIdleCancelCalls += 1 }
+        }
+    }
+}
+
+/// `.serialized` because two of these count the engine's one-time notices,
+/// and the notice sink is process-wide. This is the only suite that installs
+/// custom inputs, so serializing it is enough to make the counts exact.
+@Suite("Custom input", .serialized)
 struct CustomInputTests {
 
     @Test func hostSuppliedBytesProbeAndProduceASegment() async throws {
@@ -332,6 +421,221 @@ struct CustomInputTests {
         // The adapter frees its AVIO in deinit, so it has to outlive the
         // context it is installed on.
         withExtendedLifetime(adapter) {}
+    }
+
+    // MARK: - Interruptible inputs (3.1.0)
+
+    /// The half that does not depend on the host at all: a `stop()` whose
+    /// producer is parked inside a read that will never return must still
+    /// return. Before this, the join was unbounded and a host app leaving the
+    /// player froze with it.
+    @Test("stop() returns on its own budget when the host read never comes back")
+    func stopReturnsWhenTheHostReadNeverDoes() async throws {
+        let data = try fixtureData("h264_aac_30s", "mkv")
+        // Past startup (~164 KB of host answers on this fixture) and inside
+        // the copy loop, so the session is genuinely serving when the
+        // transport goes silent.
+        let input = MemoryInput(data: data, blockAfterBytes: 400_000)
+        // Last defer to run: releases the thread this test deliberately
+        // leaks, so the suite does not accumulate wedged producers.
+        defer { input.release() }
+        let session = try PrismCoreSession(url: absentURL("wedged.mkv"), input: { input })
+        _ = try await session.start()
+        #expect(try await reached(.seconds(20)) { input.isBlocked },
+                "the producer never reached the parked read")
+
+        let finished = Locked(false)
+        let started = ContinuousClock.now
+        // Abandoned, not awaited: a regression here does not fail, it HANGS,
+        // and a task group would wait for the same uninterruptible join at
+        // scope exit. The test owns the clock instead.
+        let stopping = Task { await session.stop(); finished.withLock { $0 = true } }
+        _ = try await reached(.seconds(15)) { finished.withLock { $0 } }
+        let elapsed = started.duration(to: .now)
+        stopping.cancel()
+
+        #expect(finished.withLock { $0 },
+                "stop() never returned — the producer join is unbounded again")
+        #expect(elapsed < PrismCoreSession.producerStopGrace + .seconds(3),
+                "stop() took \(elapsed) against a \(PrismCoreSession.producerStopGrace) grace")
+    }
+
+    /// The other half: a host that CAN be reached gets reached, so the
+    /// producer exits and there is nothing to detach.
+    @Test("A conforming input has its parked read released, so stop() joins")
+    func stopReleasesAConformingHostRead() async throws {
+        let data = try fixtureData("h264_aac_30s", "mkv")
+        let input = CancellableMemoryInput(data: data, blockAfterBytes: 400_000)
+        defer { input.release() }
+        let notices = Locked<[String]>([])
+        PrismCoreLog.observer = { message in notices.withLock { $0.append(message) } }
+        defer { PrismCoreLog.observer = nil }
+
+        let session = try PrismCoreSession(url: absentURL("released.mkv"), input: { input })
+        _ = try await session.start()
+        #expect(try await reached(.seconds(20)) { input.isBlocked },
+                "the producer never reached the parked read")
+
+        let started = ContinuousClock.now
+        await session.stop()
+        let elapsed = started.duration(to: .now)
+
+        #expect(input.cancelCalls > 0, "the engine never asked the host to let go")
+        #expect(elapsed < PrismCoreSession.producerStopGrace,
+                "stop() took \(elapsed) — it waited the grace out instead of being released")
+        let said = notices.withLock { $0 }
+        #expect(!said.contains { $0.contains("detaching") },
+                "the producer was detached, so the release never reached it: \(said)")
+        #expect(!said.contains { $0.contains("does not conform") },
+                "a conforming input was announced as unconformant: \(said)")
+    }
+
+    /// A read budget is the other place the guard becomes interrupted, and it
+    /// is the one that notifies nobody on its own: `shouldInterrupt` is a
+    /// poll, and the thread that would poll it is inside the host.
+    @Test("A probe budget reaches a host read that has already parked")
+    func probeBudgetReleasesAParkedConformingRead() async throws {
+        let data = try fixtureData("h264_aac_30s", "mkv")
+        // 2 KiB answers, parked after 4 KiB: the same tuning the failure test
+        // above uses, which puts the park inside `find_stream_info` — after
+        // the open, so the budget is bounding analysis, not a refusal.
+        let input = CancellableMemoryInput(data: data, chunk: 2048, blockAfterBytes: 4096)
+        defer { input.release() }
+
+        let started = ContinuousClock.now
+        // A real thread, never the cooperative pool: the probe blocks, and
+        // before this change it blocks forever (#44's rule).
+        let probe = ProducerThread(name: "prismcore.tests.parked-probe") {
+            _ = try SourceProbe.open(
+                url: absentURL("fixture.mkv"), budget: .milliseconds(300), input: { input }
+            )
+        }
+        let returned = await probe.join(within: .seconds(15))
+        let elapsed = started.duration(to: .now)
+
+        #expect(returned, "the probe never returned — the budget did not reach the parked read")
+        #expect(elapsed < .seconds(5), "the probe answered after \(elapsed) against a 0.3 s budget")
+        #expect(input.cancelCalls > 0)
+        #expect(probe.failureIfAny != nil, "a probe that could not read must not report success")
+    }
+
+    /// The short-count half of the contract. `read` returning 0 normally means
+    /// end of stream; a read the engine itself released is allowed to answer
+    /// that way, and reading it as EOF would hand the demuxer a truncated
+    /// container as a complete one.
+    @Test("A read released with a short count aborts rather than reporting EOF")
+    func aReleasedShortCountIsNotEndOfStream() async throws {
+        let data = try fixtureData("h264_aac", "mkv")
+        // Parked on the very first read, so nothing else can be mistaken for
+        // the abort under test.
+        let input = CancellableMemoryInput(
+            data: data, blockAfterBytes: 0, releaseAnswer: .shortCount
+        )
+        defer { input.release() }
+        let readGuard = ReadInterruptGuard()
+        let context = try #require(readGuard.makeContext())
+        defer { avformat_free_context(context) }
+        try readGuard.installCustomInput(on: context, factory: { input })
+        #expect(readGuard.inputIsInterruptible)
+        // `nonisolated(unsafe)`: the pointer crosses onto the reader thread,
+        // which is the only thread that touches it — the same single-owner
+        // shape every context in this engine already has.
+        nonisolated(unsafe) let pb = try #require(context.pointee.pb)
+
+        readGuard.arm(budget: .milliseconds(200))
+        let outcome = Locked<Int32>(0)
+        let reader = ProducerThread(name: "prismcore.tests.short-count") {
+            var buffer = [UInt8](repeating: 0, count: 4096)
+            let result = avio_read(pb, &buffer, 4096)
+            outcome.withLock { $0 = result }
+        }
+        let returned = await reader.join(within: .seconds(10))
+
+        #expect(returned, "the parked read was never released")
+        #expect(outcome.withLock { $0 } == swift_AVERROR_EXIT(),
+                "a released read must come back as an abort, not as end of stream")
+        withExtendedLifetime(readGuard) {}
+    }
+
+    /// The engine calls the hook whenever the guard becomes interrupted — it
+    /// cannot see inside the host, so it never guesses whether anything is in
+    /// flight. That makes "nothing in flight" the common case, and it has to
+    /// cost nothing.
+    @Test("cancelInFlightOperation with nothing in flight changes nothing")
+    func cancellingWithNothingInFlightIsHarmless() throws {
+        let data = try fixtureData("h264_aac", "mkv")
+        let input = CancellableMemoryInput(data: data)
+        input.cancelInFlightOperation()
+        #expect(input.idleCancelCalls == 1)
+        // …and the input still gives the engine a complete probe afterwards.
+        let info = try SourceProbe.probe(url: absentURL("fixture.mkv"), input: { input })
+        #expect(info.video?.codecName == "h264")
+        #expect((info.duration ?? 0) > 0)
+
+        // The same call made by the ENGINE, on an input that has not read a
+        // byte: `cancel()` on a guard whose context nobody is using.
+        let idle = CancellableMemoryInput(data: data)
+        let readGuard = ReadInterruptGuard()
+        let context = try #require(readGuard.makeContext())
+        defer { avformat_free_context(context) }
+        try readGuard.installCustomInput(on: context, factory: { idle })
+        readGuard.cancel()
+        #expect(idle.cancelCalls == 1)
+        #expect(idle.idleCancelCalls == 1)
+        withExtendedLifetime(readGuard) {}
+    }
+
+    /// Additive means additive: an input written against 3.0.0 behaves
+    /// identically. What it gains is a breadcrumb — said once, at the only
+    /// moment the engine can still tell the difference cheaply.
+    @Test("A non-conforming input is unchanged, and is announced exactly once")
+    func aNonConformingInputIsAnnouncedOnce() throws {
+        let data = try fixtureData("h264_aac", "mkv")
+        let notices = Locked<[String]>([])
+        PrismCoreLog.observer = { message in notices.withLock { $0.append(message) } }
+        defer { PrismCoreLog.observer = nil }
+
+        let plainGuard = ReadInterruptGuard()
+        let plainContext = try #require(plainGuard.makeContext())
+        defer { avformat_free_context(plainContext) }
+        try plainGuard.installCustomInput(on: plainContext, factory: { MemoryInput(data: data) })
+        #expect(!plainGuard.inputIsInterruptible)
+        let afterPlain = notices.withLock { $0 }
+        #expect(afterPlain.count == 1, "expected exactly one notice, got \(afterPlain)")
+        #expect(afterPlain.first?.contains("CancellablePrismCoreInput") == true,
+                "the notice must name the protocol a host would have to adopt")
+
+        // The conforming one says nothing. A breadcrumb dropped for the normal
+        // case is noise, and noise is what stops the abnormal one being read.
+        let sharpGuard = ReadInterruptGuard()
+        let sharpContext = try #require(sharpGuard.makeContext())
+        defer { avformat_free_context(sharpContext) }
+        try sharpGuard.installCustomInput(
+            on: sharpContext, factory: { CancellableMemoryInput(data: data) }
+        )
+        #expect(sharpGuard.inputIsInterruptible)
+        #expect(notices.withLock { $0 }.count == 1)
+
+        // And the old shape still reads: the notice is a note, not a refusal.
+        let info = try SourceProbe.probe(
+            url: absentURL("fixture.mkv"), input: { MemoryInput(data: data) }
+        )
+        #expect(info.video?.codecName == "h264")
+        #expect(!info.audioTracks.isEmpty)
+        withExtendedLifetime((plainGuard, sharpGuard)) {}
+    }
+
+    /// Poll `condition` until it holds or `limit` passes. Returns whether it
+    /// held — a caller that cares turns that into the failure.
+    private func reached(
+        _ limit: Duration, _ condition: () -> Bool
+    ) async throws -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: limit)
+        while ContinuousClock.now < deadline {
+            if condition() { return true }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        return condition()
     }
 }
 

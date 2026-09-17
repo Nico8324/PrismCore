@@ -8,6 +8,8 @@ source-compatible.)
 
 ## [Unreleased]
 
+## [3.1.0] — 2026-09-17
+
 The sixth defect 3.0.1 named and could not fix, because fixing it means adding
 to the protocol: a host-supplied input's blocking read could not be
 interrupted. This is that fix — new public API, nothing removed or moved, so a
@@ -2050,6 +2052,7 @@ HTTP server, with:
   AVPlayer cannot decode at all.
 
 [Unreleased]: https://github.com/Wenzlik/PrismCore/compare/2.3.0...HEAD
+[3.1.0]: https://github.com/Wenzlik/PrismCore/compare/3.0.1...3.1.0
 [3.0.1]: https://github.com/Wenzlik/PrismCore/compare/3.0.0...3.0.1
 [3.0.0]: https://github.com/Wenzlik/PrismCore/compare/2.3.0...3.0.0
 [2.3.0]: https://github.com/Wenzlik/PrismCore/compare/2.2.0...2.3.0

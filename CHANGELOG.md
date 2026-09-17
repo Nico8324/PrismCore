@@ -86,6 +86,18 @@ interrupted. This is that fix — new public API, nothing removed or moved, so a
   the loop already was — `run()` returns normally, not as an unopenable
   source.
 
+### Fixed
+
+- **A test that asserted a window nothing holds open.**
+  `RuntimeAudioDelayTests.remuxDelayTakesEffectAtTheReanchor` read
+  `audioDelaySeconds` and `pendingAudioDelaySeconds` in two separate actor
+  hops and required the second to still name the request — which the producer
+  is entitled to have adopted in between, at its next re-anchor, and did. Both
+  are now read in one lock acquisition (`HLSRemuxer.audioDelayReport`) and
+  asserted as a pair, which still forbids the state that matters: a cleared
+  `pending` while the old offset is what is being served, the report that
+  would tell a viewer their correction had landed when it had not.
+
 ## [3.0.1] — 2026-09-16
 
 Five of the six defects a review pass found over 3.0.0. All are internal — no

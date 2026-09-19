@@ -8,6 +8,14 @@ source-compatible.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **The coordinated HTTP reader keeps up with a 4K file whose tracks sit apart.** It held one
+  1 MB block starting wherever the read was, fetched by a new `URLSession` each time; an MP4 with
+  its audio two megabytes behind its video made the demuxer hop several times a second, and each
+  hop refetched — 2.5× the file's size over eight fresh connections a second, about realtime on a
+  LAN. Blocks are now 4 MB, aligned, six kept most-recently-used, and fetched on one session.
+
 ## [2.1.1] — 2026-09-07
 
 Subtitle fixes from #82 and #83.

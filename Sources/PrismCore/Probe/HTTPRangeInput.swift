@@ -9,12 +9,26 @@ final class HTTPRangeInput {
     private var url: URL
     private var headers: [String: String]
     private let interrupted: () -> Bool
-    private let blockSize = 1 << 20
+    /// Four megabytes, fetched on block boundaries and kept a few at a time.
+    ///
+    /// It was one block of one megabyte starting wherever the read happened to
+    /// be. An MP4 whose audio sits a couple of megabytes behind its video makes
+    /// the demuxer hop between the two several times a second; each hop threw
+    /// the block away and fetched another, so a 25 Mbit/s film pulled 2.5 times
+    /// its size over eight fresh connections a second and an Apple TV on
+    /// Ethernet could not fill a buffer from a Mac on the same network
+    /// (2026-09-19). Aligned blocks make both sides of the hop the same cached
+    /// blocks, and a larger block spends fewer round trips per second of film.
+    private let blockSize = 4 << 20
+    private let blocksKept = 6
     private var position: Int64 = 0
     private var length: Int64?
     private var validator: String?
-    private var buffer = Data()
-    private var bufferStart: Int64 = 0
+    /// Most recently used last.
+    private var blocks: [(start: Int64, data: Data)] = []
+    /// One session for the life of the input, so every block after the first
+    /// rides a connection that is already open and already up to speed.
+    private let session = RangeSession()
     private var io: UnsafeMutablePointer<AVIOContext>?
 
     init(url: URL, headers: [String: String], interrupted: @escaping () -> Bool) {
@@ -42,6 +56,8 @@ final class HTTPRangeInput {
     }
 
     deinit {
+        // The session holds its delegate until it is invalidated; nothing else would let go.
+        session.invalidate()
         if let io { av_free(io.pointee.buffer); avio_context_free(&self.io) }
     }
 
@@ -68,17 +84,29 @@ final class HTTPRangeInput {
         if interrupted() { return swift_AVERROR_EXIT() }
         if let length, position >= length { return swift_AVERROR_EOF() }
         do {
-            if position < bufferStart || position >= bufferStart + Int64(buffer.count) { try fill() }
-            let offset = Int(position - bufferStart)
-            guard offset >= 0, offset < buffer.count else { return swift_AVERROR_EOF() }
-            let copied = min(Int(count), buffer.count - offset)
-            buffer.copyBytes(to: destination, from: offset..<(offset + copied))
+            let buffer = try block(holding: position)
+            let offset = Int(position - buffer.start)
+            guard offset >= 0, offset < buffer.data.count else { return swift_AVERROR_EOF() }
+            let copied = min(Int(count), buffer.data.count - offset)
+            buffer.data.copyBytes(to: destination, from: offset..<(offset + copied))
             position += Int64(copied)
             return Int32(copied)
         } catch { return interrupted() ? swift_AVERROR_EXIT() : swift_AVERROR(EIO) }
     }
 
-    private func fill() throws {
+    private func block(holding position: Int64) throws -> (start: Int64, data: Data) {
+        let start = position - position % Int64(blockSize)
+        if let index = blocks.firstIndex(where: { $0.start == start }) {
+            blocks.append(blocks.remove(at: index))
+        } else {
+            try fill(from: start)
+        }
+        return blocks[blocks.count - 1]
+    }
+
+    private func fill() throws { try fill(from: position - position % Int64(blockSize)) }
+
+    private func fill(from start: Int64) throws {
         let deadline = ProcessInfo.processInfo.systemUptime + 30
         let cancelled = { [self] in interrupted() || ProcessInfo.processInfo.systemUptime >= deadline }
         for _ in 0..<8 {
@@ -89,7 +117,7 @@ final class HTTPRangeInput {
             do {
                 var requestHeaders = headers
                 if let validator { requestHeaders["If-Range"] = validator }
-                response = try RangeResponse.fetch(url: url, headers: requestHeaders, start: position,
+                response = try session.fetch(url: url, headers: requestHeaders, start: start,
                     size: blockSize, cancelled: cancelled)
             } catch { HTTPOriginCoordinator.shared.release(origin); throw error }
             let status = response.response?.statusCode ?? 0
@@ -120,7 +148,7 @@ final class HTTPRangeInput {
             }
             guard status == 206, response.error == nil,
                   let raw = response.response?.value(forHTTPHeaderField: "Content-Range"),
-                  let range = Self.contentRange(raw), range.start == position,
+                  let range = Self.contentRange(raw), range.start == start,
                   range.end - range.start + 1 == Int64(response.data.count),
                   response.data.count <= blockSize else { throw Failure.request }
             if let length, length != range.total { throw Failure.request }
@@ -130,8 +158,9 @@ final class HTTPRangeInput {
             if let validator, let currentValidator, validator != currentValidator { throw Failure.request }
             if validator == nil { validator = currentValidator }
             length = range.total
-            bufferStart = position
-            buffer = response.data
+            blocks.removeAll { $0.start == start }
+            blocks.append((start, response.data))
+            if blocks.count > blocksKept { blocks.removeFirst() }
             return
         }
         throw Failure.request
@@ -148,34 +177,48 @@ final class HTTPRangeInput {
     enum Failure: Error { case allocation, request }
 }
 
-private final class RangeResponse: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+private final class RangeResponse: @unchecked Sendable {
     var response: HTTPURLResponse?
     var data = Data()
     var error: Error?
     let limit: Int
-    private let completed = DispatchSemaphore(value: 0)
+    let completed = DispatchSemaphore(value: 0)
 
     init(limit: Int) { self.limit = limit }
+}
 
-    static func fetch(url: URL, headers: [String: String], start: Int64, size: Int,
-                      cancelled: () -> Bool) throws -> RangeResponse {
-        let result = RangeResponse(limit: size)
+private final class RangeSession: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var results: [Int: RangeResponse] = [:]
+    private lazy var session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 15
         config.timeoutIntervalForResource = 30
-        let session = URLSession(configuration: config, delegate: result, delegateQueue: nil)
-        defer { session.invalidateAndCancel() }
+        return URLSession(configuration: config, delegate: self, delegateQueue: nil)
+    }()
+
+    func invalidate() { session.invalidateAndCancel() }
+
+    func fetch(url: URL, headers: [String: String], start: Int64, size: Int,
+               cancelled: () -> Bool) throws -> RangeResponse {
+        let result = RangeResponse(limit: size)
         var request = URLRequest(url: url)
         for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
         let (end, overflow) = start.addingReportingOverflow(Int64(size) - 1)
         request.setValue("bytes=\(start)-\(overflow ? Int64.max : end)", forHTTPHeaderField: "Range")
         request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
         let task = session.dataTask(with: request)
+        lock.withLock { results[task.taskIdentifier] = result }
+        defer { lock.withLock { results[task.taskIdentifier] = nil } }
         task.resume()
         while result.completed.wait(timeout: .now() + 0.05) == .timedOut {
             if cancelled() { task.cancel(); throw HTTPRangeInput.Failure.request }
         }
         return result
+    }
+
+    private func result(for task: URLSessionTask) -> RangeResponse? {
+        lock.withLock { results[task.taskIdentifier] }
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask,
@@ -186,18 +229,21 @@ private final class RangeResponse: NSObject, URLSessionDataDelegate, @unchecked 
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
                     didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        self.response = response as? HTTPURLResponse
+        guard let result = result(for: dataTask) else { completionHandler(.cancel); return }
+        result.response = response as? HTTPURLResponse
         // A server ignoring Range must not download a movie into this buffer.
-        completionHandler(self.response?.statusCode == 206 && response.expectedContentLength <= Int64(limit) ? .allow : .cancel)
+        completionHandler(result.response?.statusCode == 206 && response.expectedContentLength <= Int64(result.limit) ? .allow : .cancel)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        guard self.data.count + data.count <= limit else { dataTask.cancel(); return }
-        self.data.append(data)
+        guard let result = result(for: dataTask) else { return }
+        guard result.data.count + data.count <= result.limit else { dataTask.cancel(); return }
+        result.data.append(data)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        self.error = error
-        completed.signal()
+        guard let result = result(for: task) else { return }
+        result.error = error
+        result.completed.signal()
     }
 }

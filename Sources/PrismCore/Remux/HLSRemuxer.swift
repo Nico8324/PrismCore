@@ -852,6 +852,63 @@ final class HLSRemuxer: @unchecked Sendable {
             ))
         }
 
+        // Keep the index this plan was built from, so the NEXT play does not
+        // pay for it again. The keyframes are already in memory — the
+        // demuxer's own index, loaded by the nudge seek above — so storing
+        // them is a JSON write and no I/O against the source at all.
+        //
+        // What it saves is not the parse, it is the ROUND TRIPS. Measured
+        // against a model of Aether's localhost range proxy (which fetches
+        // each forwarded window whole before it writes a byte: 8 MB bites at
+        // ~800 KB/s), a first play of a 60 min Matroska spends four requests —
+        // the header, two at the tail for the Cues, and one to get back to the
+        // head — and 21.4 s before AVPlayer sees a playlist. The two tail
+        // requests and the rewind are all the index load's; with the map on
+        // disk the next play makes the header request and stops there.
+        //
+        // `.builtFromSource` only: a plan that came from the cache is already
+        // stored, and a degraded one is the harvest's business below.
+        //
+        // Stored ONLY when the index provably reaches the end of the source,
+        // and then as complete. A plan existing is not that proof (review
+        // finding): `keyframePlan`'s witnesses ask for a gap under the cap
+        // and a span of one target, which a head PREFIX satisfies — and a
+        // prefix is exactly what the index-load seek leaves behind when its
+        // budget runs out or the read fails mid-scan. Stored as complete,
+        // that prefix would be permanent: the next play would skip the index
+        // load on the strength of it, never see `planIsPartial`, never
+        // harvest, and plan the whole unseen remainder as one entry that only
+        // closes at EOF.
+        //
+        // An unproven prefix is therefore not stored at all — not even as a
+        // partial map. Partial coverage means a CONTIGUOUS run from the head,
+        // which the harvest knows because it read every packet; an aborted
+        // index scan knows no such thing about the entries the demuxer
+        // happened to add. Writing nothing costs this source the index-load
+        // seek again next time — which is what it paid before the sidecar
+        // existed — and leaves the next play free to load a full index and
+        // store that.
+        if let keyframeCache, let cacheIdentity, plannedPlan != nil, cachedKeyframes == nil {
+            let stream = input.pointee.streams[Int(videoIndex)]!
+            let indexed = SegmentPlan.indexedKeyframes(of: stream)
+            let durationSeconds = Double(input.pointee.duration) / Double(AV_TIME_BASE)
+            if indexed.count >= 2, let last = indexed.max(), durationSeconds > 0,
+               SegmentPlan.indexCoversThroughEnd(
+                   lastKeyframePTS: last,
+                   tickSeconds: av_q2d(stream.pointee.time_base),
+                   durationSeconds: durationSeconds,
+                   targetSeconds: segmentSeconds
+               ) {
+                let timeBase = stream.pointee.time_base
+                keyframeCache.store(.init(
+                    identity: cacheIdentity,
+                    timeBaseNum: timeBase.num,
+                    timeBaseDen: timeBase.den,
+                    keyframePTS: indexed.sorted()
+                ))
+            }
+        }
+
         // Harvest for next time (issue #34): this session degraded to the
         // sequential shape even though it could have been planned — the map
         // is not in the file. The producer is about to read every packet

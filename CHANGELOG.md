@@ -8,6 +8,68 @@ source-compatible.)
 
 ## [Unreleased]
 
+## [3.1.1] — 2026-09-20
+
+Startup over a host proxy, which is where the 2026-09-19 field report spent
+18 seconds before AVPlayer saw a playlist:
+`probe 10583ms (open 10560 + info 7 + describe 14) … plan 7344ms
+(builtFromSource, 591 seg)`. Both numbers are round trips, not work — a
+Matroska startup makes four requests (the header, two at the tail for the
+Cues, one back to the head), and Aether's localhost range proxy fetches each
+forwarded window **whole** before it writes a byte, so each of the two
+open-ended ones costs a full 8 MB bite. Two of the four are now gone.
+
+Measured against a model of that proxy (8 MB bites from an origin at
+~800 KB/s, a 60 min Matroska, `StartupCheckpointBenchmark`), probe + `start()`
+as the host runs it:
+
+| | first play | second play |
+|---|---|---|
+| 3.1.0, FFmpeg's HTTP | 21.5 s | 21.5 s |
+| 3.1.1, FFmpeg's HTTP | 21.5 s | 21.5 s |
+| 3.1.0, coordinated HTTP | 3.3 s | 3.0 s |
+| 3.1.1, coordinated HTTP | **1.7 s** | **1.5 s** |
+
+FFmpeg's own HTTP has no block cache to retain anything in and re-opens on
+every backward seek, so it keeps the shape it had; the coordinated reader is
+where the round trips can actually be removed. The remaining 1.4 s is the
+proxy's first bite, which is the host's to fix.
+
+### Changed
+
+- **A plan built from the container's own seek index is now kept in the
+  keyframe cache**, not only a harvest from a session that could not be
+  planned. The keyframes are already in memory when the plan is made — the
+  demuxer's index, loaded by the nudge seek — so storing them costs a JSON
+  write and no I/O against the source at all, and the next play of the same
+  file skips the index-load seek entirely (`segmentPlanReady` reports
+  `keyframeIndexCache` instead of `builtFromSource`).
+
+  Stored **only when the index provably reaches the end of the source**, and
+  then as complete. That a plan exists is not that proof (review finding): the
+  plan's witnesses ask for a keyframe gap under the cap and a span of one
+  target, both of which a head *prefix* satisfies — and a prefix is what an
+  index-load seek leaves behind when its budget runs out or the tail read
+  fails. Stored as complete, such a prefix would outlive the session that
+  produced it and suppress every later attempt to load a real index. An
+  unproven prefix is therefore not stored at all, and the next play builds
+  from the source again.
+
+- **`HTTPRangeInput` retains recently fetched blocks (up to 4 MB) instead of
+  exactly one.** Startup reads head → tail → head, and with a single block the
+  last of those refetched bytes the reader already had: 1.35 s of a 3.0 s
+  startup on the model above. Bounded by bytes rather than by block count,
+  because a Matroska's two tail reads are tens of kilobytes each and counting
+  them as equals to the 1 MB head is precisely what evicted the head. Only the
+  coordinated reader has blocks; FFmpeg's native HTTP is untouched.
+
+### Added
+
+- **`StartupCheckpointBenchmark`** (`PRISMCORE_BENCH`) — the probe phases and
+  `start()`'s checkpoints, printed in the same shape a host logs them, so a
+  device report and a bench run can be compared term by term. The report that
+  started this work had no counterpart in the suite.
+
 ## [3.1.0] — 2026-09-17
 
 The sixth defect 3.0.1 named and could not fix, because fixing it means adding
@@ -2052,6 +2114,7 @@ HTTP server, with:
   AVPlayer cannot decode at all.
 
 [Unreleased]: https://github.com/Wenzlik/PrismCore/compare/2.3.0...HEAD
+[3.1.1]: https://github.com/Wenzlik/PrismCore/compare/3.1.0...3.1.1
 [3.1.0]: https://github.com/Wenzlik/PrismCore/compare/3.0.1...3.1.0
 [3.0.1]: https://github.com/Wenzlik/PrismCore/compare/3.0.0...3.0.1
 [3.0.0]: https://github.com/Wenzlik/PrismCore/compare/2.3.0...3.0.0

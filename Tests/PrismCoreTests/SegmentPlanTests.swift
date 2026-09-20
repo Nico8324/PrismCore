@@ -18,6 +18,34 @@ struct SegmentPlanTests {
         #expect(entries.map(\.duration) == [6, 6, 6, 2])
     }
 
+    @Test("A plan proves nothing about END coverage — a head prefix plans just as happily")
+    func planningIsNotProofOfCoverage() throws {
+        // The shape an index load leaves behind when its budget runs out on a
+        // one-hour source: keyframes every 2 s through 14 s and nothing after.
+        let prefix: [Int64] = stride(from: 0, through: 14_000, by: 2_000).map(Int64.init)
+        // The witnesses pass — no gap over the cap, more than one target of
+        // span — so the planner accepts it and plans the other 3586 s as a
+        // single entry.
+        let entries = try #require(SegmentPlan.keyframePlan(
+            keyframes: prefix, durationSeconds: 3600, tickSeconds: tick, targetSeconds: 6,
+            firstSegmentSeconds: 2
+        ))
+        #expect(entries.map(\.startPTS) == [0, 2_000, 8_000, 14_000])
+        #expect(entries.last?.duration == 3586)
+
+        // Which is why the keyframe cache asks a different question before it
+        // calls a map complete, and gets a different answer.
+        #expect(!SegmentPlan.indexCoversThroughEnd(
+            lastKeyframePTS: 14_000, tickSeconds: tick,
+            durationSeconds: 3600, targetSeconds: 6
+        ))
+        // A real whole-file index ends inside the last target length.
+        #expect(SegmentPlan.indexCoversThroughEnd(
+            lastKeyframePTS: 3_598_000, tickSeconds: tick,
+            durationSeconds: 3600, targetSeconds: 6
+        ))
+    }
+
     @Test("A partial map plans its prefix on keyframes and the tail on the stride")
     func partialMapMixedPlan() throws {
         // Keyframes every 2 s up to 14 s (the covered prefix), 60 s file.

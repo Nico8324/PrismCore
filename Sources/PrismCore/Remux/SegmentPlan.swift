@@ -250,7 +250,29 @@ struct SegmentPlan: Equatable {
         targetSeconds: Int
     ) -> Bool {
         guard let last = indexedKeyframes(of: stream).last else { return false }
-        return Double(last) * tickSeconds >= durationSeconds - Double(targetSeconds)
+        return indexCoversThroughEnd(
+            lastKeyframePTS: last, tickSeconds: tickSeconds,
+            durationSeconds: durationSeconds, targetSeconds: targetSeconds
+        )
+    }
+
+    /// Whether a keyframe set reaches the end of the source: its last entry
+    /// falls inside the final target-length of the container's duration.
+    ///
+    /// This is the only proof of END coverage available without reading the
+    /// file. The plan's own witnesses do NOT give it — they ask for a gap no
+    /// wider than the cap and a span of at least one target, both of which a
+    /// head prefix satisfies — so anything that must distinguish "the whole
+    /// file" from "as far as we got" asks here (review finding: an index-load
+    /// seek that ran out of budget leaves exactly such a prefix, and the plan
+    /// accepts it).
+    static func indexCoversThroughEnd(
+        lastKeyframePTS: Int64,
+        tickSeconds: Double,
+        durationSeconds: Double,
+        targetSeconds: Int
+    ) -> Bool {
+        Double(lastKeyframePTS) * tickSeconds >= durationSeconds - Double(targetSeconds)
     }
 
     /// The keyframe-aligned plan, or nil when the index fails its witnesses.

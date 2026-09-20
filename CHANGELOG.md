@@ -43,9 +43,17 @@ proxy's first bite, which is the host's to fix.
   demuxer's index, loaded by the nudge seek — so storing them costs a JSON
   write and no I/O against the source at all, and the next play of the same
   file skips the index-load seek entirely (`segmentPlanReady` reports
-  `keyframeIndexCache` instead of `builtFromSource`). Stored complete, because
-  the container's index describes the whole file — unlike a harvest, which
-  only ever saw what it played.
+  `keyframeIndexCache` instead of `builtFromSource`).
+
+  Stored **only when the index provably reaches the end of the source**, and
+  then as complete. That a plan exists is not that proof (review finding): the
+  plan's witnesses ask for a keyframe gap under the cap and a span of one
+  target, both of which a head *prefix* satisfies — and a prefix is what an
+  index-load seek leaves behind when its budget runs out or the tail read
+  fails. Stored as complete, such a prefix would outlive the session that
+  produced it and suppress every later attempt to load a real index. An
+  unproven prefix is therefore not stored at all, and the next play builds
+  from the source again.
 
 - **`HTTPRangeInput` retains recently fetched blocks (up to 4 MB) instead of
   exactly one.** Startup reads head → tail → head, and with a single block the

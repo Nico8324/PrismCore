@@ -867,15 +867,39 @@ final class HLSRemuxer: @unchecked Sendable {
         // disk the next play makes the header request and stops there.
         //
         // `.builtFromSource` only: a plan that came from the cache is already
-        // stored, and a degraded one is the harvest's business below. Marked
-        // complete because the container's index describes the whole file —
-        // unlike a harvest, which only ever saw what it played.
+        // stored, and a degraded one is the harvest's business below.
+        //
+        // Stored ONLY when the index provably reaches the end of the source,
+        // and then as complete. A plan existing is not that proof (review
+        // finding): `keyframePlan`'s witnesses ask for a gap under the cap
+        // and a span of one target, which a head PREFIX satisfies — and a
+        // prefix is exactly what the index-load seek leaves behind when its
+        // budget runs out or the read fails mid-scan. Stored as complete,
+        // that prefix would be permanent: the next play would skip the index
+        // load on the strength of it, never see `planIsPartial`, never
+        // harvest, and plan the whole unseen remainder as one entry that only
+        // closes at EOF.
+        //
+        // An unproven prefix is therefore not stored at all — not even as a
+        // partial map. Partial coverage means a CONTIGUOUS run from the head,
+        // which the harvest knows because it read every packet; an aborted
+        // index scan knows no such thing about the entries the demuxer
+        // happened to add. Writing nothing costs this source the index-load
+        // seek again next time — which is what it paid before the sidecar
+        // existed — and leaves the next play free to load a full index and
+        // store that.
         if let keyframeCache, let cacheIdentity, plannedPlan != nil, cachedKeyframes == nil {
-            let indexed = SegmentPlan.indexedKeyframes(
-                of: input.pointee.streams[Int(videoIndex)]!
-            )
-            if indexed.count >= 2 {
-                let timeBase = input.pointee.streams[Int(videoIndex)]!.pointee.time_base
+            let stream = input.pointee.streams[Int(videoIndex)]!
+            let indexed = SegmentPlan.indexedKeyframes(of: stream)
+            let durationSeconds = Double(input.pointee.duration) / Double(AV_TIME_BASE)
+            if indexed.count >= 2, let last = indexed.max(), durationSeconds > 0,
+               SegmentPlan.indexCoversThroughEnd(
+                   lastKeyframePTS: last,
+                   tickSeconds: av_q2d(stream.pointee.time_base),
+                   durationSeconds: durationSeconds,
+                   targetSeconds: segmentSeconds
+               ) {
+                let timeBase = stream.pointee.time_base
                 keyframeCache.store(.init(
                     identity: cacheIdentity,
                     timeBaseNum: timeBase.num,

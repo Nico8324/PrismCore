@@ -724,14 +724,17 @@ public enum SourceProbe {
         httpHeaders: [String: String] = [:],
         budget: Duration = SourceOpenTuning.probeBudget,
         coordinatedHTTP: Bool = false,
-        input: PrismCoreInputFactory? = nil
+        input: PrismCoreInputFactory? = nil,
+        structure: SourceStructureExport = .none,
+        hints: SourceOpenHints? = nil
     ) async throws -> ProbedSource {
         try Task.checkCancellation()
         let outcome: Result<ProbedSource, any Error> = await withCheckedContinuation { continuation in
             let thread = ProducerThread(name: "cz.zmrhal.prismcore.probe") {
                 continuation.resume(returning: Result {
                     try open(url: url, httpHeaders: httpHeaders, budget: budget,
-                             coordinatedHTTP: coordinatedHTTP, input: input)
+                             coordinatedHTTP: coordinatedHTTP, input: input,
+                             structure: structure, hints: hints)
                 })
             }
             // Kept alive by its own closure until it exits; nothing to join.
@@ -749,12 +752,32 @@ public enum SourceProbe {
     ///   transport libavformat cannot open itself. One instance is taken for
     ///   this open; `url` is then only a naming hint for format probing, never
     ///   fetched. `nil` (the default) keeps native FFmpeg I/O.
+    /// The `hints:`-first spelling of `open`, for callers that have a probe
+    /// document in hand and nothing else to say.
+    ///
+    /// `hints: nil` is `open(url:)` exactly — the same code, not a parallel
+    /// one. That property is what keeps the hinted path an addition to the
+    /// engine rather than a fork of it, and `SourceProbeHintsTests` pins it.
+    public static func open(_ url: URL, hints: SourceOpenHints?) throws -> ProbedSource {
+        try open(url: url, hints: hints)
+    }
+
+    /// - Parameter structure: how much of a byte-layout and index export to
+    ///   pay for. `.none` (the default) costs no I/O and reports
+    ///   `SourceStructure.unknown`; see `SourceStructureExport` for why the
+    ///   other two are opt-in.
+    /// - Parameter hints: what a caller already knows about this source. May
+    ///   make the open read *less*; may never make it read something else. A
+    ///   hint that turns out not to describe these bytes is recorded in
+    ///   `ProbedSource.hints` and otherwise ignored.
     public static func open(
         url: URL,
         httpHeaders: [String: String] = [:],
         budget: Duration = SourceOpenTuning.probeBudget,
         coordinatedHTTP: Bool = false,
-        input inputFactory: PrismCoreInputFactory? = nil
+        input inputFactory: PrismCoreInputFactory? = nil,
+        structure structureExport: SourceStructureExport = .none,
+        hints: SourceOpenHints? = nil
     ) throws -> ProbedSource {
         // The interrupt guard has to exist BEFORE the open — the blocking
         // reads check the URLContext's copy of the callback, taken at
@@ -770,7 +793,10 @@ public enum SourceProbe {
             do { try interruptGuard.installCustomInput(on: input, factory: inputFactory) }
             catch { avformat_free_context(input); throw error }
         } else if coordinatedHTTP, ["http", "https"].contains(url.scheme?.lowercased() ?? ""), let input {
-            do { try interruptGuard.installHTTPInput(on: input, url: url, headers: httpHeaders) }
+            // The only place a sizing hint can still change anything: the
+            // reader has to be built with it, because the first read happens
+            // inside `avformat_open_input` below.
+            do { try interruptGuard.installHTTPInput(on: input, url: url, headers: httpHeaders, hints: hints) }
             catch { avformat_free_context(input); throw error }
         }
 
@@ -855,6 +881,24 @@ public enum SourceProbe {
         let info = describe(input: input, verifyingInterlace: true)
         let describedAt = clock.now
 
+        // Both after `describe`, and in this order. The structure export may
+        // move the read position (the index load is a seek to the tail and
+        // back), and `describe`'s interlace verification decodes packets from
+        // wherever the analysis left off — running the export first would
+        // change what those frames are. The hint evaluation reads the stream
+        // list and the transport's validator, neither of which the export
+        // touches.
+        let structure = SourceStructureReader.read(
+            input: input,
+            formatName: info.formatName,
+            videoStreamIndex: info.video.map { Int32($0.streamIndex) },
+            export: structureExport,
+            interruptGuard: interruptGuard
+        )
+        let hintOutcome = HintEvaluation.evaluate(
+            hints: hints, input: input, interruptGuard: interruptGuard
+        )
+
         // A budget that expired mid-verification latched AVERROR_EXIT in the
         // AVIOContext, and the adopting producer's first read would get it
         // verbatim. The verification itself degraded gracefully (an aborted
@@ -865,7 +909,8 @@ public enum SourceProbe {
         }
 
         return ProbedSource(
-            info: info, url: url, httpHeaders: httpHeaders, inputFactory: inputFactory,
+            info: info, structure: structure, hints: hintOutcome,
+            url: url, httpHeaders: httpHeaders, inputFactory: inputFactory,
             context: input, interruptGuard: interruptGuard,
             timing: ProbeTiming(
                 open: probeStart.duration(to: openedAt),

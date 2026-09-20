@@ -40,9 +40,43 @@ package enum FuzzTargets {
         "isobmff-patch": { @Sendable in isobmffPatch($0) },
         "text-subtitles": { @Sendable in textSubtitles($0) },
         "a53-captions": { @Sendable in a53Captions($0) },
+        "container-layout": { @Sendable in containerLayout($0) },
     ]
 
     // MARK: - Targets
+
+    /// The top-level element walk that produces a source's `headerBytes`,
+    /// `firstClusterOffset` and `indexLocation`, over arbitrary bytes read as
+    /// each container it knows.
+    ///
+    /// The wrong-answer invariants matter more here than the crash one,
+    /// because this parser's output crosses a network and is acted on by a
+    /// process that cannot check it: an offset outside the file would size a
+    /// read into nothing, and `none` is a verdict this walk can never earn —
+    /// it would tell a consumer to skip a tail index that is really there.
+    /// Mutated bytes are exactly the shape that talks a length-driven walk
+    /// into both.
+    package static func containerLayout(_ bytes: [UInt8]) {
+        let data = Data(bytes)
+        let read: ContainerLayoutScanner.Reader = { offset, count in
+            guard offset >= 0, count > 0, let start = Int(exactly: offset),
+                  start + count <= data.count else { return nil }
+            return Data(data[start..<(start + count)])
+        }
+        for format in ["matroska,webm", "mov,mp4,m4a,3gp,3g2,mj2"] {
+            let size = Int64(bytes.count)
+            let layout = ContainerLayoutScanner.scan(formatName: format, byteSize: size, read: read)
+            if let offset = layout.firstMediaOffset, offset < 0 || offset > size {
+                fatalError("\(format): media offset \(offset) is outside a \(size)-byte source")
+            }
+            if let header = layout.headerBytes, header < 0 || Int64(header) > size {
+                fatalError("\(format): header length \(header) is outside a \(size)-byte source")
+            }
+            if layout.indexLocation == .none {
+                fatalError("\(format): claimed a container declares no index, which this walk cannot know")
+            }
+        }
+    }
 
     /// The JOC walk over an arbitrary packet. The walk is best-effort by
     /// design, so the only strong claims are "no crash" and "a returned

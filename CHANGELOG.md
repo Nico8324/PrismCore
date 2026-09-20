@@ -8,6 +8,82 @@ source-compatible.)
 
 ## [Unreleased]
 
+### Added
+
+- **`ProbedSource.structure` — the container's byte layout and seek index, on
+  request.** `SourceInfo` has always answered "what streams are in here"; this
+  answers "where does the header end, where does the media start, is there an
+  index, and does it reach the end of the file". It exists for one consumer:
+  a server that has already analysed a file handing those facts to a client
+  about to read the same bytes across a network, so the client's first
+  open-ended request can be a bounded one
+  ([Wellspring's probe-hints design](https://github.com/Wenzlik/Wellspring/blob/main/docs/prismcore-probe-hints.md),
+  §4). `SourceStructure`, `IndexSummary`, `IndexLocation`, `IndexCompleteness`
+  and `IndexSource` are `Codable` in exactly the wire shape §3 prints, and
+  `ProbeStructureExportTests.wireShapeIsPinned` is the executable statement of
+  it — the server's `PrismProbeReport` cannot import this module (it links
+  neither PrismCore nor FFmpeg, on purpose), so a pinned shape is the only
+  thing that can keep the two in lockstep.
+
+  The export is **opt-in** (`SourceProbe.open(structure:)`, `.none` by
+  default) because both of its steps are real I/O: the layout walk re-reads
+  the head, and `.full` pays the same index-load seek `SegmentPlan` does. The
+  intended caller reads a local descriptor out of process, where both are
+  free; a host probing over a network to decide how to route must not pay
+  them, and with the default it does not.
+
+  Every field is optional or has an `unknown` case, and **nothing is
+  inferred**. There is no libavformat API for a container's byte layout —
+  `avio_tell` after the open is the probe buffer's position, not the header's
+  length, and a first packet's `pos` is a per-demuxer convention — so
+  `ContainerLayoutScanner` walks the top-level element framing itself, for
+  Matroska and ISO-BMFF, reading IDs and declared lengths and never a payload.
+  What it cannot determine it says `unknown` about: in particular
+  `IndexLocation.none` and `IndexCompleteness.absent` require positive
+  evidence that a container declares no index, an empty index table at open is
+  not that evidence, and neither case is reachable from this walk today. An
+  index load the budget cut short reports `unknown` with its timestamps
+  withheld rather than a prefix dressed as a map. Wired into the fuzzer as
+  `container-layout`, whose invariants are the wrong-answer ones — an offset
+  outside the file, or a `none` this walk cannot earn.
+
+- **`SourceProbe.open(_:hints:)` — an open that can be told what the caller
+  already knows** (design §6.1). `hints: nil` is today's open, the same code
+  with every hint behind an absent optional, which
+  `SourceOpenHintsTests.nilHintsAreTheOldPath` pins.
+
+  `headerBytes` / `firstClusterOffset` size the coordinated reader's first
+  read, and only upward: that reader's first request is already a bounded
+  `bytes=0-1048575`, so a hint below a block is inert (shrinking it would turn
+  one round trip into several on any file whose analysis reads past its
+  header) while a three-megabyte header now arrives in one request instead of
+  three. `probesize` is deliberately left alone — too small a value makes
+  libavformat *fail* the open, and the contract these hints ride on is that a
+  wrong one costs a read, never a wrong parse. `indexLocation` is carried and
+  not acted on: acting on it would mean skipping the tail reads, which is the
+  one thing a sizing hint may not do.
+
+  `expectedValidator` and `keyframes` exist with honest validation. The
+  coordinated reader now records what the origin's first response reported
+  (`ETag`, else `Last-Modified`) and compares it once, before a byte has been
+  delivered — a mismatch there is a rejection of the hints, never of the play,
+  and the mid-session case keeps today's behaviour of refusing to append the
+  mismatched block. A supplied map is checked against §6.3 in full: the
+  stream, the exact time base, strictly increasing timestamps inside a fixed
+  cap, bounds against the stream's start and the container's duration, and a
+  `partial` map whose covered-through marker is one of its own entries. Any
+  failure rejects the whole map, and every rejection is reported on
+  `ProbedSource.hints` rather than thrown.
+
+  A surviving map is **carried, not consumed**. The design's trust rule 5
+  makes a supplied map unusable until the transport binding exists at both
+  ends of the wire (its P2), so wiring it into `SegmentPlan.build` now would
+  create a path that may not legally execute — and the only way it *could*
+  execute is the bug the design warns about, a remote assertion harvested into
+  the local `KeyframeIndexCache` as though it were this machine's own read.
+  `SourceOpenHintsTests.suppliedMapNeverReachesTheSidecar` runs a real session
+  with a sentinel map and proves the sidecar stays clean.
+
 ## [3.1.1] — 2026-09-20
 
 Startup over a host proxy, which is where the 2026-09-19 field report spent

@@ -22,7 +22,47 @@ package enum FuzzSeeds {
             Array(srtText.utf8), Array(vttText.utf8), Array(assEvent.utf8), tx3gSample,
         ],
         "a53-captions": [captionedAccessUnit, xdsAccessUnit],
+        "container-layout": [matroskaHead, faststartMP4Head],
     ]
+
+    /// The head of a Matroska laid out the way mkvmerge writes one: EBML
+    /// header, Segment, a SeekHead pointing at Cues past the media, Tracks,
+    /// then the first Cluster. Everything the walk keys on is present, so a
+    /// mutation anywhere in it lands on a branch that runs.
+    package static let matroskaHead: [UInt8] = {
+        func vint(_ value: Int) -> [UInt8] {
+            var bytes: [UInt8] = [0x01]
+            for shift in stride(from: 48, through: 0, by: -8) {
+                bytes.append(UInt8((value >> shift) & 0xFF))
+            }
+            return bytes
+        }
+        func element(_ id: [UInt8], _ payload: [UInt8]) -> [UInt8] { id + vint(payload.count) + payload }
+        let cuesID: [UInt8] = [0x1C, 0x53, 0xBB, 0x6B]
+        let seekEntry = element([0x4D, 0xBB],
+            element([0x53, 0xAB], cuesID) + element([0x53, 0xAC], [0x00, 0x00, 0x04, 0x00]))
+        let children = element([0x11, 0x4D, 0x9B, 0x74], seekEntry)
+            + element([0x16, 0x54, 0xAE, 0x6B], [UInt8](repeating: 0x42, count: 48))
+            + element([0x1F, 0x43, 0xB6, 0x75], [UInt8](repeating: 0x11, count: 96))
+            + element(cuesID, [UInt8](repeating: 0x33, count: 24))
+        return element([0x1A, 0x45, 0xDF, 0xA3], [0x42, 0x86, 0x81, 0x01])
+            + element([0x18, 0x53, 0x80, 0x67], children)
+    }()
+
+    /// A faststart MP4's box sequence — `ftyp`, `moov`, `mdat` — so the walk
+    /// reaches the `.head` verdict and the header-length arithmetic that
+    /// follows it.
+    package static let faststartMP4Head: [UInt8] = {
+        func box(_ type: String, _ payload: [UInt8]) -> [UInt8] {
+            let total = payload.count + 8
+            return [UInt8((total >> 24) & 0xFF), UInt8((total >> 16) & 0xFF),
+                    UInt8((total >> 8) & 0xFF), UInt8(total & 0xFF)]
+                + Array(type.utf8) + payload
+        }
+        return box("ftyp", Array("isom".utf8) + [0, 0, 0, 0])
+            + box("moov", [UInt8](repeating: 0x02, count: 96))
+            + box("mdat", [UInt8](repeating: 0x03, count: 256))
+    }()
 
     /// An H.264 Annex-B access unit carrying a complete A/53 caption SEI: a
     /// pop-on caption loaded, addressed to row 15, printed and flipped onto the

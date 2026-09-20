@@ -486,6 +486,57 @@ interlaced around progressive frames, so the probe decodes a handful of frames b
 believing the flag. Evicting those from the native path would trade hardware decode
 and Atmos passthrough for deinterlacing nothing.
 
+### Probe hints: describing a source, and being told about one
+
+Two read-only additions for hosts whose media comes from a server that has
+already analysed the same file. Both are opt-in and both default to today's
+behaviour exactly.
+
+**Exporting.** `SourceProbe.open(url:structure:)` fills
+`ProbedSource.structure` with the container's byte layout and seek index —
+where the metadata region ends, where the first media element starts, whether
+the container's index lives at the head or the tail, and (at `.full`) the
+index itself with a verdict on whether it reaches the end of the file. The
+export is for an out-of-process probe reading a local descriptor: `.layout`
+re-reads the head and `.full` also pays an index-load seek, which is why
+`.none` is the default and a routing probe over a network pays neither.
+
+Nothing in it is inferred. Every field is optional or has an `unknown` case,
+and `IndexLocation.none` / `IndexCompleteness.absent` need positive evidence
+that a container declares no index — an empty index table at open is not that
+evidence. A consumer across a network cannot tell a measurement from a
+plausible guess, so this side does not make guesses.
+
+```swift
+let probed = try SourceProbe.open(url: url, structure: .full)
+probed.structure.firstClusterOffset   // Int64?  — where media begins
+probed.structure.indexLocation        // .head / .tail / .none / .unknown
+probed.structure.index?.completeness  // .complete / .partial / .absent / .unknown
+```
+
+**Consuming.** `SourceProbe.open(_:hints:)` takes what a caller already knows.
+`hints: nil` is the unhinted open, unchanged.
+
+```swift
+let probed = try SourceProbe.open(url, hints: SourceOpenHints(
+    headerBytes: 4312, firstClusterOffset: 5184, indexLocation: .tail
+))
+probed.hints.firstReadBytes   // what the first read was actually bounded to
+probed.hints.rejections       // why a hint was not used — never an error
+```
+
+A hint may make this engine do *less* work; it may never make it skip a check.
+`headerBytes` and `firstClusterOffset` size the first read and nothing else, so
+a stale value costs a read rather than a wrong parse. `expectedValidator` and
+`keyframes` exist and are validated in full — the transport's `ETag` is checked
+once before any byte is delivered, and a supplied map is checked against the
+stream, its exact time base, monotonicity, a cap and the container's bounds —
+but a surviving map is carried on `ProbedSource.hints`, not yet consumed by the
+planner, and is **never** written into the local keyframe sidecar. A map
+computed elsewhere and a map harvested by this machine's own read of the file
+are the same numbers with different provenance, and the disk must not lose the
+difference.
+
 ## Non-goals
 
 Deliberate omissions, so you don't have to read the source to find them:

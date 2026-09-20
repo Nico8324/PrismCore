@@ -104,6 +104,20 @@ API surface.
   dropped. Cost: 2000 PGS packets, 0 cues, no error anywhere.
 - **`av_seek_frame` trips assertions in `matroskadec.c`** with nested elements;
   prefer `avformat_seek_file`, and flush after seeking.
+- **There is no libavformat API for a container's byte layout.** Where a
+  header ends and where the first media element starts are not derivable from
+  an `AVFormatContext`: `avio_tell` after the open is the *probe buffer's*
+  position, not the header's length, and a first packet's `pos` is a
+  per-demuxer convention (the cluster for one format, the block for another).
+  `ContainerLayoutScanner` walks the top-level element framing by hand for
+  exactly this reason — IDs and declared lengths only, never a payload — and
+  the numbers it produces cross a network to a process that cannot check
+  them, which is why the export says `unknown` for everything it did not
+  measure. `IndexLocation.none` and `IndexCompleteness.absent` need positive
+  evidence that a container declares no index; **an empty index table at open
+  is not that evidence** (a Matroska's Cues are at the tail and nothing has
+  read them yet), and reporting `none` from silence sends a consumer straight
+  past a real index.
 
 ### Building the FFmpeg xcframeworks
 

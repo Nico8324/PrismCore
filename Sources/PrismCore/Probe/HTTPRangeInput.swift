@@ -9,10 +9,52 @@ final class HTTPRangeInput {
     private var url: URL
     private var headers: [String: String]
     private let interrupted: () -> Bool
-    private let blockSize = 1 << 20
+    private static let blockSize = 1 << 20
     private var position: Int64 = 0
     private var length: Int64?
     private var validator: String?
+
+    /// How large the FIRST fill may be, when a caller's sizing hint says the
+    /// metadata region is bigger than one block.
+    ///
+    /// Only ever **upward**, and only for the first fill. A header of three
+    /// megabytes costs three requests at the fixed block size, and against a
+    /// proxy that fetches each forwarded window whole before writing a byte
+    /// those are three full waits; asking for the region in one request is the
+    /// entire sizing win the hint exists for. Downward it is deliberately
+    /// inert: this reader's first read is already a bounded
+    /// `bytes=0-1048575`, not the open-ended request the design's first
+    /// measurement is about, and shrinking it below a block would only turn
+    /// one round trip into several on any file whose analysis reads past its
+    /// header — which is most of them.
+    private var firstFillSize: Int?
+
+    /// The validator a caller stated it expects, and what the origin actually
+    /// reported on the first response. Compared once, before any byte has been
+    /// delivered, and never fatal: a hint that cannot be bound to the
+    /// representation is a hint that is not used, not a play that fails.
+    private let expectedValidator: String?
+    private var firstResponseSeen = false
+    private var observation: ValidatorObservation = .notObserved
+
+    enum ValidatorObservation: Equatable {
+        /// No response has arrived yet.
+        case notObserved
+        /// The origin reported none — no `ETag`, no `Last-Modified`.
+        case unavailable
+        case satisfied(String)
+        case mismatched(reported: String)
+        /// A validator was reported and the caller stated no expectation.
+        case unchecked(String)
+    }
+
+    /// What the first response said, once it has arrived. Locked for the same
+    /// reason `lastOriginFailure` is: the open site reads it from the thread
+    /// that ran the blocking open, and nothing guarantees the reader thread is
+    /// finished with it.
+    var validatorObservation: ValidatorObservation {
+        failureLock.withLock { observation }
+    }
 
     /// Recently fetched blocks, least-recently-used first.
     ///
@@ -47,11 +89,26 @@ final class HTTPRangeInput {
     var lastOriginFailure: PrismCoreError? { failureLock.withLock { latchedFailure } }
     private func latch(_ failure: PrismCoreError?) { failureLock.withLock { latchedFailure = failure } }
 
-    init(url: URL, headers: [String: String], interrupted: @escaping () -> Bool) {
+    init(
+        url: URL,
+        headers: [String: String],
+        hints: SourceOpenHints? = nil,
+        interrupted: @escaping () -> Bool
+    ) {
         self.url = url
         self.headers = headers
         self.interrupted = interrupted
+        self.expectedValidator = hints?.expectedValidator
+        // Clamped to what this reader is willing to retain: a first fill it
+        // would evict on its own next fill has bought nothing.
+        self.firstFillSize = hints?.firstReadSizeHint.map {
+            min(max($0, Self.blockSize), Self.retainedBytes)
+        }
     }
+
+    /// The size the first fill was actually bounded to, for the host's log
+    /// line. `nil` until that fill has happened.
+    private(set) var firstFillBytes: Int?
 
     func install(on context: UnsafeMutablePointer<AVFormatContext>) throws {
         guard let allocation = av_malloc(32768) else { throw Failure.allocation }
@@ -119,12 +176,13 @@ final class HTTPRangeInput {
             guard !cancelled() else { throw Failure.request }
             let origin = HTTPOriginCoordinator.origin(url)
             guard HTTPOriginCoordinator.shared.acquire(origin, cancelled: cancelled) else { throw Failure.request }
+            let requestSize = firstFillSize ?? Self.blockSize
             let response: RangeResponse
             do {
                 var requestHeaders = headers
                 if let validator { requestHeaders["If-Range"] = validator }
                 response = try RangeResponse.fetch(url: url, headers: requestHeaders, start: position,
-                    size: blockSize, cancelled: cancelled)
+                    size: requestSize, cancelled: cancelled)
             } catch { HTTPOriginCoordinator.shared.release(origin); throw error }
             let status = response.response?.statusCode ?? 0
             if response.error != nil && (status == 0 || status == 206) {
@@ -179,13 +237,38 @@ final class HTTPRangeInput {
                   let raw = response.response?.value(forHTTPHeaderField: "Content-Range"),
                   let range = Self.contentRange(raw), range.start == position,
                   range.end - range.start + 1 == Int64(response.data.count),
-                  response.data.count <= blockSize else { throw Failure.request }
+                  response.data.count <= requestSize else { throw Failure.request }
             if let length, length != range.total { throw Failure.request }
             let tag = response.response?.value(forHTTPHeaderField: "ETag")
             let currentValidator = tag.flatMap { $0.hasPrefix("W/") ? nil : $0 }
                 ?? response.response?.value(forHTTPHeaderField: "Last-Modified")
             if let validator, let currentValidator, validator != currentValidator { throw Failure.request }
             if validator == nil { validator = currentValidator }
+            // The caller's expectation, judged once and only on the FIRST real
+            // response — before a byte of it has been delivered anywhere.
+            // Deliberately not a throw: a representation that is not the one
+            // the hints describe is a reason to stop trusting the hints, and
+            // the bytes arriving here are a perfectly good current version to
+            // open unhinted. The mid-session case is the line above, which
+            // does throw, because there the old version's headers, blocks and
+            // plan are already built and mixing versions fails invisibly.
+            if !firstResponseSeen {
+                firstResponseSeen = true
+                let verdict: ValidatorObservation
+                switch (expectedValidator, currentValidator) {
+                case (nil, let reported?): verdict = .unchecked(reported)
+                case (nil, nil): verdict = .unavailable
+                case (_?, nil): verdict = .unavailable
+                case (let expected?, let reported?):
+                    verdict = expected == reported ? .satisfied(reported) : .mismatched(reported: reported)
+                }
+                failureLock.withLock { observation = verdict }
+            }
+            // One fill only: every later read is an ordinary block.
+            if firstFillSize != nil {
+                firstFillBytes = requestSize
+                firstFillSize = nil
+            }
             length = range.total
             blocks.append((start: position, data: response.data))
             // Never drops the block just fetched: it is the one the read that

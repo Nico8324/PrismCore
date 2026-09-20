@@ -138,13 +138,25 @@ final class ReadInterruptGuard: @unchecked Sendable {
     var originFailure: PrismCoreError? { httpInput?.lastOriginFailure }
 
     func installHTTPInput(on context: UnsafeMutablePointer<AVFormatContext>, url: URL,
-                          headers: [String: String]) throws {
-        let input = HTTPRangeInput(url: url, headers: headers, interrupted: { [weak self] in
+                          headers: [String: String], hints: SourceOpenHints? = nil) throws {
+        let input = HTTPRangeInput(url: url, headers: headers, hints: hints, interrupted: { [weak self] in
             self?.shouldInterrupt ?? true
         })
         try input.install(on: context)
         httpInput = input
     }
+
+    /// What the coordinated reader saw on its first response, when that is the
+    /// transport. `nil` for FFmpeg's own I/O and for a host-supplied input:
+    /// neither reports a validator, which is itself the answer a caller that
+    /// asked for one needs.
+    var validatorObservation: HTTPRangeInput.ValidatorObservation? {
+        httpInput?.validatorObservation
+    }
+
+    /// The byte bound the first read was actually given, when a sizing hint
+    /// moved it off the reader's default block.
+    var hintedFirstReadBytes: Int? { httpInput?.firstFillBytes }
 
     /// Start enforcing: reads abort (`AVERROR_EXIT`) once `budget` has passed.
     func arm(budget: Duration) {

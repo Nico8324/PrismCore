@@ -396,7 +396,15 @@ struct ParkedProducerTests {
 
     /// Long enough that a wake can only have come from a signal — the
     /// coordinator's own backstop is a full second.
-    private static let signalWindow = DispatchTime.now() + .milliseconds(500)
+    ///
+    /// A computed property, not a `let`: a `DispatchTime` is an **absolute**
+    /// instant, and a stored one is evaluated once when the type is first
+    /// touched. That deadline then ages — in a full-suite run these tests may
+    /// start seconds later, by which point every `wait(timeout:)` on it
+    /// returns `.timedOut` before the park has had a chance to do anything,
+    /// and the failure reads as a lost signal rather than as a stopwatch that
+    /// was started in another test.
+    private static var signalWindow: DispatchTime { .now() + .milliseconds(500) }
 
     /// Parks a thread on `coordinator` and hands back a semaphore that is
     /// signalled when the park returns.

@@ -24,11 +24,18 @@ final class RangeFixtureServer: @unchecked Sendable {
     /// share — which is the difference the taxonomy has to survive.
     private let deniedStatus: Int?
     private let retryAfter: String
+    /// The validator this origin publishes, or none at all. `nil` is the
+    /// default because it is also the honest model of Aether's range proxy,
+    /// which synthesises its responses and forwards no `ETag` — the gap the
+    /// probe-hints design calls the validator problem.
+    private let etag: String?
     private var requestTimes: [TimeInterval] = []
     private var resumed = false
 
     init(media: Data, bytesPerSecond: Double = 4_000_000, firstByteDelay: Double = 0.02, refusals: Int = 0,
-         drops: Int = 0, truncations: Int = 0, deniedStatus: Int? = nil, retryAfter: String = "1") throws {
+         drops: Int = 0, truncations: Int = 0, deniedStatus: Int? = nil, retryAfter: String = "1",
+         etag: String? = nil) throws {
+        self.etag = etag
         self.truncations = truncations
         self.deniedStatus = deniedStatus
         self.retryAfter = retryAfter
@@ -110,7 +117,7 @@ final class RangeFixtureServer: @unchecked Sendable {
             let end = min(media.count - 1, requestedEnd)
             guard end >= start else { close(connection); return }
             let status = range == nil ? "200 OK" : "206 Partial Content"
-            let header = "HTTP/1.1 \(status)\r\nContent-Length: \(end - start + 1)\r\nContent-Range: bytes \(start)-\(end)/\(media.count)\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n"
+            let header = "HTTP/1.1 \(status)\r\nContent-Length: \(end - start + 1)\r\nContent-Range: bytes \(start)-\(end)/\(media.count)\r\nAccept-Ranges: bytes\r\n\(etag.map { "ETag: \($0)\r\n" } ?? "")Connection: close\r\n\r\n"
             let truncate = truncations > 0
             if truncate { truncations -= 1 }
             queue.asyncAfter(deadline: .now() + firstByteDelay) {

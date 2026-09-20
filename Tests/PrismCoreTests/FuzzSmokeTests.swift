@@ -99,5 +99,24 @@ struct FuzzSmokeTests {
         let xdsCues = xdsReader.flush(at: 2)
         #expect(xdsCues.map(\.channel) == [3])
         #expect(xdsCues.map(\.cue.text) == ["HI"])
+
+        // The layout seeds must reach the verdicts, not merely the first
+        // element: a seed the walk abandons at byte 0 exercises nothing a
+        // mutation of it could then break.
+        func layout(_ seed: [UInt8], _ format: String) -> ContainerLayoutScanner.Layout {
+            let data = Data(seed)
+            return ContainerLayoutScanner.scan(formatName: format, byteSize: Int64(seed.count)) {
+                offset, count in
+                guard offset >= 0, count > 0, let start = Int(exactly: offset),
+                      start + count <= data.count else { return nil }
+                return Data(data[start..<(start + count)])
+            }
+        }
+        let matroska = layout(FuzzSeeds.matroskaHead, "matroska,webm")
+        #expect(matroska.firstMediaOffset != nil, "the Matroska seed never reached a Cluster")
+        #expect(matroska.indexLocation == .tail, "the Matroska seed's SeekHead never resolved its Cues")
+        let mp4 = layout(FuzzSeeds.faststartMP4Head, "mov,mp4,m4a,3gp,3g2,mj2")
+        #expect(mp4.headerBytes != nil, "the MP4 seed never reached mdat")
+        #expect(mp4.indexLocation == .head)
     }
 }

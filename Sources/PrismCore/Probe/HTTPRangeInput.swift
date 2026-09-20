@@ -13,8 +13,26 @@ final class HTTPRangeInput {
     private var position: Int64 = 0
     private var length: Int64?
     private var validator: String?
-    private var buffer = Data()
-    private var bufferStart: Int64 = 0
+
+    /// Recently fetched blocks, least-recently-used first.
+    ///
+    /// More than one on purpose. Startup's read pattern is head → tail → head:
+    /// the demuxer opens at the header, the segment plan nudges it to the
+    /// container's index at the tail (a Matroska's Cues take two reads there),
+    /// and the producer then starts at byte zero. With a single block that
+    /// last step refetches bytes this reader already had, and it is not a
+    /// cheap refetch — measured against a model of Aether's localhost range
+    /// proxy, which fetches each forwarded window whole before it writes a
+    /// byte: 1.35 s of a 3.0 s startup on a 60 min Matroska.
+    ///
+    /// Bounded by BYTES rather than by block count, because the blocks are
+    /// not the same size: the two tail reads are tens of kilobytes, and
+    /// counting them as equals to the 1 MB head is what evicts the head they
+    /// were fetched around. The bound is per reader, and a session has more
+    /// than one (the producer, a scrub preview), so it is deliberately close
+    /// to the read pattern's own size rather than a cache anyone would tune.
+    private static let retainedBytes = 4 << 20
+    private var blocks: [(start: Int64, data: Data)] = []
     private var io: UnsafeMutablePointer<AVIOContext>?
     /// What the origin last said, kept because the only thing this reader can
     /// hand libavformat is an errno: `read` returns `-EIO` and every status —
@@ -80,11 +98,15 @@ final class HTTPRangeInput {
         if interrupted() { return swift_AVERROR_EXIT() }
         if let length, position >= length { return swift_AVERROR_EOF() }
         do {
-            if position < bufferStart || position >= bufferStart + Int64(buffer.count) { try fill() }
-            let offset = Int(position - bufferStart)
-            guard offset >= 0, offset < buffer.count else { return swift_AVERROR_EOF() }
-            let copied = min(Int(count), buffer.count - offset)
-            buffer.copyBytes(to: destination, from: offset..<(offset + copied))
+            if blockIndex(containing: position) == nil { try fill() }
+            guard let index = blockIndex(containing: position) else { return swift_AVERROR_EOF() }
+            // Touched blocks become the most recent, so a reader alternating
+            // between two regions keeps both rather than thrashing one out.
+            let block = blocks.remove(at: index)
+            blocks.append(block)
+            let offset = Int(position - block.start)
+            let copied = min(Int(count), block.data.count - offset)
+            block.data.copyBytes(to: destination, from: offset..<(offset + copied))
             position += Int64(copied)
             return Int32(copied)
         } catch { return interrupted() ? swift_AVERROR_EXIT() : swift_AVERROR(EIO) }
@@ -165,8 +187,13 @@ final class HTTPRangeInput {
             if let validator, let currentValidator, validator != currentValidator { throw Failure.request }
             if validator == nil { validator = currentValidator }
             length = range.total
-            bufferStart = position
-            buffer = response.data
+            blocks.append((start: position, data: response.data))
+            // Never drops the block just fetched: it is the one the read that
+            // triggered this fill is about to use.
+            var retained = blocks.reduce(0) { $0 + $1.data.count }
+            while blocks.count > 1, retained > Self.retainedBytes {
+                retained -= blocks.removeFirst().data.count
+            }
             // A refusal the retry loop rode out must not outlive it: a session
             // that was throttled at minute one and dies of something else at
             // minute forty would otherwise be reported as rate-limited.
@@ -174,6 +201,10 @@ final class HTTPRangeInput {
             return
         }
         throw Failure.request
+    }
+
+    private func blockIndex(containing offset: Int64) -> Int? {
+        blocks.lastIndex { offset >= $0.start && offset < $0.start + Int64($0.data.count) }
     }
 
     static func contentRange(_ value: String) -> (start: Int64, end: Int64, total: Int64)? {

@@ -852,6 +852,39 @@ final class HLSRemuxer: @unchecked Sendable {
             ))
         }
 
+        // Keep the index this plan was built from, so the NEXT play does not
+        // pay for it again. The keyframes are already in memory — the
+        // demuxer's own index, loaded by the nudge seek above — so storing
+        // them is a JSON write and no I/O against the source at all.
+        //
+        // What it saves is not the parse, it is the ROUND TRIPS. Measured
+        // against a model of Aether's localhost range proxy (which fetches
+        // each forwarded window whole before it writes a byte: 8 MB bites at
+        // ~800 KB/s), a first play of a 60 min Matroska spends four requests —
+        // the header, two at the tail for the Cues, and one to get back to the
+        // head — and 21.4 s before AVPlayer sees a playlist. The two tail
+        // requests and the rewind are all the index load's; with the map on
+        // disk the next play makes the header request and stops there.
+        //
+        // `.builtFromSource` only: a plan that came from the cache is already
+        // stored, and a degraded one is the harvest's business below. Marked
+        // complete because the container's index describes the whole file —
+        // unlike a harvest, which only ever saw what it played.
+        if let keyframeCache, let cacheIdentity, plannedPlan != nil, cachedKeyframes == nil {
+            let indexed = SegmentPlan.indexedKeyframes(
+                of: input.pointee.streams[Int(videoIndex)]!
+            )
+            if indexed.count >= 2 {
+                let timeBase = input.pointee.streams[Int(videoIndex)]!.pointee.time_base
+                keyframeCache.store(.init(
+                    identity: cacheIdentity,
+                    timeBaseNum: timeBase.num,
+                    timeBaseDen: timeBase.den,
+                    keyframePTS: indexed.sorted()
+                ))
+            }
+        }
+
         // Harvest for next time (issue #34): this session degraded to the
         // sequential shape even though it could have been planned — the map
         // is not in the file. The producer is about to read every packet

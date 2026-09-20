@@ -162,6 +162,63 @@ struct KeyframeIndexCacheTests {
         #expect(media.range(of: Data("moof".utf8)) != nil, "the demanded tail segment did not serve a real fragment")
     }
 
+    @Test("A plan built from the container's own index is kept, so the next play skips the index-load seek")
+    func containerIndexIsKeptForTheNextPlay() async throws {
+        let cacheDirectory = try makeTempDirectory()
+        defer { try? FileManager.default.removeItem(at: cacheDirectory) }
+        // A Matroska WITH Cues: the plan comes from the container's index, so
+        // nothing is harvested — this is the case that used to store nothing
+        // and pay the index-load seek again on every play. Over a network
+        // that seek is two Range requests at the tail plus a third to get
+        // back to the head, which is what the sidecar now removes.
+        let source = try fixture("h264_aac_30s.mkv")
+
+        let first = try PrismCoreSession(
+            url: source, keyframeIndexCacheDirectory: cacheDirectory
+        )
+        let firstCheckpoints = try await first.startupCheckpoints()
+        async let firstOrigin = Self.planOrigin(of: firstCheckpoints)
+        _ = try await first.start()
+        await first.stop()
+        #expect(await firstOrigin == .builtFromSource)
+
+        let sidecars = try FileManager.default.contentsOfDirectory(atPath: cacheDirectory.path)
+            .filter { $0.hasSuffix(".json") }
+        #expect(sidecars.count == 1, "a plan built from the container index stored nothing")
+        let entry = try JSONDecoder().decode(
+            KeyframeIndexCache.Entry.self,
+            from: Data(contentsOf: cacheDirectory.appendingPathComponent(try #require(sidecars.first)))
+        )
+        // The file's own index, not a harvest: complete, and nothing past it.
+        #expect(entry.complete)
+        #expect(entry.coveredThroughPTS == nil)
+        #expect(entry.keyframePTS.count >= 2)
+
+        let second = try PrismCoreSession(
+            url: source, keyframeIndexCacheDirectory: cacheDirectory
+        )
+        let secondCheckpoints = try await second.startupCheckpoints()
+        async let secondOrigin = Self.planOrigin(of: secondCheckpoints)
+        let playlist = try await second.start()
+        #expect(await secondOrigin == .keyframeIndexCache)
+        // Same shape as the first play, by the same keyframes: a real VOD
+        // media playlist behind the master.
+        let (variant, _) = try await URLSession.uncached.data(
+            from: playlist.deletingLastPathComponent().appendingPathComponent("index.m3u8")
+        )
+        #expect(String(decoding: variant, as: UTF8.self).contains("#EXT-X-PLAYLIST-TYPE:VOD"))
+        await second.stop()
+    }
+
+    private static func planOrigin(
+        of checkpoints: AsyncStream<StartupCheckpoint>
+    ) async -> SegmentPlanOrigin? {
+        for await mark in checkpoints {
+            if case .segmentPlanReady(let origin, _) = mark.phase { return origin }
+        }
+        return nil
+    }
+
     @Test("A run cancelled before any keyframe persists nothing; a cancelled prefix persists a PARTIAL map the next play plans on")
     func cancelledRunPersistsPartialMap() async throws {
         let cacheDirectory = try makeTempDirectory()

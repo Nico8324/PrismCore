@@ -193,6 +193,17 @@ reason: an open-ended range means the server keeps writing until the client
 hangs up, so "bytes served" includes socket slack and varies run to run. Prefer
 repeated timings with a warm cache, and report the spread, not one number.
 
+**Model the host's proxy, not just the origin.** Aether does not hand this
+engine a server URL — it hands it a localhost range proxy, and that proxy
+fetches each forwarded window *whole* before it writes a byte (8 MB bites).
+FFmpeg's HTTP asks for `bytes=N-`, so every open and every backward seek waits
+for a full bite: on the 2026-09-19 field log, 10.5 s for the open and another
+for the plan's rewind, from a source whose header is a few kilobytes. A
+Range-capable server that answers immediately hides this completely.
+`Scripts/proxy-model-server.py` is that origin, and
+`StartupCheckpointBenchmark` prints the host's own log line against it; the
+number that matters is **requests × bite**, not bytes.
+
 **The benchmark server must support Range requests.** `python3 -m http.server`
 does not — it answers every Range with a 200 and the whole file, libavformat
 concludes the stream cannot seek, the Matroska Cues at the tail never load, and

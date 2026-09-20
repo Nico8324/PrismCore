@@ -8,6 +8,8 @@ source-compatible.)
 
 ## [Unreleased]
 
+## [3.2.0] — 2026-09-20
+
 ### Added
 
 - **`ProbedSource.structure` — the container's byte layout and seek index, on

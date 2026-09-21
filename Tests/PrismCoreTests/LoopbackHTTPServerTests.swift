@@ -23,7 +23,7 @@ struct LoopbackHTTPServerTests {
         let base = try await server.start()
         defer { Task { await server.stop() } }
 
-        let (data, response) = try await URLSession.shared.data(
+        let (data, response) = try await URLSession.uncached.data(
             from: base.appendingPathComponent("index.m3u8")
         )
         let http = try #require(response as? HTTPURLResponse)
@@ -41,12 +41,12 @@ struct LoopbackHTTPServerTests {
         let base = try await server.start()
         defer { Task { await server.stop() } }
 
-        let (_, missing) = try await URLSession.shared.data(from: base.appendingPathComponent("nope.m4s"))
+        let (_, missing) = try await URLSession.uncached.data(from: base.appendingPathComponent("nope.m4s"))
         #expect((missing as? HTTPURLResponse)?.statusCode == 404)
 
         var traversal = URLRequest(url: base)
         traversal.url = URL(string: "http://127.0.0.1:\(await server.port)/../secret")
-        let (_, escaped) = try await URLSession.shared.data(for: traversal)
+        let (_, escaped) = try await URLSession.uncached.data(for: traversal)
         #expect((escaped as? HTTPURLResponse)?.statusCode == 404)
     }
 

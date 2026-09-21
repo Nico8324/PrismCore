@@ -185,10 +185,15 @@ public enum FFmpegBuild {
     /// case worth catching, and `avcodec_find_encoder` is the same question
     /// the audio bridge itself asks at runtime.
     public struct Capabilities: Sendable, Equatable {
-        /// Whether the audio bridge can run at all. False on stock MPVKit,
-        /// which makes every non-copyable audio codec unbridgeable and routes
-        /// sources to the software path that would otherwise have remuxed.
+        /// Whether this build carries FFmpeg's `eac3` encoder. Stock MPVKit
+        /// does not; the bridge then falls back to AAC (see `audioBridgeEncoder`),
+        /// so this no longer decides whether a source can remux — only whether
+        /// the bridged track can be passed through to an AVR as a bitstream.
         public let hasEAC3Encoder: Bool
+        /// The encoder the audio bridge will actually use — `eac3`, `aac`, or
+        /// `nil` in a build with neither, where non-copyable audio routes to
+        /// the software path.
+        public let audioBridgeEncoder: String?
         /// Which AV1 decoder answered (`libdav1d`, `av1`, …), or `nil` in a
         /// build without one. The software path is the only way AV1 plays on a
         /// device without hardware support, so "which decoder" and "hardware
@@ -214,7 +219,8 @@ public enum FFmpegBuild {
 
     public static var capabilities: Capabilities {
         Capabilities(
-            hasEAC3Encoder: AudioBridge.isEncoderAvailable,
+            hasEAC3Encoder: avcodec_find_encoder(AV_CODEC_ID_EAC3) != nil,
+            audioBridgeEncoder: AudioBridge.isEncoderAvailable ? AudioBridge.defaultTargetCodecName : nil,
             av1Decoder: avcodec_find_decoder(AV_CODEC_ID_AV1)
                 .map { String(cString: $0.pointee.name) },
             isAV1HardwareSupported: HardwareDecodeSupport.isAV1Supported,
@@ -230,7 +236,8 @@ public enum FFmpegBuild {
         let capabilities = capabilities
         var lines = ["FFmpeg \(versionInfo)"]
         lines += libraries.map { "  \($0)" }
-        lines.append("  eac3 encoder: \(capabilities.hasEAC3Encoder ? "yes" : "NO — audio bridge disabled")")
+        lines.append("  eac3 encoder: \(capabilities.hasEAC3Encoder ? "yes" : "no")")
+        lines.append("  audio bridge: \(capabilities.audioBridgeEncoder ?? "NONE — no encoder, non-copyable audio goes to software")")
         lines.append(
             "  av1 decoder: \(capabilities.av1Decoder ?? "none")"
                 + " (hardware: \(capabilities.isAV1HardwareSupported ? "yes" : "no"))"

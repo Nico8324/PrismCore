@@ -21,7 +21,18 @@ final class ProducerThread: @unchecked Sendable {
     private let lock = NSLock()
     private var finished = false
     private var failure: (any Error)?
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+    /// Keyed, not an array, because a bounded `join` has to be able to take
+    /// its OWN continuation back when its grace runs out without disturbing
+    /// anybody else waiting on the same thread.
+    private var waiters: [Int: CheckedContinuation<Bool, Never>] = [:]
+    private var nextWaiterToken = 0
+
+    /// Where a bounded join's grace expires. Not `Task.sleep`: the whole point
+    /// of the bound is that it fires even when the caller's cooperative pool
+    /// is the thing under pressure.
+    private static let graceQueue = DispatchQueue(
+        label: "cz.zmrhal.prismcore.producer-join", qos: .userInitiated
+    )
 
     /// Starts `body` immediately on a new thread named `name`.
     init(name: String, body: @escaping @Sendable () throws -> Void) {
@@ -55,27 +66,53 @@ final class ProducerThread: @unchecked Sendable {
     /// this replaced: a `Task.cancel()` never interrupted a blocking FFmpeg read
     /// either.
     func join() async {
+        _ = await join(within: nil)
+    }
+
+    /// Suspend until the body exits, or until `grace` has passed — `false`
+    /// means it is **still running** and the caller has to decide what to do
+    /// about that.
+    ///
+    /// `nil` waits forever, which is the plain `join()`.
+    ///
+    /// The bound exists because "ask it to stop and then wait" is only a
+    /// teardown as long as the body can hear the ask. A producer blocked
+    /// inside a host's synchronous `read` cannot, unless the host conforms to
+    /// `CancellablePrismCoreInput` — and a host that does not must not be able
+    /// to freeze the app that is merely leaving the player.
+    @discardableResult
+    func join(within grace: Duration?) async -> Bool {
         await withCheckedContinuation { continuation in
-            lock.lock()
-            if finished {
-                lock.unlock()
-                continuation.resume()
-                return
+            var token = 0
+            let alreadyFinished: Bool = lock.withLock {
+                if finished { return true }
+                token = nextWaiterToken
+                nextWaiterToken += 1
+                waiters[token] = continuation
+                return false
             }
-            waiters.append(continuation)
-            lock.unlock()
+            if alreadyFinished { continuation.resume(returning: true); return }
+            guard let grace else { return }
+            let expiring = token
+            Self.graceQueue.asyncAfter(deadline: .now() + max(0, grace.seconds)) { [self] in
+                // Whoever removes the continuation from the table owns it —
+                // that is what keeps the expiry and a body finishing at the
+                // same instant from resuming it twice.
+                let timedOut = lock.withLock { waiters.removeValue(forKey: expiring) }
+                timedOut?.resume(returning: false)
+            }
         }
     }
 
     private func finish(with error: (any Error)?) {
-        let toResume: [CheckedContinuation<Void, Never>] = lock.withLock {
+        let toResume: [CheckedContinuation<Bool, Never>] = lock.withLock {
             finished = true
             failure = error
-            defer { waiters = [] }
-            return waiters
+            defer { waiters = [:] }
+            return Array(waiters.values)
         }
         // Resumed outside the lock: a continuation may run its awaiting code
         // synchronously, and that code is entitled to call back in here.
-        for continuation in toResume { continuation.resume() }
+        for continuation in toResume { continuation.resume(returning: true) }
     }
 }

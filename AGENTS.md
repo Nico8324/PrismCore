@@ -104,6 +104,20 @@ API surface.
   dropped. Cost: 2000 PGS packets, 0 cues, no error anywhere.
 - **`av_seek_frame` trips assertions in `matroskadec.c`** with nested elements;
   prefer `avformat_seek_file`, and flush after seeking.
+- **There is no libavformat API for a container's byte layout.** Where a
+  header ends and where the first media element starts are not derivable from
+  an `AVFormatContext`: `avio_tell` after the open is the *probe buffer's*
+  position, not the header's length, and a first packet's `pos` is a
+  per-demuxer convention (the cluster for one format, the block for another).
+  `ContainerLayoutScanner` walks the top-level element framing by hand for
+  exactly this reason — IDs and declared lengths only, never a payload — and
+  the numbers it produces cross a network to a process that cannot check
+  them, which is why the export says `unknown` for everything it did not
+  measure. `IndexLocation.none` and `IndexCompleteness.absent` need positive
+  evidence that a container declares no index; **an empty index table at open
+  is not that evidence** (a Matroska's Cues are at the tail and nothing has
+  read them yet), and reporting `none` from silence sends a consumer straight
+  past a real index.
 
 ### Building the FFmpeg xcframeworks
 
@@ -192,6 +206,17 @@ Byte-counting through a toy HTTP server is unreliable for the same class of
 reason: an open-ended range means the server keeps writing until the client
 hangs up, so "bytes served" includes socket slack and varies run to run. Prefer
 repeated timings with a warm cache, and report the spread, not one number.
+
+**Model the host's proxy, not just the origin.** Aether does not hand this
+engine a server URL — it hands it a localhost range proxy, and that proxy
+fetches each forwarded window *whole* before it writes a byte (8 MB bites).
+FFmpeg's HTTP asks for `bytes=N-`, so every open and every backward seek waits
+for a full bite: on the 2026-09-19 field log, 10.5 s for the open and another
+for the plan's rewind, from a source whose header is a few kilobytes. A
+Range-capable server that answers immediately hides this completely.
+`Scripts/proxy-model-server.py` is that origin, and
+`StartupCheckpointBenchmark` prints the host's own log line against it; the
+number that matters is **requests × bite**, not bytes.
 
 **The benchmark server must support Range requests.** `python3 -m http.server`
 does not — it answers every Range with a 200 and the whole file, libavformat

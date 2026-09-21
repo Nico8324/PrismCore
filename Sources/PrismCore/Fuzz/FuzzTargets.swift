@@ -39,9 +39,44 @@ package enum FuzzTargets {
         "hvcc-normalize": { @Sendable in hvccNormalize($0) },
         "isobmff-patch": { @Sendable in isobmffPatch($0) },
         "text-subtitles": { @Sendable in textSubtitles($0) },
+        "a53-captions": { @Sendable in a53Captions($0) },
+        "container-layout": { @Sendable in containerLayout($0) },
     ]
 
     // MARK: - Targets
+
+    /// The top-level element walk that produces a source's `headerBytes`,
+    /// `firstClusterOffset` and `indexLocation`, over arbitrary bytes read as
+    /// each container it knows.
+    ///
+    /// The wrong-answer invariants matter more here than the crash one,
+    /// because this parser's output crosses a network and is acted on by a
+    /// process that cannot check it: an offset outside the file would size a
+    /// read into nothing, and `none` is a verdict this walk can never earn —
+    /// it would tell a consumer to skip a tail index that is really there.
+    /// Mutated bytes are exactly the shape that talks a length-driven walk
+    /// into both.
+    package static func containerLayout(_ bytes: [UInt8]) {
+        let data = Data(bytes)
+        let read: ContainerLayoutScanner.Reader = { offset, count in
+            guard offset >= 0, count > 0, let start = Int(exactly: offset),
+                  start + count <= data.count else { return nil }
+            return Data(data[start..<(start + count)])
+        }
+        for format in ["matroska,webm", "mov,mp4,m4a,3gp,3g2,mj2"] {
+            let size = Int64(bytes.count)
+            let layout = ContainerLayoutScanner.scan(formatName: format, byteSize: size, read: read)
+            if let offset = layout.firstMediaOffset, offset < 0 || offset > size {
+                fatalError("\(format): media offset \(offset) is outside a \(size)-byte source")
+            }
+            if let header = layout.headerBytes, header < 0 || Int64(header) > size {
+                fatalError("\(format): header length \(header) is outside a \(size)-byte source")
+            }
+            if layout.indexLocation == .none {
+                fatalError("\(format): claimed a container declares no index, which this walk cannot know")
+            }
+        }
+    }
 
     /// The JOC walk over an arbitrary packet. The walk is best-effort by
     /// design, so the only strong claims are "no crash" and "a returned
@@ -123,6 +158,78 @@ package enum FuzzTargets {
         }
     }
 
+    /// The closed-caption path end to end: SEI walk, T.35 message loop, and the
+    /// 608 terminal that the extracted bytes drive.
+    ///
+    /// The inputs here are the least trustworthy bytes in the whole engine — a
+    /// broadcast recording's video packets, arbitrary and unvalidated, walked
+    /// by a parser whose message loop reads its own lengths. The invariants are
+    /// about the *cues*, not just survival: a cue that inverts, outstays its
+    /// cap, or carries a `-->` is a wrong answer the decoder must not be able
+    /// to produce however malformed the bitstream was.
+    package static func a53Captions(_ bytes: [UInt8]) {
+        let carriages: [(HEVCNALUnits.Framing, HEVCNALUnits.Codec)] = [
+            (.annexB, .h264), (.annexB, .hevc), (.lengthPrefixed(4), .h264), (.lengthPrefixed(2), .hevc),
+        ]
+        for (framing, codec) in carriages {
+            let triplets = bytes.withUnsafeBufferPointer {
+                A53CaptionData.triplets(in: $0, framing: framing, codec: codec)
+            }
+            for triplet in triplets where triplet.type > 3 {
+                fatalError("cc_type is two bits and cannot exceed 3: \(triplet.type)")
+            }
+
+            let reader = ClosedCaptionReader(framing: framing, codec: codec)
+            let start = 1.0
+            bytes.withUnsafeBufferPointer { reader.ingest($0, presentationSeconds: start) }
+            let end = start + 1_000
+            for entry in reader.flush(at: end) {
+                guard (1...4).contains(entry.channel) else {
+                    fatalError("cue attributed to a service that does not exist: CC\(entry.channel)")
+                }
+                let cue = entry.cue
+                guard !cue.text.isEmpty else { fatalError("empty cue emitted") }
+                guard cue.end > cue.start else {
+                    fatalError("cue does not advance: \(cue.start) → \(cue.end)")
+                }
+                guard cue.start >= start, cue.end <= end else {
+                    fatalError("cue outside the times it was fed: \(cue.start) → \(cue.end)")
+                }
+                // The open-cue cap is what keeps a caption whose erase never
+                // comes from standing for the rest of the film.
+                guard cue.end - cue.start <= CEA608ChannelDecoder.maximumCueSeconds + 0.001 else {
+                    fatalError("cue outlived the cap: \(cue.end - cue.start)s")
+                }
+                guard !cue.text.contains("-->"), !cue.text.contains("\n\n") else {
+                    fatalError("cue text would break the WebVTT it is written into")
+                }
+            }
+
+            // The same bytes again, closed by a walk of segment boundaries
+            // instead of one flush. Nothing arrives after the single packet at
+            // `start`, so everything these boundaries cut across was displayed
+            // at `start` and has to expire exactly once. Measured from the
+            // interval rather than the display, each boundary handed an
+            // unterminated caption a fresh allowance and it was re-emitted for
+            // ever — invisible to a single flush, which is why the walk is here.
+            let split = ClosedCaptionReader(framing: framing, codec: codec)
+            bytes.withUnsafeBufferPointer { split.ingest($0, presentationSeconds: start) }
+            var walked: [ClosedCaptionReader.ChannelCue] = []
+            for step in 1...8 { walked += split.advance(to: start + Double(step) * 6) }
+            walked += split.flush(at: end)
+            let expiry = start + CEA608ChannelDecoder.maximumCueSeconds + 0.001
+            for entry in walked {
+                let cue = entry.cue
+                guard cue.end > cue.start else {
+                    fatalError("cue does not advance: \(cue.start) → \(cue.end)")
+                }
+                guard cue.end <= expiry else {
+                    fatalError("a caption renewed its cap at a boundary: ends \(cue.end)")
+                }
+            }
+        }
+    }
+
     /// `hvcC` normalization, whose invariant is idempotence: a record the
     /// normalizer rewrote is by definition in form, so normalizing it again
     /// must report "nothing to change". A second pass that finds work means
@@ -169,10 +276,15 @@ package enum FuzzTargets {
     /// converter's whole reason to exist.
     package static func textSubtitles(_ bytes: [UInt8]) {
         let data = Data(bytes)
+        let playResolution = TextSubtitleConverter.PlayResolution(width: 1920, height: 1080)
         for kind: TextSubtitleConverter.Kind in [.subrip, .ass, .webvtt, .movText] {
-            guard let text = TextSubtitleConverter.cueText(from: data, kind: kind) else { continue }
-            assertWebVTTSafe(text, from: "cueText(\(kind))")
+            guard let converted = TextSubtitleConverter.convert(data, kind: kind, playResolution: playResolution)
+            else { continue }
+            assertWebVTTSafe(converted.text, from: "convert(\(kind))")
+            assertBalancedTags(converted.text, from: "convert(\(kind))")
+            assertPlacementSane(converted.placement, from: "convert(\(kind))")
         }
+        _ = TextSubtitleConverter.playResolution(fromASSHeader: data)
 
         guard let text = String(data: data, encoding: .utf8) else { return }
         assertWebVTTSafe(TextSubtitleConverter.sanitize(text), from: "sanitize")
@@ -182,9 +294,62 @@ package enum FuzzTargets {
                 fatalError("cue with non-positive duration: \(cue.start)…\(cue.end)")
             }
             assertWebVTTSafe(cue.text, from: "cues(from…)")
+            assertBalancedTags(cue.text, from: "cues(from…)")
+            if let settings = cue.settings { assertSettingsSafe(settings, from: "cues(from…)") }
+            assertPlacementSane(cue.placement, from: "cues(from…)")
         }
-        _ = TextSubtitleConverter.parseTimingLine(text)
+        // Raw side-data settings take this path in production; the string
+        // here stands in for whatever a demuxer attached.
+        if let settings = TextCuePlacement.sanitizedWebVTTSettings(text) {
+            assertSettingsSafe(settings, from: "sanitizedWebVTTSettings")
+            assertPlacementSane(TextCuePlacement(webVTTSettings: settings), from: "sanitizedWebVTTSettings")
+        }
+        _ = TextCuePlacement(webVTTSettings: text)
+        _ = TextSubtitleConverter.parseTimingLineWithSettings(text)
         _ = TextSubtitleConverter.parseTimestamp(text)
+    }
+
+    /// A settings string shares the cue's timing line, where a newline ends
+    /// the (still payload-less) cue and `-->` starts a second timing.
+    private static func assertSettingsSafe(_ settings: String, from source: String) {
+        if settings.contains("\n") || settings.contains("\r") || settings.contains("-->") || settings.isEmpty {
+            fatalError("\(source) produced unsafe cue settings: \(settings.debugDescription)")
+        }
+    }
+
+    /// A placement is either absent or a numpad alignment with finite anchor.
+    private static func assertPlacementSane(_ placement: TextCuePlacement?, from source: String) {
+        guard let placement else { return }
+        if !(1...9).contains(placement.alignment) {
+            fatalError("\(source) produced alignment \(placement.alignment)")
+        }
+        if let anchor = placement.anchor, !anchor.x.isFinite || !anchor.y.isFinite {
+            fatalError("\(source) produced a non-finite anchor")
+        }
+        if let settings = placement.webVTTSettings { assertSettingsSafe(settings, from: source) }
+    }
+
+    /// The `<b>`/`<i>`/`<u>` tags the override translation emits must nest
+    /// and close — an overlapping or open tag is what makes a renderer
+    /// style the rest of the cue, or the next one, by mistake.
+    private static func assertBalancedTags(_ text: String, from source: String) {
+        var stack: [Substring] = []
+        var rest = text[...]
+        while let open = rest.firstIndex(of: "<") {
+            rest = rest[open...]
+            guard let close = rest.firstIndex(of: ">") else { return }
+            let inner = rest[rest.index(after: open)..<close]
+            rest = rest[rest.index(after: close)...]
+            // Only the tags the translation writes are checked; a source's
+            // own `<i>` (SRT) may legitimately be unbalanced and is passed
+            // through as before.
+            guard ["b", "i", "u", "/b", "/i", "/u"].contains(String(inner)) else { continue }
+            if inner.hasPrefix("/") {
+                guard stack.popLast() == inner.dropFirst() else { return } // source-authored tag
+            } else {
+                stack.append(inner)
+            }
+        }
     }
 
     /// Empty output is legal (the caller drops the cue); unsafe output is not.

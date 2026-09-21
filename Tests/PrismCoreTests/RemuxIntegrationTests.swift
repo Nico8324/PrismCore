@@ -51,7 +51,7 @@ struct RemuxIntegrationTests {
     }
 
     private func fetch(_ url: URL) async throws -> String {
-        let (data, _) = try await URLSession.shared.data(from: url)
+        let (data, _) = try await URLSession.uncached.data(from: url)
         return String(decoding: data, as: UTF8.self)
     }
 
@@ -137,7 +137,7 @@ struct RemuxIntegrationTests {
             mediaURL = playlist.deletingLastPathComponent().appendingPathComponent(variant)
         }
         let initURL = mediaURL.deletingLastPathComponent().appendingPathComponent(mapURI)
-        let (initSegment, _) = try await URLSession.shared.data(from: initURL)
+        let (initSegment, _) = try await URLSession.uncached.data(from: initURL)
         #expect(paspRatios(in: initSegment) == [[64, 45]])
     }
 
@@ -173,7 +173,7 @@ struct RemuxIntegrationTests {
         #expect(audioCodecs.contains("eac3"))
     }
 
-    @Test("DTS audio: video still plays; any audio that survives is bridged EAC3")
+    @Test("DTS audio: video still plays; the audio is bridged to what the build can encode")
     func dtsAudio() async throws {
         let session = try PrismCoreSession(url: try fixture("h264_dts.mkv"))
         let playlist = try await session.start()
@@ -183,12 +183,12 @@ struct RemuxIntegrationTests {
         let info = try SourceProbe.probe(url: playlist)
         let audioCodecs = info.audioTracks.map(\.codecName)
         #expect(info.video?.codecName == "h264")
-        // v0 drops non-copyable audio with no copyable sibling; the phase-3
-        // bridge turns it into EAC3. Either way, DTS must never reach the
-        // output — AVPlayer can't decode it from fMP4.
+        // DTS must never reach the output — AVPlayer can't decode it from
+        // fMP4 — and with an encoder present (every build has aac) the sound
+        // survives as the bridge's codec rather than being dropped.
         #expect(!audioCodecs.contains("dts"))
-        if !audioCodecs.isEmpty {
-            #expect(audioCodecs.contains("eac3"))
+        if AudioBridge.isEncoderAvailable {
+            #expect(audioCodecs == [AudioBridge.defaultTargetCodecName], "audio was \(audioCodecs)")
         }
     }
 

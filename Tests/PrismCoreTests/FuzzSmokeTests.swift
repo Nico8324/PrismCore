@@ -67,10 +67,56 @@ struct FuzzSmokeTests {
         // actually runs.
         #expect(HVCCNormalizer.normalize(hvcC: Data(FuzzSeeds.hvcCRecord)) != nil)
         #expect(!TextSubtitleConverter.cues(fromSRT: FuzzSeeds.srtText).isEmpty)
-        #expect(!TextSubtitleConverter.cues(fromWebVTT: FuzzSeeds.vttText).isEmpty)
+        // The VTT seed's `line:85%` must survive to the settings, or the
+        // settings-safety invariant never runs on a mutation of it.
+        #expect(TextSubtitleConverter.cues(fromWebVTT: FuzzSeeds.vttText).first?.settings == "line:85%")
+        // The ASS seed must reach the override translation: tag, alignment
+        // and a normalized anchor all present.
+        let ass = TextSubtitleConverter.convert(
+            Data(FuzzSeeds.assEvent.utf8), kind: .ass,
+            playResolution: .init(width: 8, height: 10)
+        )
+        #expect(ass?.text == "<i>Hi</i>\nthere")
+        #expect(ass?.placement == TextCuePlacement(alignment: 8, anchor: .init(x: 0.5, y: 0.5)))
         #expect(
             TextSubtitleConverter.cueText(from: Data(FuzzSeeds.tx3gSample), kind: .movText)
                 == "Sample"
         )
+        // The caption seed must reach the terminal, not merely the SEI walk: a
+        // flipped-and-erased pop-on caption is the whole path in one packet.
+        let captionReader = ClosedCaptionReader(framing: .annexB, codec: .h264)
+        FuzzSeeds.captionedAccessUnit.withUnsafeBufferPointer {
+            captionReader.ingest($0, presentationSeconds: 1)
+        }
+        #expect(captionReader.flush(at: 2).first?.cue.text == "HI♪")
+        // The XDS seed must reach the packet state machine, not merely the SEI
+        // walk: exactly the caption survives, and neither half of the programme
+        // name it is interleaved with does.
+        let xdsReader = ClosedCaptionReader(framing: .annexB, codec: .h264)
+        FuzzSeeds.xdsAccessUnit.withUnsafeBufferPointer {
+            xdsReader.ingest($0, presentationSeconds: 1)
+        }
+        let xdsCues = xdsReader.flush(at: 2)
+        #expect(xdsCues.map(\.channel) == [3])
+        #expect(xdsCues.map(\.cue.text) == ["HI"])
+
+        // The layout seeds must reach the verdicts, not merely the first
+        // element: a seed the walk abandons at byte 0 exercises nothing a
+        // mutation of it could then break.
+        func layout(_ seed: [UInt8], _ format: String) -> ContainerLayoutScanner.Layout {
+            let data = Data(seed)
+            return ContainerLayoutScanner.scan(formatName: format, byteSize: Int64(seed.count)) {
+                offset, count in
+                guard offset >= 0, count > 0, let start = Int(exactly: offset),
+                      start + count <= data.count else { return nil }
+                return Data(data[start..<(start + count)])
+            }
+        }
+        let matroska = layout(FuzzSeeds.matroskaHead, "matroska,webm")
+        #expect(matroska.firstMediaOffset != nil, "the Matroska seed never reached a Cluster")
+        #expect(matroska.indexLocation == .tail, "the Matroska seed's SeekHead never resolved its Cues")
+        let mp4 = layout(FuzzSeeds.faststartMP4Head, "mov,mp4,m4a,3gp,3g2,mj2")
+        #expect(mp4.headerBytes != nil, "the MP4 seed never reached mdat")
+        #expect(mp4.indexLocation == .head)
     }
 }

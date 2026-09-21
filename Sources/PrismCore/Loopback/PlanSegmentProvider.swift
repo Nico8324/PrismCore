@@ -44,6 +44,23 @@ struct PlanSegmentProvider: SegmentProvider {
     /// of an armed or eager rendition returns `false` and changes nothing.
     var audioDemand: (@Sendable (String) -> Bool)?
 
+    /// Consulted before every media-segment disk read: is this index's file
+    /// stale output — muxed with an audio offset the producer has since
+    /// abandoned?
+    ///
+    /// Retirement has to reach the serving path through the store rather than
+    /// through the filesystem, because the two are not in step: the producer
+    /// retires the whole cache in one step at the re-anchor and the files are
+    /// unlinked afterwards on a background queue. A host that does what the
+    /// API documents — watch `pendingAudioDelaySeconds`, refresh the player
+    /// when it clears — fetches inside exactly that gap, and used to get the
+    /// old offset served as a hit (and cached by AVPlayer past the deletion).
+    ///
+    /// A superseded index reads as a miss, not a 404: `handleMiss` asks the
+    /// producer to re-anchor there and waits for the rewritten file, so the
+    /// segment stays reproducible on demand like any evicted one.
+    var isSuperseded: (@Sendable (Int) -> Bool)?
+
     init(root: URL, coordinator: DemandCoordinator, landed: ProductionSignal? = nil) {
         self.root = root
         self.coordinator = coordinator
@@ -92,6 +109,9 @@ struct PlanSegmentProvider: SegmentProvider {
            audioDemand?(path) == true,
            let anchor = Self.segmentIndex(inPath: path) ?? coordinator.armAnchorIndex {
             coordinator.requestProduction(of: anchor, force: true)
+        }
+        if let index = Self.segmentIndex(inPath: path), isSuperseded?(index) == true {
+            return await handleMiss(path: path)
         }
         let direct = await directory.data(forPath: path)
         if case .notFound = direct {
@@ -183,6 +203,11 @@ struct PlanSegmentProvider: SegmentProvider {
         let timeout = timeout ?? productionTimeout
         let coordinator = self.coordinator
         let landed = self.landed
+        // The file this wait is waiting for may still be the superseded one:
+        // the unlink is asynchronous, so "it exists" is not "it is the right
+        // bytes" until the store says the index has been rewritten.
+        let isSuperseded = self.isSuperseded
+        let supersededIndex = Self.segmentIndex(inPath: path)
         return PendingResult {
             defer {
                 if let servingIndex { coordinator.endServing(index: servingIndex) }
@@ -195,7 +220,8 @@ struct PlanSegmentProvider: SegmentProvider {
                 // check and the wait then makes the wait return at once,
                 // instead of being lost to a waiter that was not yet asleep.
                 let generation = landed?.currentGeneration
-                if let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) {
+                let stale = supersededIndex.map { isSuperseded?($0) == true } ?? false
+                if !stale, let data = try? Data(contentsOf: fileURL, options: .mappedIfSafe) {
                     return .data(data, contentType: contentType)
                 }
                 // The slot may have been declared empty AFTER this serve went

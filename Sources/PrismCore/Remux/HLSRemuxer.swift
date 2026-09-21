@@ -58,7 +58,93 @@ import Libavutil
 final class HLSRemuxer: @unchecked Sendable {
     let residentSegments = ResidentSegmentStore()
     let audioDeliveryStore = AudioDeliveryStore()
-    var audioDelaySeconds: Double = 0
+
+    /// The offset the muxers are writing with RIGHT NOW. Written from the
+    /// session before `start()` and from the producer thread when it adopts a
+    /// request at a re-anchor; read per packet by the writers. Lock-guarded
+    /// because the host reads it from its own thread while the producer runs.
+    var audioDelaySeconds: Double {
+        get { audioDelayLock.withLock { effectiveAudioDelaySeconds } }
+        set {
+            audioDelayLock.withLock {
+                effectiveAudioDelaySeconds = AudioDelay.normalized(newValue)
+                requestedAudioDelaySeconds = nil
+            }
+        }
+    }
+
+    /// A delay the host asked for that no muxer has taken up yet, or `nil`
+    /// when nothing is outstanding. Never conflated with `audioDelaySeconds`:
+    /// a host that reported this value as the one in force would be telling
+    /// the viewer their correction had landed while the segments still on
+    /// disk carry the old one.
+    var pendingAudioDelaySeconds: Double? {
+        audioDelayLock.withLock { requestedAudioDelaySeconds }
+    }
+
+    /// Both halves in ONE lock acquisition.
+    ///
+    /// Read separately they are two samples of a pair that moves atomically:
+    /// the producer adopts a request at a re-anchor, clearing `requested` and
+    /// setting `effective` under this lock, so a reader that takes them one at
+    /// a time can catch (0, nil) — a state that never existed. Only a caller
+    /// checking the *relationship* needs this; a host reporting one value at a
+    /// time is fine with the plain properties.
+    var audioDelayReport: (serving: Double, pending: Double?) {
+        audioDelayLock.withLock { (effectiveAudioDelaySeconds, requestedAudioDelaySeconds) }
+    }
+
+    private let audioDelayLock = NSLock()
+    private var effectiveAudioDelaySeconds: Double = 0
+    private var requestedAudioDelaySeconds: Double?
+
+    /// Ask the producer to start muxing with `seconds`, and return whether
+    /// there is a re-anchor to carry it — the only point at which the offset
+    /// can change without corrupting output. Mid-fragment it cannot: the
+    /// shift moves audio dts, and a backward step there is a non-monotonic
+    /// dts the muxer refuses outright.
+    ///
+    /// False means this session has no demand plan (the sequential shape
+    /// never re-anchors), so the request is not even stored — reporting a
+    /// pending change that can never arrive is worse than refusing it.
+    func requestAudioDelay(_ seconds: Double) -> Bool {
+        let value = AudioDelay.normalized(seconds)
+        guard let demand, let plan = demand.publishedPlan, !plan.entries.isEmpty,
+              let playhead = demand.armAnchorIndex else { return false }
+        // Clamped into the plan: a producer parked at EOF reports an index one
+        // past the last entry, and the producer drops an anchor request it
+        // cannot find in the plan — the request would then sit pending
+        // forever, which is exactly the lie this API exists to avoid.
+        let anchor = min(max(0, playhead), plan.entries.count - 1)
+        audioDelayLock.withLock {
+            requestedAudioDelaySeconds = value == effectiveAudioDelaySeconds ? nil : value
+        }
+        // Forced: the playhead's segment is usually the one production is
+        // already on, and an unforced request for that index is dropped.
+        demand.requestProduction(of: anchor, force: true)
+        return true
+    }
+
+    /// The producer's side of the handshake, called only at a re-anchor:
+    /// takes the outstanding request, if any, and makes it the one in force.
+    ///
+    /// - Parameter invalidating: runs INSIDE the lock, before the request is
+    ///   cleared. Everything that makes the old offset's output unservable
+    ///   belongs here: the documented way to use this API is to watch
+    ///   `pendingAudioDelaySeconds` and refresh the player the moment it
+    ///   clears, so a host doing exactly that fetches at this instant. Clear
+    ///   first and that fetch is answered off disk with the offset the viewer
+    ///   just corrected away from — and AVPlayer may cache the answer past
+    ///   the deletion that follows.
+    private func adoptRequestedAudioDelay(invalidating: () -> Void) -> Double? {
+        audioDelayLock.withLock {
+            guard let requested = requestedAudioDelaySeconds else { return nil }
+            invalidating()
+            requestedAudioDelaySeconds = nil
+            effectiveAudioDelaySeconds = requested
+            return requested
+        }
+    }
     var coordinatedHTTP = false
     private let activeGuardLock = NSLock()
     private var activeGuard: ReadInterruptGuard?
@@ -93,6 +179,40 @@ final class HLSRemuxer: @unchecked Sendable {
     struct AudioCandidate: Equatable {
         let index: Int32
         let codecID: AVCodecID
+        /// The container's own claim that this track is the film's original
+        /// soundtrack (`AV_DISPOSITION_ORIGINAL`).
+        ///
+        /// Rarely set, and worth a great deal when it is: it is a statement
+        /// about the film rather than about the encode, and it is the only
+        /// language signal a library can read without asking a metadata
+        /// service what language the picture was shot in.
+        var isOriginal: Bool = false
+        /// The container's own default flag (`AV_DISPOSITION_DEFAULT`).
+        ///
+        /// Weaker than it looks, which is why it sits low in `chooseAudio`'s
+        /// order: a market-specific disc puts its dub first and flags it
+        /// default, so trusting this above all else is what opens an English
+        /// film in Russian.
+        var isDefault: Bool = false
+        /// The container's language tag, verbatim — `cze`, `ces`, `cs`,
+        /// `pt-BR`, `und`, or nothing at all. Normalized only at the point of
+        /// comparison (`LanguageMatch`), never on the way in: what the
+        /// container said is also what the master playlist prints.
+        var language: String?
+
+        init(
+            index: Int32,
+            codecID: AVCodecID,
+            isOriginal: Bool = false,
+            isDefault: Bool = false,
+            language: String? = nil
+        ) {
+            self.index = index
+            self.codecID = codecID
+            self.isOriginal = isOriginal
+            self.isDefault = isDefault
+            self.language = language
+        }
     }
 
     /// What the produced presentation looks like — decided once, before the
@@ -106,10 +226,18 @@ final class HLSRemuxer: @unchecked Sendable {
     }
 
     enum Failure: Error {
+        /// The source was opened and described, and its stream list holds no
+        /// video. A fact about the source — which is why the "we got handed no
+        /// context" guards below no longer share this case: they used to, and a
+        /// host reading the taxonomy would have been told an audio-only verdict
+        /// about a source whose streams were never enumerated.
         case noVideoStream
         /// The video codec can't ride AVPlayer's HLS-fMP4 pipeline (VP9,
         /// MPEG-2, …) — the caller should route this source to Prism/libmpv.
-        case videoCodecNotNativelyPlayable(String)
+        case videoCodecNotNativelyPlayable(String, streamIndex: Int)
+        /// `avformat_open_input` reported success and left no context, or an
+        /// adopted one went missing. Not a verdict about anything.
+        case openProducedNoContext
     }
 
     static let masterPlaylistFileName = "master.m3u8"
@@ -166,6 +294,11 @@ final class HLSRemuxer: @unchecked Sendable {
     /// the renditions shape can carry them — a boost lives in the master's
     /// audio group, and the muxed shape has no master.
     private let dialogueBoost: [DialogueBoostLevel]
+    /// The host's language hints, verbatim as it passed them. They steer which
+    /// rendition is DEFAULT and nothing else — no track is dropped, no decode
+    /// or bridge decision changes, and every track is still offered.
+    private let preferredAudioLanguage: String?
+    private let preferredSubtitleLanguage: String?
     /// Cross-session keyframe map (issue #34): consulted before the plan's
     /// index-load seek, fed by the sequential producer of a source whose own
     /// index couldn't be trusted. `nil` = no persistence, exactly as before.
@@ -180,6 +313,10 @@ final class HLSRemuxer: @unchecked Sendable {
     /// the reference also means an unconsumed one is closed when this remuxer
     /// is released rather than leaked.
     private let probed: ProbedSource?
+    /// The host's byte source, when it supplies one. `run()` takes its own
+    /// instance from it — never the probe's, which belongs to the context
+    /// that probe opened.
+    private let inputFactory: PrismCoreInputFactory?
 
     /// Set by `cancel()`; checked once per packet in the copy loop.
     private let cancelled = LockedFlag()
@@ -189,6 +326,17 @@ final class HLSRemuxer: @unchecked Sendable {
     /// so "cancel mid-file" can only be made deterministic from inside the
     /// cut path. `nil` in production.
     var onSegmentLanded: ((Int) -> Void)?
+
+    /// The session's startup-checkpoint sink, called on the producer thread as
+    /// each stage is reached. `nil` unless a host registered for them, and a
+    /// nil check is the whole cost of that case.
+    ///
+    /// No lock, deliberately: this is written once by `PrismCoreSession.start()`
+    /// BEFORE the `ProducerThread` is created, and the thread's creation is the
+    /// happens-before edge that publishes it. Nothing writes it afterwards, so
+    /// the producer only ever reads a value it was born with — the same
+    /// discipline `onSegmentLanded` already relies on.
+    var onStartupPhase: (@Sendable (StartupPhase) -> Void)?
 
     /// The WebVTT subtitle renditions produced alongside the fMP4 (phase 6).
     /// Exposed so the session can register external files before the run and
@@ -344,12 +492,19 @@ final class HLSRemuxer: @unchecked Sendable {
         segmentCacheBytes: Int? = nil,
         forceMuxed: Bool = false,
         dialogueBoost: [DialogueBoostLevel] = [],
+        preferredAudioLanguage: String? = nil,
+        preferredSubtitleLanguage: String? = nil,
         probed: ProbedSource? = nil,
+        input: PrismCoreInputFactory? = nil,
         keyframeCacheDirectory: URL? = nil,
         indexLoadBudget: Duration = SegmentPlan.indexLoadBudget,
         landed: ProductionSignal? = nil
     ) {
         self.probed = probed
+        // The probe's factory carries over when the caller did not pass one:
+        // a session built from a `ProbedSource` must be able to re-open the
+        // same bytes if the context handover has already happened.
+        self.inputFactory = input ?? probed?.inputFactory
         self.landed = landed
         self.keyframeCache = keyframeCacheDirectory.map { KeyframeIndexCache(directory: $0) }
         self.indexLoadBudget = indexLoadBudget
@@ -365,6 +520,8 @@ final class HLSRemuxer: @unchecked Sendable {
         self.segmentCacheBytes = segmentCacheBytes
         self.forceMuxed = forceMuxed
         self.dialogueBoost = dialogueBoost
+        self.preferredAudioLanguage = preferredAudioLanguage
+        self.preferredSubtitleLanguage = preferredSubtitleLanguage
     }
 
     func cancel() {
@@ -418,9 +575,30 @@ final class HLSRemuxer: @unchecked Sendable {
 
             interruptGuard = ReadInterruptGuard()
             input = interruptGuard.makeContext()
-            if coordinatedHTTP, ["http", "https"].contains(sourceURL.scheme?.lowercased() ?? ""), let input {
+            // Host-supplied bytes take `pb`; the coordinated HTTP reader is
+            // the fallback for sources the host does NOT carry itself.
+            if let inputFactory, let input {
+                do { try interruptGuard.installCustomInput(on: input, factory: inputFactory) }
+                catch { avformat_free_context(input); throw error }
+            } else if coordinatedHTTP, ["http", "https"].contains(sourceURL.scheme?.lowercased() ?? ""), let input {
                 do { try interruptGuard.installHTTPInput(on: input, url: sourceURL, headers: httpHeaders) }
                 catch { avformat_free_context(input); throw error }
+            }
+            // Published BEFORE the open, not after it. `cancel()` can only
+            // reach a guard it can see, and until 3.1.0 this one became
+            // visible only once the open had returned — so a `stop()` that
+            // landed during the open bounced off, and the thread kept the
+            // whole `probeBudget` (10 s) for itself no matter who asked it to
+            // come back. Measured on `ErrorTaxonomyTests.starvedStartupIsTheBudget`
+            // (an origin that withholds the first byte for 3 s): the teardown
+            // took 2.3 s before this line and 4 ms after it.
+            //
+            // This is also the only way the host-input hook can reach an open
+            // that parked inside `read` — `installCustomInput` ran a few lines
+            // up, but the guard nobody can see cancels nobody.
+            activeGuardLock.withLock {
+                activeGuard = interruptGuard
+                if cancelled.isSet { interruptGuard.cancel() }
             }
             // Bounded like the probe's open, and for the same reason: a
             // server that accepts and then starves the reads would otherwise
@@ -429,14 +607,36 @@ final class HLSRemuxer: @unchecked Sendable {
             // throws and the session surfaces a startup error instead.
             interruptGuard.arm(budget: SourceOpenTuning.probeBudget)
             let sourceSpec = sourceURL.isFileURL ? sourceURL.path : sourceURL.absoluteString
-            try FFmpegError.check(
-                avformat_open_input(&input, sourceSpec, nil, &openOptions),
-                "avformat_open_input"
-            )
-            guard let opened = input else { throw Failure.noVideoStream }
-            try FFmpegError.check(
-                avformat_find_stream_info(opened, nil), "avformat_find_stream_info"
-            )
+            do {
+                try FFmpegError.check(
+                    avformat_open_input(&input, sourceSpec, nil, &openOptions),
+                    "avformat_open_input"
+                )
+                guard let opened = input else { throw Failure.openProducedNoContext }
+                try FFmpegError.check(
+                    avformat_find_stream_info(opened, nil), "avformat_find_stream_info"
+                )
+            } catch {
+                // The guard is unpublished on the way out: nothing owns this
+                // context any more, and a `cancel()` arriving later must not
+                // find a guard whose reads have already been closed.
+                activeGuardLock.withLock { activeGuard = nil }
+                // A cancellation is not a source failure, wherever it lands.
+                // Now that the guard is visible during the open, a `stop()`
+                // can abort the open itself — and `run()` already returns
+                // normally for a cancel anywhere in the copy loop, so it
+                // returns normally for this one too. Reporting it as an
+                // unopenable source would turn every teardown-during-startup
+                // into a spurious error in the host's log.
+                if cancelled.isSet {
+                    avformat_close_input(&input)
+                    return
+                }
+                // Over the coordinated reader every transport verdict reaches
+                // libavformat as an errno, so the guard holds the only copy of
+                // what the origin actually said (see `ReadInterruptGuard`).
+                throw interruptGuard.customInputFailure ?? interruptGuard.originFailure ?? error
+            }
             interruptGuard.disarm()
             adoptedInfo = nil
         }
@@ -452,7 +652,11 @@ final class HLSRemuxer: @unchecked Sendable {
             activeGuardLock.withLock { activeGuard = nil }
             withExtendedLifetime(interruptGuard) {}
         }
-        guard let input else { throw Failure.noVideoStream }
+        guard let input else { throw Failure.openProducedNoContext }
+        // Open + `find_stream_info` are behind us. On a remote origin this is
+        // usually where most of a slow startup went, which is why it is the
+        // first thing a host is told about.
+        onStartupPhase?(.sourceOpened)
 
         // The probe already reads everything both decisions below need — which
         // streams exist, what they are, whether they copy, their languages and
@@ -466,21 +670,61 @@ final class HLSRemuxer: @unchecked Sendable {
         // them), so the session surfaces them as API instead — publish before
         // any packet work so they are readable the moment `start()` returns.
         chaptersLock.withLock { storedChapters = info.chapters }
+        // Published BEFORE the two guards below: a source we are about to
+        // refuse (no video, or video we cannot stream-copy) is exactly the one
+        // a host most wants described — the checkpoint is what lets it say
+        // *why* it is routing elsewhere instead of only that it is.
+        onStartupPhase?(.streamInfoResolved(info))
         guard let videoTrack = info.video else { throw Failure.noVideoStream }
         guard videoTrack.copyability == .streamCopy else {
-            throw Failure.videoCodecNotNativelyPlayable(videoTrack.codecName)
+            throw Failure.videoCodecNotNativelyPlayable(videoTrack.codecName, streamIndex: videoTrack.streamIndex)
         }
         let videoIndex = Int32(videoTrack.streamIndex)
+
+        // Closed captions ride inside the video, so the only way to know they
+        // exist is to look at packets — and it has to happen now, because the
+        // master playlist below is written before the copy loop and a
+        // rendition cannot be added to a manifest AVPlayer has already read.
+        // The scan is bounded and leaves the read position where it stopped,
+        // which is why it forces the rewind below. See `ClosedCaptionScout`
+        // for the cost this adds and why absence cannot be proven cheaper.
+        var closedCaptions: ClosedCaptionScout.Finding?
+        if let pb = input.pointee.pb, pb.pointee.seekable != 0,
+           let carriage = ClosedCaptionScout.carriage(
+               codecID: input.pointee.streams[Int(videoIndex)]!.pointee.codecpar.pointee.codec_id,
+               nalUnitLengthSize: videoTrack.nalUnitLengthSize
+           ) {
+            closedCaptions = ClosedCaptionScout.scan(
+                input: input, videoStreamIndex: videoIndex,
+                framing: carriage.framing, codec: carriage.codec
+            )
+            needsRewindToHead = true
+        }
 
         // Subtitle renditions are set up before the muxer: their packets never
         // reach it (in-band timed text is not HLS-conformant — muxing it in
         // gets the whole stream rejected by AVPlayer), they become WebVTT files
         // alongside the fMP4 segments.
-        let subtitleStreams = try subtitles.prepare(input: input)
+        let subtitleStreams = try subtitles.prepare(
+            input: input,
+            preferredLanguage: preferredSubtitleLanguage,
+            closedCaptions: closedCaptions,
+            // Captions have no metadata of their own; the video stream's
+            // language tag is the only declaration a container ever makes
+            // about them, and it is usually right for CC1.
+            closedCaptionLanguage: avMetadataValue(
+                input.pointee.streams[Int(videoIndex)]!.pointee.metadata, "language"
+            )
+        )
+        let tapsClosedCaptions = subtitles.hasClosedCaptions
 
         let candidates = audioCandidates(input)
         let bestAudio = av_find_best_stream(input, AVMEDIA_TYPE_AUDIO, -1, videoIndex, nil, 0)
-        let routes = Self.routeAll(candidates: candidates, best: bestAudio >= 0 ? bestAudio : nil)
+        let routes = Self.routeAll(
+            candidates: candidates,
+            best: bestAudio >= 0 ? bestAudio : nil,
+            preferredLanguage: preferredAudioLanguage
+        )
 
         // Can this source be honestly wrapped in a master playlist at all? The
         // answer decides the whole output shape, so it is settled before a
@@ -524,7 +768,11 @@ final class HLSRemuxer: @unchecked Sendable {
 
         let shape: OutputShape = (!routes.isEmpty && masterIsPossible && !forceMuxed)
             ? .renditions(routes)
-            : .muxed(Self.chooseAudio(candidates: candidates, best: bestAudio >= 0 ? bestAudio : nil))
+            : .muxed(Self.chooseAudio(
+                candidates: candidates,
+                best: bestAudio >= 0 ? bestAudio : nil,
+                preferredLanguage: preferredAudioLanguage
+            ))
 
         // Demand-driven mode needs a trustworthy upfront segmentation. Only a
         // keyframe-based plan qualifies — uniform-plan boundaries are time
@@ -592,6 +840,74 @@ final class HLSRemuxer: @unchecked Sendable {
         }
         let plannedPlan: SegmentPlan? = builtPlan?.basis == .keyframeIndex ? builtPlan : nil
         let planIsPartial = plannedPlan != nil && cachedCoveredThrough != nil
+        if let onStartupPhase {
+            // The cached map and a freshly loaded index reach the same plan by
+            // very different routes (one skips the index-load seek entirely),
+            // so the origin is reported rather than flattened into "planned".
+            let origin: SegmentPlanOrigin = plannedPlan == nil
+                ? .sequential
+                : (cachedKeyframes != nil ? .keyframeIndexCache : .builtFromSource)
+            onStartupPhase(.segmentPlanReady(
+                origin: origin, segments: plannedPlan?.entries.count ?? 0
+            ))
+        }
+
+        // Keep the index this plan was built from, so the NEXT play does not
+        // pay for it again. The keyframes are already in memory — the
+        // demuxer's own index, loaded by the nudge seek above — so storing
+        // them is a JSON write and no I/O against the source at all.
+        //
+        // What it saves is not the parse, it is the ROUND TRIPS. Measured
+        // against a model of Aether's localhost range proxy (which fetches
+        // each forwarded window whole before it writes a byte: 8 MB bites at
+        // ~800 KB/s), a first play of a 60 min Matroska spends four requests —
+        // the header, two at the tail for the Cues, and one to get back to the
+        // head — and 21.4 s before AVPlayer sees a playlist. The two tail
+        // requests and the rewind are all the index load's; with the map on
+        // disk the next play makes the header request and stops there.
+        //
+        // `.builtFromSource` only: a plan that came from the cache is already
+        // stored, and a degraded one is the harvest's business below.
+        //
+        // Stored ONLY when the index provably reaches the end of the source,
+        // and then as complete. A plan existing is not that proof (review
+        // finding): `keyframePlan`'s witnesses ask for a gap under the cap
+        // and a span of one target, which a head PREFIX satisfies — and a
+        // prefix is exactly what the index-load seek leaves behind when its
+        // budget runs out or the read fails mid-scan. Stored as complete,
+        // that prefix would be permanent: the next play would skip the index
+        // load on the strength of it, never see `planIsPartial`, never
+        // harvest, and plan the whole unseen remainder as one entry that only
+        // closes at EOF.
+        //
+        // An unproven prefix is therefore not stored at all — not even as a
+        // partial map. Partial coverage means a CONTIGUOUS run from the head,
+        // which the harvest knows because it read every packet; an aborted
+        // index scan knows no such thing about the entries the demuxer
+        // happened to add. Writing nothing costs this source the index-load
+        // seek again next time — which is what it paid before the sidecar
+        // existed — and leaves the next play free to load a full index and
+        // store that.
+        if let keyframeCache, let cacheIdentity, plannedPlan != nil, cachedKeyframes == nil {
+            let stream = input.pointee.streams[Int(videoIndex)]!
+            let indexed = SegmentPlan.indexedKeyframes(of: stream)
+            let durationSeconds = Double(input.pointee.duration) / Double(AV_TIME_BASE)
+            if indexed.count >= 2, let last = indexed.max(), durationSeconds > 0,
+               SegmentPlan.indexCoversThroughEnd(
+                   lastKeyframePTS: last,
+                   tickSeconds: av_q2d(stream.pointee.time_base),
+                   durationSeconds: durationSeconds,
+                   targetSeconds: segmentSeconds
+               ) {
+                let timeBase = stream.pointee.time_base
+                keyframeCache.store(.init(
+                    identity: cacheIdentity,
+                    timeBaseNum: timeBase.num,
+                    timeBaseDen: timeBase.den,
+                    keyframePTS: indexed.sorted()
+                ))
+            }
+        }
 
         // Harvest for next time (issue #34): this session degraded to the
         // sequential shape even though it could have been planned — the map
@@ -687,7 +1003,9 @@ final class HLSRemuxer: @unchecked Sendable {
                 }
             }
             // Dialogue-boost renditions, derived from the DEFAULT track only
-            // (routes[0] — the one `chooseAudio` picked): the feature is "the
+            // (routes[0] — the one `chooseAudio` picked, which is the
+            // preferred-language track when one matched, so boost and DEFAULT
+            // can never name different tracks): the feature is "the
             // dialogue is hard to hear on the track I'm listening to", and one
             // extra decode→filter→encode chain per level is already real CPU;
             // one per level per TRACK would be a five-language MKV paying for
@@ -756,7 +1074,10 @@ final class HLSRemuxer: @unchecked Sendable {
                 }
                 variant.audioRenditions = renditions.enumerated().map { ordinal, rendition in
                     // DEFAULT on the first rendition only, which is the track
-                    // `chooseAudio` would have picked (see `routeAll`).
+                    // `chooseAudio` would have picked (see `routeAll`) — and
+                    // therefore the host's `preferredAudioLanguage` when one
+                    // matched. Every other track is still declared and still
+                    // selectable; the preference moves the flag, not the menu.
                     rendition.rendition(groupID: Self.audioGroupID, isDefault: ordinal == 0)
                 }
                 // The WebVTT renditions `prepare` set up above. Declaring them
@@ -856,6 +1177,11 @@ final class HLSRemuxer: @unchecked Sendable {
         var nextBoundaryPTS: Int64 = 0
         var lastVideoEndPTS: Int64?
         var segmentIndex = 0
+        /// Has the startup checkpoint for the first landed video segment gone
+        /// out? Producer-thread-local, so no lock — and a plain "is it index
+        /// 0" test would not do: a re-anchor back to the head re-produces
+        /// segment 0, and the host would be told startup happened twice.
+        var didAnnounceFirstSegment = false
         /// Post-reanchor: discard packets until the anchor keyframe arrives
         /// (a BACKWARD seek may land at an earlier keyframe than requested).
         var droppingUntilPTS: Int64?
@@ -1015,6 +1341,10 @@ final class HLSRemuxer: @unchecked Sendable {
                 try playlist.appendSegment(duration: duration, file: file)
             }
             onSegmentLanded?(segmentIndex)
+            if !didAnnounceFirstSegment {
+                didAnnounceFirstSegment = true
+                onStartupPhase?(.firstVideoSegmentWritten(index: segmentIndex))
+            }
             // Same wall-time window, so rendition segment N covers variant
             // segment N — cut only when a media segment really landed.
             try subtitles.flushSegment(
@@ -1030,6 +1360,12 @@ final class HLSRemuxer: @unchecked Sendable {
             for rendition in renditions {
                 renditionBytes += try rendition.cut(durationSeconds: duration)
             }
+            // The whole cut for this index is on disk now — variant and every
+            // rendition — so a superseded index becomes servable again HERE,
+            // not at the variant's `publish`: a rendition of the same index is
+            // written after it, and clearing early would let an
+            // `audioN/segNNNNN.m4s` fetch be answered with the old offset.
+            residentSegments.markProduced(index: segmentIndex - 1)
             demand?.setProducing(index: segmentIndex)
             recordAndEvict(index: segmentIndex - 1, videoBytes: media.count, renditionBytes: renditionBytes)
             // Refreshed per segment rather than once at EOF: a host that wants to
@@ -1049,12 +1385,52 @@ final class HLSRemuxer: @unchecked Sendable {
                 av_seek_frame(input, videoIndex, target, AVSEEK_FLAG_BACKWARD),
                 "av_seek_frame"
             )
+            // A re-anchor rebuilds every muxer, which is the one moment a new
+            // audio offset can be taken up: the shift moves audio dts, and
+            // applying it inside a running fragment would step dts backwards —
+            // `av_interleaved_write_frame` refuses that (-22).
+            // Marking the old output unservable happens inside the adoption,
+            // before `pendingAudioDelaySeconds` can report nil. Only the
+            // *deletion* is deferred to the unlink queue: it is filesystem
+            // work (one `removeItem` per index per rendition, a whole cache's
+            // worth at once here), and this sits on the seek path between a
+            // demuxer seek and the first packet of the new anchor. The
+            // serving path consults the store instead of waiting for the
+            // files to go — a superseded index reads as a miss, which
+            // re-anchors production and rewrites it, so nothing becomes
+            // permanently unfetchable.
+            var supersededVictims: [Int] = []
+            let adoptedDelay = adoptRequestedAudioDelay {
+                supersededVictims = residentSegments.supersedeAll()
+                // A rendition slot that carried no audio at the old offset may
+                // carry some at the new one; a stale 404 there is a rendition
+                // segment AVPlayer counts as failed. Cleared with the rest of
+                // the old verdicts, for the same reason they are.
+                demand?.clearUnproducible()
+            }
             writer = FMP4SegmentWriter()
             writer.audioDelaySeconds = audioDelaySeconds
             _ = try writer.open(input: input, plan: plan, restart: true)
             streamMap = writer.streamMap
             for rendition in renditions {
+                rendition.audioDelaySeconds = audioDelaySeconds
                 try rendition.reanchor(input: input, segmentIndex: anchor)
+            }
+            if adoptedDelay != nil {
+                // Every segment already on disk was muxed with the PREVIOUS
+                // offset. Left there, the provider serves them as hits and a
+                // backward seek plays audio at the offset the viewer just
+                // corrected away from — the failure a delay control must not
+                // have. They stopped being servable above; here they stop
+                // taking up disk.
+                let directories = [outputDirectory] + renditions.map {
+                    outputDirectory.appendingPathComponent($0.directoryName)
+                }
+                unlinkQueue.async { [residentSegments, supersededVictims] in
+                    for victim in supersededVictims {
+                        residentSegments.unlinkRetired(index: victim, directories: directories)
+                    }
+                }
             }
             subtitles.reanchor(segmentIndex: anchor, startSeconds: Double(target) * tickSeconds)
             segmentIndex = anchor
@@ -1091,7 +1467,23 @@ final class HLSRemuxer: @unchecked Sendable {
                     // options above handle the socket; anything that still
                     // surfaces here ends the remux (the playlists stay valid up
                     // to the last written segment).
-                    throw FFmpegError(code: readResult, operation: "av_read_frame")
+                    // An origin that went away mid-session is the most common
+                    // way to arrive here, and neither a host-supplied input
+                    // nor the coordinated reader can tell libavformat more
+                    // than an errno — it arrives as `-EIO` either way, so ask
+                    // the guard what it really was before reporting a symptom.
+                    //
+                    // The order is most-specific-first and it matters: the
+                    // host's own thrown error (an expired debrid token, a
+                    // dropped SMB mount) is the only thing that names WHICH
+                    // transport gave up, the origin's classification is the
+                    // next best, and the libav* code is the consequence of
+                    // whichever of them happened. Same order as the opening
+                    // paths, so a failure reads identically to a host whether
+                    // it lands at startup or an hour into a film.
+                    throw interruptGuard.customInputFailure
+                        ?? interruptGuard.originFailure
+                        ?? FFmpegError(code: readResult, operation: "av_read_frame")
                 }
                 countSourceBytes(packet.pointee.size)
                 defer { av_packet_unref(packet) }
@@ -1193,6 +1585,17 @@ final class HLSRemuxer: @unchecked Sendable {
                             }
                         }
                         lastVideoEndPTS = pts + max(packet.pointee.duration, 0)
+                        // Closed captions, on the PTS — not the DTS the packet
+                        // arrived in order of. Gated on a boolean the scout
+                        // settled before the first packet, so a source without
+                        // captions never reaches the NAL walk.
+                        if tapsClosedCaptions, let data = packet.pointee.data,
+                           packet.pointee.size > 0 {
+                            subtitles.ingestVideoPacket(
+                                UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)),
+                                presentationSeconds: Double(pts) * tickSeconds
+                            )
+                        }
                     }
                     // P7 → 8.1: rewrite the RPUs and drop the enhancement layer
                     // before the bits reach the muxer. Returns nil for a packet
@@ -1306,6 +1709,13 @@ final class HLSRemuxer: @unchecked Sendable {
             // trailer's tail bytes, is one segment. A sub-6s source cuts here for
             // the first time, so this can also mint the init segment.
             let closingPTS = lastVideoEndPTS ?? nextBoundaryPTS
+            // Before the last cut: the caption reorder window still holds the
+            // final frames, and the caption on screen at EOF has no end
+            // command coming. Both have to be settled while there is still a
+            // segment to write them into.
+            if tapsClosedCaptions {
+                subtitles.flushClosedCaptions(endSeconds: Double(closingPTS) * tickSeconds)
+            }
             let (initSegment, media) = try writer.cutSegment()
             if let initSegment, !initSegment.isEmpty {
                 try writeInitSegmentIfAbsent(initSegment)
@@ -1321,7 +1731,15 @@ final class HLSRemuxer: @unchecked Sendable {
                 if plannedPlan == nil {
                     try playlist.appendSegment(duration: finalDuration, file: file)
                 }
+                residentSegments.markProduced(index: segmentIndex)
                 recordAndEvict(index: segmentIndex, videoBytes: finalSegment.count, renditionBytes: 0)
+                // A source shorter than the first target never reaches
+                // `emitSegment`, so this is where ITS first segment lands —
+                // and the readiness gate is waiting on exactly this write.
+                if !didAnnounceFirstSegment {
+                    didAnnounceFirstSegment = true
+                    onStartupPhase?(.firstVideoSegmentWritten(index: segmentIndex))
+                }
                 if let start = segmentStartPTS {
                     try subtitles.flushSegment(
                         start: Double(start) * tickSeconds,
@@ -1413,7 +1831,14 @@ final class HLSRemuxer: @unchecked Sendable {
         for index in 0..<Int(input.pointee.nb_streams) {
             let par = input.pointee.streams[index]!.pointee.codecpar.pointee
             guard par.codec_type == AVMEDIA_TYPE_AUDIO else { continue }
-            candidates.append(AudioCandidate(index: Int32(index), codecID: par.codec_id))
+            let disposition = input.pointee.streams[index]!.pointee.disposition
+            candidates.append(AudioCandidate(
+                index: Int32(index),
+                codecID: par.codec_id,
+                isOriginal: disposition & AV_DISPOSITION_ORIGINAL != 0,
+                isDefault: disposition & AV_DISPOSITION_DEFAULT != 0,
+                language: avMetadataValue(input.pointee.streams[index]!.pointee.metadata, "language")
+            ))
         }
         return candidates
     }
@@ -1433,6 +1858,7 @@ final class HLSRemuxer: @unchecked Sendable {
     static func routeAll(
         candidates: [AudioCandidate],
         best: Int32?,
+        preferredLanguage: String? = nil,
         canBridge: (AVCodecID) -> Bool = { AudioBridge.canBridge(codecID: $0) }
     ) -> [AudioRoute] {
         let viable: [AudioRoute] = candidates.compactMap { candidate in
@@ -1444,7 +1870,12 @@ final class HLSRemuxer: @unchecked Sendable {
             }
             return nil
         }
-        guard let preferred = chooseAudio(candidates: candidates, best: best, canBridge: canBridge),
+        guard let preferred = chooseAudio(
+                  candidates: candidates,
+                  best: best,
+                  preferredLanguage: preferredLanguage,
+                  canBridge: canBridge
+              ),
               let position = viable.firstIndex(where: { $0.index == preferred.index })
         else { return viable }
         var ordered = viable
@@ -1489,6 +1920,22 @@ final class HLSRemuxer: @unchecked Sendable {
     ///
     /// Order of preference, and the reasoning:
     ///
+    /// -1. A track whose language matches the host's `preferredAudioLanguage`,
+    ///    when there is one. Above *everything* below, including the original
+    ///    soundtrack: the rungs below are the engine guessing what the viewer
+    ///    would want, and this rung is the viewer having said. Matching is
+    ///    tolerant (`LanguageMatch`), an exact region match beats a bare one,
+    ///    and a track that cannot be carried at all is still skipped — a
+    ///    rendition AVPlayer can't play is worse than the wrong language.
+    ///    No match changes nothing: the rungs below decide exactly as before.
+    /// 0. A track the container marks as the film's **original** soundtrack.
+    ///    Everything below this line ranks by what the audio *is* — codec,
+    ///    channels, whether the bits can pass through untouched — and none of
+    ///    that has any bearing on which language a film is meant to be heard
+    ///    in. A dual-audio release whose dub is the richer encode used to win
+    ///    on those grounds alone, so the film opened in the dub. Where the
+    ///    source says which track is the original, that answers a different and
+    ///    better question, and it goes first.
     /// 1. The demuxer's *best* stream when it is stream-copyable — untouched
     ///    bits beat anything we could re-encode, and this is the case that keeps
     ///    Atmos alive.
@@ -1496,19 +1943,64 @@ final class HLSRemuxer: @unchecked Sendable {
     ///    to a lesser copyable track, which meant a DTS-HD MA 7.1 main track
     ///    lost to an AC3 2.0 compatibility track — the bridge makes the main
     ///    track the better answer even at a re-encode's cost.
-    /// 3. Any copyable stream, for sources whose best track can't be bridged
+    /// 3. The container's own **default** flag. Below the two above on purpose:
+    ///    a market-specific disc flags its dub default, so this is a hint about
+    ///    the release rather than about the film. It still beats container
+    ///    order, which is what the two rungs below fall back to.
+    /// 4. Any copyable stream, for sources whose best track can't be bridged
     ///    either (no decoder in this build, or no EAC3 encoder — see
     ///    `AudioBridge.isEncoderAvailable`). This is v0's behaviour, preserved
     ///    as the fallback rather than removed.
-    /// 4. Any bridgeable stream at all.
+    /// 5. Any bridgeable stream at all.
+    ///
+    /// Rungs 0 and 3 are additive: a source that marks neither gets exactly the
+    /// order it got before, which is why adding them cannot cost an Atmos track.
+    ///
+    /// What this still cannot do *by itself* is prefer a language: which one a
+    /// film is meant to be heard in is a fact about the film that no container
+    /// reliably carries. A host that knows it — from a metadata service, or
+    /// from the person — passes it as `preferredAudioLanguage` and it becomes
+    /// rung -1; a host that doesn't gets exactly the order it always got.
     ///
     /// `canBridge` is injected so the decision can be exercised as a pure
     /// function in tests, independent of what the linked FFmpeg supports.
     static func chooseAudio(
         candidates: [AudioCandidate],
         best: Int32?,
+        preferredLanguage: String? = nil,
         canBridge: (AVCodecID) -> Bool = { AudioBridge.canBridge(codecID: $0) }
     ) -> AudioRoute? {
+        /// How this track would be carried, or `nil` when it cannot be.
+        func route(_ candidate: AudioCandidate) -> AudioRoute? {
+            if copyableAudio.contains(candidate.codecID) {
+                return AudioRoute(index: candidate.index, mode: .streamCopy)
+            }
+            if canBridge(candidate.codecID) {
+                return AudioRoute(index: candidate.index, mode: .bridge)
+            }
+            return nil
+        }
+
+        // Rung -1. Only carriable candidates are offered to the matcher: a
+        // match on a track this build can neither copy nor bridge would hand
+        // back nothing and skip the remaining rungs entirely, turning a
+        // preference into silence.
+        let carriable = candidates.filter { route($0) != nil }
+        if let index = LanguageMatch.bestIndex(
+            in: carriable,
+            preferred: preferredLanguage,
+            language: \.language,
+            // Tie-break inside the asked-for language, in the same order the
+            // rungs below use: the original soundtrack, then the container's
+            // default flag, then container order.
+            bonus: { ($0.isOriginal ? 2 : 0) + ($0.isDefault ? 1 : 0) }
+        ), let route = route(carriable[index]) {
+            return route
+        }
+
+        if let original = candidates.first(where: \.isOriginal), let route = route(original) {
+            return route
+        }
         if let best, let bestCandidate = candidates.first(where: { $0.index == best }) {
             if copyableAudio.contains(bestCandidate.codecID) {
                 return AudioRoute(index: best, mode: .streamCopy)
@@ -1516,6 +2008,9 @@ final class HLSRemuxer: @unchecked Sendable {
             if canBridge(bestCandidate.codecID) {
                 return AudioRoute(index: best, mode: .bridge)
             }
+        }
+        if let flagged = candidates.first(where: \.isDefault), let route = route(flagged) {
+            return route
         }
         if let copyable = candidates.first(where: { copyableAudio.contains($0.codecID) }) {
             return AudioRoute(index: copyable.index, mode: .streamCopy)

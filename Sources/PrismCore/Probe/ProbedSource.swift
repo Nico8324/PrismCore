@@ -47,10 +47,31 @@ public final class ProbedSource: @unchecked Sendable {
     /// it is a value, copied out at probe time.
     public let info: SourceInfo
 
+    /// The container's byte layout and seek index, for a caller that asked the
+    /// open to measure them (`SourceStructureExport`).
+    ///
+    /// `SourceStructure.unknown` otherwise, which is the default and costs
+    /// nothing. It is a separate value from `info` because it answers a
+    /// separate question — `info` is "what streams are in here", this is
+    /// "where do they start and is there an index" — and because only one of
+    /// the two is worth paying extra reads for.
+    public let structure: SourceStructure
+
+    /// What became of the hints this open was given, if any. `wereSupplied ==
+    /// false` for every open that passed none, which is every open today.
+    public let hints: HintOutcome
+
     /// The source this describes, so a consumer that needs to re-open (a
     /// fallback session, whose context was already taken) knows what to open.
     public let url: URL
     let httpHeaders: [String: String]
+    /// The host-supplied byte source this was probed through, when there was
+    /// one — travelling for the same reason the headers do: whoever re-opens
+    /// (the remuxer whose adopted context was already consumed, a muxed
+    /// fallback session) has to reach the same bytes, and only the host can
+    /// produce them. It is a FACTORY, so each of those opens gets its own
+    /// cursor.
+    let inputFactory: PrismCoreInputFactory?
 
     /// The interrupt guard the context was OPENED with — the callback is
     /// baked into the URLContext at creation and cannot be added later (issue
@@ -71,15 +92,21 @@ public final class ProbedSource: @unchecked Sendable {
 
     init(
         info: SourceInfo,
+        structure: SourceStructure = .unknown,
+        hints: HintOutcome = .unhinted,
         url: URL,
         httpHeaders: [String: String],
+        inputFactory: PrismCoreInputFactory? = nil,
         context: UnsafeMutablePointer<AVFormatContext>,
         interruptGuard: ReadInterruptGuard,
         timing: ProbeTiming
     ) {
         self.info = info
+        self.structure = structure
+        self.hints = hints
         self.url = url
         self.httpHeaders = httpHeaders
+        self.inputFactory = inputFactory
         self.context = context
         self.interruptGuard = interruptGuard
         self.timing = timing

@@ -145,7 +145,7 @@ struct RealMediaVerificationTests {
     private func fetchInitSegment(base: URL) async throws -> Data {
         let deadline = ContinuousClock.now.advanced(by: .seconds(60))
         while ContinuousClock.now < deadline {
-            if let (data, response) = try? await URLSession.shared.data(
+            if let (data, response) = try? await URLSession.uncached.data(
                    from: base.appendingPathComponent("init.mp4")
                ),
                (response as? HTTPURLResponse)?.statusCode == 200, !data.isEmpty {
@@ -274,7 +274,7 @@ struct RealMediaVerificationTests {
 
     private func fetchRenditionInit(base: URL) async throws -> Data? {
         for ordinal in 0..<4 {
-            if let (data, response) = try? await URLSession.shared.data(
+            if let (data, response) = try? await URLSession.uncached.data(
                    from: base.appendingPathComponent("audio\(ordinal)/init.mp4")
                ),
                (response as? HTTPURLResponse)?.statusCode == 200, !data.isEmpty {

@@ -58,11 +58,17 @@ final class SubtitleRenditionSet: @unchecked Sendable {
     /// One rendition being produced.
     private struct Track {
         enum Converter {
-            /// Text packets → cue text, directly.
-            case text(TextSubtitleConverter.Kind)
+            /// Text packets → cue text, directly. The play resolution is
+            /// the ASS script's (`nil` for the other kinds), for `\pos`.
+            case text(TextSubtitleConverter.Kind, playResolution: TextSubtitleConverter.PlayResolution?)
             /// Bitmap packets → composition → OCR → cue text. Class-typed:
             /// the pending-cue lifecycle is mutable state.
             case bitmap(BitmapRenditionTrack)
+            /// CEA-608 service riding inside the video elementary stream. Its
+            /// cues arrive from `ingestVideoPacket`, not from `ingest` — there
+            /// is no subtitle packet to hand over, which is exactly why closed
+            /// captions were invisible to this engine until now.
+            case closedCaption(channel: Int)
             /// External file, converted up front — `ingest` never sees it.
             case preloaded
         }
@@ -199,6 +205,14 @@ final class SubtitleRenditionSet: @unchecked Sendable {
     /// Set once the presentation origin is known; guards a flush that would
     /// otherwise print cues against origin 0.
     private var originSet = false
+    /// Built only when the scout found captions in the video stream. `nil` —
+    /// the overwhelmingly common case — is what keeps the copy loop's caption
+    /// tap free for every source that has none.
+    private var captionReader: ClosedCaptionReader?
+
+    /// Whether this session has any closed-caption rendition, so the copy loop
+    /// can skip the tap on one boolean rather than an optional chain per packet.
+    var hasClosedCaptions: Bool { captionReader != nil }
 
     // MARK: Host cue tap
 
@@ -240,21 +254,29 @@ final class SubtitleRenditionSet: @unchecked Sendable {
     // MARK: - Setup
 
     /// Create a rendition per convertible source: embedded text streams first
-    /// (in stream order), then registered external files. Returns the set of
-    /// input stream indices whose packets `ingest` wants.
+    /// (in stream order), then the closed-caption services the scout found in
+    /// the video, then registered external files. Returns the set of input
+    /// stream indices whose packets `ingest` wants.
     @discardableResult
-    func prepare(input: UnsafeMutablePointer<AVFormatContext>) throws -> Set<Int32> {
+    func prepare(
+        input: UnsafeMutablePointer<AVFormatContext>,
+        preferredLanguage: String? = nil,
+        closedCaptions: ClosedCaptionScout.Finding? = nil,
+        closedCaptionLanguage: String? = nil
+    ) throws -> Set<Int32> {
         var built: [Track] = []
         var descriptions: [MasterPlaylistBuilder.SubtitleRendition] = []
 
         // How many subtitle streams share each language — `isForcedRendition` needs to know
         // whether a forced track has a full sibling before it may be hidden as forced.
         var languageCounts: [String: Int] = [:]
+        var hasTextTrack = false
         for index in 0..<Int32(input.pointee.nb_streams) {
             guard let stream = input.pointee.streams[Int(index)],
                   stream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE
             else { continue }
             languageCounts[avMetadataValue(stream.pointee.metadata, "language") ?? "", default: 0] += 1
+            if Self.kind(for: stream.pointee.codecpar.pointee.codec_id) != nil { hasTextTrack = true }
         }
 
         for index in 0..<Int32(input.pointee.nb_streams) {
@@ -265,14 +287,18 @@ final class SubtitleRenditionSet: @unchecked Sendable {
 
             let converter: Track.Converter
             if let kind = Self.kind(for: par.codec_id) {
-                converter = .text(kind)
-            } else if Self.ocrCodecs.contains(par.codec_id), SubtitleOCR.isAvailable,
+                converter = .text(kind, playResolution: Self.playResolution(of: stream.pointee.codecpar, kind: kind))
+            } else if Self.ocrCodecs.contains(par.codec_id), !hasTextTrack, SubtitleOCR.isAvailable,
                       let decoder = try? BitmapSubtitleDecoder(
                         codecpar: stream.pointee.codecpar, timeBase: stream.pointee.time_base
                       ) {
                 // A bitmap track becomes a rendition through on-device OCR —
                 // lossy by design (typography dies, text survives), but it is
                 // the only form that rides PiP, AirPlay and the system menu.
+                // Only when the source has no text track at all: beside a real
+                // SRT, four unlabelled OCR readings of the same dialogue are
+                // menu noise that hides the one worth choosing (a Vision Pro
+                // menu of "English-SRT, Subtitles 2, 3, 4, 5" — 2026-09-06).
                 // A build without Vision, or a decoder this build lacks,
                 // leaves the track host-only exactly as before.
                 converter = .bitmap(BitmapRenditionTrack(decoder: decoder, language: language))
@@ -294,9 +320,11 @@ final class SubtitleRenditionSet: @unchecked Sendable {
             )
             descriptions.append(
                 MasterPlaylistBuilder.SubtitleRendition(
-                    name: avMetadataValue(stream.pointee.metadata, "title")
-                        ?? language
-                        ?? "Subtitles \(ordinal + 1)",
+                    name: Self.renditionName(
+                        language: language,
+                        title: avMetadataValue(stream.pointee.metadata, "title"),
+                        ordinal: ordinal
+                    ),
                     language: language,
                     uri: "\(Self.directoryName(ordinal))/index.m3u8",
                     isForced: Self.isForcedRendition(
@@ -305,6 +333,41 @@ final class SubtitleRenditionSet: @unchecked Sendable {
                     )
                 )
             )
+        }
+
+        if let closedCaptions {
+            captionReader = ClosedCaptionReader(
+                framing: closedCaptions.framing, codec: closedCaptions.codec
+            )
+            for channel in closedCaptions.channels {
+                let ordinal = built.count
+                let writer = try WebVTTRenditionWriter(
+                    directory: outputDirectory.appendingPathComponent(
+                        Self.directoryName(ordinal), isDirectory: true
+                    )
+                )
+                built.append(
+                    Track(
+                        // No input stream index: captions have no stream of
+                        // their own, which is the whole difficulty.
+                        inputIndex: nil, timeBase: nil,
+                        converter: .closedCaption(channel: channel), writer: writer
+                    )
+                )
+                descriptions.append(
+                    MasterPlaylistBuilder.SubtitleRendition(
+                        name: ClosedCaptionReader.renditionName(
+                            channel: channel, language: closedCaptionLanguage
+                        ),
+                        language: closedCaptionLanguage,
+                        uri: "\(Self.directoryName(ordinal))/index.m3u8",
+                        // A caption service is never "forced": it carries the
+                        // whole programme's dialogue, and FORCED=YES would keep
+                        // AVKit from ever listing it.
+                        isForced: false
+                    )
+                )
+            }
         }
 
         for file in lock.withLock({ externalFiles }) {
@@ -332,7 +395,10 @@ final class SubtitleRenditionSet: @unchecked Sendable {
 
         lock.withLock {
             tracks = built
-            storedRenditions = Self.withUniqueNames(descriptions)
+            storedRenditions = Self.applyingPreferredDefault(
+                Self.withUniqueNames(descriptions),
+                preferredLanguage: preferredLanguage
+            )
         }
         return Set(built.compactMap(\.inputIndex))
     }
@@ -353,6 +419,28 @@ final class SubtitleRenditionSet: @unchecked Sendable {
     /// `eng`, and the forced one lost. It was invisible from the playlist text,
     /// which listed both lines correctly, `FORCED=YES` and all.
     ///
+    /// What the player's menu calls a rendition.
+    ///
+    /// The language, in its own name, the way Apple's playlists and the converted files do:
+    /// "English", "Français". A muxer's title is usually noise ("English-SRT") and is dropped —
+    /// unless it says what *kind* of track this is (SDH, forced, signs), which the language alone
+    /// cannot, and then it rides along: "English (Signs & Songs)". No language, no title: an
+    /// ordinal, and `withUniqueNames` keeps collisions apart.
+    static func renditionName(language: String?, title: String?, ordinal: Int) -> String {
+        let endonym = language.flatMap { code -> String? in
+            let locale = Locale(identifier: code)
+            return locale.localizedString(forLanguageCode: code)?.capitalized(with: locale)
+        }
+        let kindWords = ["sdh", "cc", "hearing", "forced", "signs", "songs", "commentary"]
+        let describes = title.map { t in kindWords.contains { t.lowercased().contains($0) } } ?? false
+        switch (endonym, title) {
+        case (let name?, let t?) where describes: return "\(name) (\(t))"
+        case (let name?, _): return name
+        case (nil, let t?): return t
+        case (nil, nil): return "Subtitles \(ordinal + 1)"
+        }
+    }
+
     /// Whether a subtitle stream should be declared `FORCED=YES`.
     ///
     /// AVKit never lists a forced rendition in its subtitle menu — it shows one only on its own
@@ -388,6 +476,38 @@ final class SubtitleRenditionSet: @unchecked Sendable {
             unique.name = name
             return unique
         }
+    }
+
+    /// Mark the rendition that answers the host's `preferredSubtitleLanguage`
+    /// as the group's `DEFAULT`, leaving every other flag alone.
+    ///
+    /// Three properties this deliberately has:
+    ///
+    /// - **No match is a no-op.** An unmatched preference (or none at all)
+    ///   returns the descriptions untouched — `DEFAULT=NO` everywhere, the
+    ///   pre-existing behaviour, never an error and never an empty group.
+    /// - **Nothing is dropped.** Every rendition is still declared and still
+    ///   selectable; this moves one flag, it does not filter the menu.
+    /// - **Forced semantics are untouched.** `isForced` is computed from the
+    ///   container's disposition (see `isForcedRendition`) and is not read or
+    ///   written here. It only breaks *ties*: between a full and a forced
+    ///   rendition of the same language the full one wins the DEFAULT, because
+    ///   a viewer who asked for Czech subtitles and got the foreign-dialogue
+    ///   track would see almost nothing and conclude the preference did not
+    ///   work. A forced rendition can still take it when it is the only match.
+    static func applyingPreferredDefault(
+        _ descriptions: [MasterPlaylistBuilder.SubtitleRendition],
+        preferredLanguage: String?
+    ) -> [MasterPlaylistBuilder.SubtitleRendition] {
+        guard let index = LanguageMatch.bestIndex(
+            in: descriptions,
+            preferred: preferredLanguage,
+            language: \.language,
+            bonus: { $0.isForced ? 0 : 1 }
+        ) else { return descriptions }
+        var updated = descriptions
+        updated[index].isDefault = true
+        return updated
     }
 
     // MARK: - Lazy arming
@@ -504,7 +624,9 @@ final class SubtitleRenditionSet: @unchecked Sendable {
         guard end > start else { return nil }
         let key = "\(streamIndex)|\(cue.start)|\(cue.end)|\(cue.text)"
         guard emittedKeys.insert(key).inserted else { return nil }
-        let rebased = TimedTextCue(streamIndex: streamIndex, start: start, end: end, text: cue.text)
+        let rebased = TimedTextCue(
+            streamIndex: streamIndex, start: start, end: end, text: cue.text, placement: cue.placement
+        )
         emittedCues.append(rebased)
         return rebased
     }
@@ -518,7 +640,9 @@ final class SubtitleRenditionSet: @unchecked Sendable {
         guard let track = tracks.first(where: { $0.inputIndex == streamIndex }) else { return }
 
         switch track.converter {
-        case .preloaded:
+        // Neither has a source packet: an external file was converted in
+        // `prepare`, a caption service arrives through `ingestVideoPacket`.
+        case .preloaded, .closedCaption:
             return
         case .bitmap(let bitmap):
             // Bitmap events carry their own AV_TIME_BASE-derived times; the
@@ -528,28 +652,84 @@ final class SubtitleRenditionSet: @unchecked Sendable {
                 track.writer.add(cue)
                 emitHostCue(streamIndex: streamIndex, cue)
             }
-        case .text(let kind):
+        case .text(let kind, let playResolution):
             guard let timeBase = track.timeBase,
                   packet.pointee.pts != swift_AV_NOPTS_VALUE(),
                   let data = packet.pointee.data, packet.pointee.size > 0
             else { return }
             let payload = Data(bytes: data, count: Int(packet.pointee.size))
-            guard let text = TextSubtitleConverter.cueText(from: payload, kind: kind) else { return }
+            guard let converted = TextSubtitleConverter.convert(payload, kind: kind, playResolution: playResolution)
+            else { return }
 
             let tick = av_q2d(timeBase)
             let start = Double(packet.pointee.pts) * tick
             let duration = packet.pointee.duration > 0
                 ? Double(packet.pointee.duration) * tick
                 : WebVTTRenditionWriter.fallbackCueSeconds
-            let cue = SubtitleCue(start: start, end: start + duration, text: text)
+            // A WebVTT track's own cue settings are the most faithful
+            // placement there is; they outrank anything read off the payload.
+            let sourceSettings = kind == .webvtt
+                ? Self.webVTTSettings(on: packet).flatMap(TextCuePlacement.sanitizedWebVTTSettings)
+                : nil
+            let placement = sourceSettings.flatMap(TextCuePlacement.init(webVTTSettings:)) ?? converted.placement
+            let cue = SubtitleCue(
+                start: start, end: start + duration, text: converted.text,
+                settings: sourceSettings ?? converted.placement?.webVTTSettings,
+                placement: placement
+            )
             track.writer.add(cue)
             emitHostCue(streamIndex: streamIndex, cue)
+        }
+    }
+
+    /// One **video** packet, for the closed captions riding inside it.
+    ///
+    /// `presentationSeconds` is the packet's PTS on the source's own axis —
+    /// the same axis `ingest` puts a text cue's start on, and the one
+    /// `flushSegment` cuts against. Using DTS here instead would drift every
+    /// caption on any stream with B-frames.
+    ///
+    /// No-op unless the scout found captions, so a source without them pays
+    /// nothing but the caller's own `hasClosedCaptions` check.
+    func ingestVideoPacket(_ bytes: UnsafeBufferPointer<UInt8>, presentationSeconds: Double) {
+        guard let captionReader else { return }
+        captionReader.ingest(bytes, presentationSeconds: presentationSeconds)
+        deliver(captionReader.drainCues())
+    }
+
+    /// End of stream: release the reorder window and close whatever caption is
+    /// still standing. Without this the last few frames of captions are still
+    /// in the window when the producer stops, and the caption on screen at EOF
+    /// never gets an end.
+    func flushClosedCaptions(endSeconds: Double) {
+        guard let captionReader else { return }
+        deliver(captionReader.flush(at: endSeconds))
+    }
+
+    private func deliver(_ cues: [ClosedCaptionReader.ChannelCue]) {
+        guard !cues.isEmpty else { return }
+        for entry in cues {
+            guard let track = tracks.first(where: {
+                if case .closedCaption(let channel) = $0.converter { return channel == entry.channel }
+                return false
+            }) else { continue }
+            track.writer.add(entry.cue)
+            // A caption has no source stream to name, so the host tap gets a
+            // synthetic negative index — CC1 is -1, CC4 is -4. Negative is the
+            // point: it can never collide with a real `SubtitleTrackInfo`
+            // index, so a host routing cues by index cannot mistake one for a
+            // demuxed track.
+            emitHostCue(streamIndex: Int32(-entry.channel), entry.cue)
         }
     }
 
     /// Cut every rendition on the video segment's own boundaries (source
     /// seconds), so segment N of a rendition covers segment N of the variant.
     func flushSegment(start: Double, end: Double) throws {
+        // Before anything is written: a caption standing across this cut has to
+        // become a cue up to the boundary, or the segment that was showing it
+        // ships without it.
+        if let captionReader { deliver(captionReader.advance(to: end)) }
         for track in tracks {
             // An open bitmap cue splits at the boundary: its first part is
             // written into this segment, its tail re-opens into the next —
@@ -582,6 +762,9 @@ final class SubtitleRenditionSet: @unchecked Sendable {
 
     /// Demand-driven jump on every rendition.
     func reanchor(segmentIndex: Int, startSeconds: Double) {
+        // The reorder window holds frames from before the seek and the 608
+        // terminal holds a screen that belongs to them; neither survives a jump.
+        captionReader?.reanchor()
         for track in tracks {
             if case .bitmap(let bitmap) = track.converter {
                 bitmap.reanchor()
@@ -611,6 +794,31 @@ final class SubtitleRenditionSet: @unchecked Sendable {
         case AV_CODEC_ID_MOV_TEXT: return .movText
         default: return nil
         }
+    }
+
+    /// The ASS script header's play resolution for an ASS/SSA stream (its
+    /// extradata is the `[Script Info]` block and styles); `nil` for the
+    /// other text kinds, whose `\pos` — if an author pasted one in — has no
+    /// unit to be measured in.
+    static func playResolution(
+        of codecpar: UnsafePointer<AVCodecParameters>, kind: TextSubtitleConverter.Kind
+    ) -> TextSubtitleConverter.PlayResolution? {
+        guard kind == .ass, let extradata = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0
+        else { return nil }
+        return TextSubtitleConverter.playResolution(
+            fromASSHeader: Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size))
+        )
+    }
+
+    /// The cue-settings string the demuxer attached to a WebVTT packet, if
+    /// any — verbatim, as it followed the timing line in the source. Both the
+    /// WebVTT and the Matroska demuxers attach it; the payload itself never
+    /// carries it.
+    static func webVTTSettings(on packet: UnsafeMutablePointer<AVPacket>) -> String? {
+        var size = 0
+        guard let raw = av_packet_get_side_data(packet, AV_PKT_DATA_WEBVTT_SETTINGS, &size), size > 0
+        else { return nil }
+        return String(bytes: UnsafeRawBufferPointer(start: raw, count: Int(size)), encoding: .utf8)
     }
 
     /// Read and convert a whole sidecar file. The extension picks the parser;

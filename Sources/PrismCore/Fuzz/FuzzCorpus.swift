@@ -21,7 +21,119 @@ package enum FuzzSeeds {
         "text-subtitles": [
             Array(srtText.utf8), Array(vttText.utf8), Array(assEvent.utf8), tx3gSample,
         ],
+        "a53-captions": [captionedAccessUnit, xdsAccessUnit],
+        "container-layout": [matroskaHead, faststartMP4Head],
     ]
+
+    /// The head of a Matroska laid out the way mkvmerge writes one: EBML
+    /// header, Segment, a SeekHead pointing at Cues past the media, Tracks,
+    /// then the first Cluster. Everything the walk keys on is present, so a
+    /// mutation anywhere in it lands on a branch that runs.
+    package static let matroskaHead: [UInt8] = {
+        func vint(_ value: Int) -> [UInt8] {
+            var bytes: [UInt8] = [0x01]
+            for shift in stride(from: 48, through: 0, by: -8) {
+                bytes.append(UInt8((value >> shift) & 0xFF))
+            }
+            return bytes
+        }
+        func element(_ id: [UInt8], _ payload: [UInt8]) -> [UInt8] { id + vint(payload.count) + payload }
+        let cuesID: [UInt8] = [0x1C, 0x53, 0xBB, 0x6B]
+        let seekEntry = element([0x4D, 0xBB],
+            element([0x53, 0xAB], cuesID) + element([0x53, 0xAC], [0x00, 0x00, 0x04, 0x00]))
+        let children = element([0x11, 0x4D, 0x9B, 0x74], seekEntry)
+            + element([0x16, 0x54, 0xAE, 0x6B], [UInt8](repeating: 0x42, count: 48))
+            + element([0x1F, 0x43, 0xB6, 0x75], [UInt8](repeating: 0x11, count: 96))
+            + element(cuesID, [UInt8](repeating: 0x33, count: 24))
+        return element([0x1A, 0x45, 0xDF, 0xA3], [0x42, 0x86, 0x81, 0x01])
+            + element([0x18, 0x53, 0x80, 0x67], children)
+    }()
+
+    /// A faststart MP4's box sequence — `ftyp`, `moov`, `mdat` — so the walk
+    /// reaches the `.head` verdict and the header-length arithmetic that
+    /// follows it.
+    package static let faststartMP4Head: [UInt8] = {
+        func box(_ type: String, _ payload: [UInt8]) -> [UInt8] {
+            let total = payload.count + 8
+            return [UInt8((total >> 24) & 0xFF), UInt8((total >> 16) & 0xFF),
+                    UInt8((total >> 8) & 0xFF), UInt8(total & 0xFF)]
+                + Array(type.utf8) + payload
+        }
+        return box("ftyp", Array("isom".utf8) + [0, 0, 0, 0])
+            + box("moov", [UInt8](repeating: 0x02, count: 96))
+            + box("mdat", [UInt8](repeating: 0x03, count: 256))
+    }()
+
+    /// An H.264 Annex-B access unit carrying a complete A/53 caption SEI: a
+    /// pop-on caption loaded, addressed to row 15, printed and flipped onto the
+    /// screen, so a mutation anywhere in it lands somewhere the decoder
+    /// actually goes.
+    ///
+    /// No erase: every pair in one packet shares one timestamp, and an erase at
+    /// the same instant as the flip would close a zero-length interval and emit
+    /// nothing at all. The caption is left standing for the flush to close,
+    /// which is also the shape that exercises the open-cue cap.
+    package static let captionedAccessUnit: [UInt8] = captionAccessUnit([
+        (0, 0x14, 0x20),  // RCL — pop-on
+        (0, 0x14, 0x2E),  // ENM
+        (0, 0x14, 0x60),  // PAC: row 15, column 0
+        (0, 0x48, 0x49),  // "HI"
+        (0, 0x11, 0x37),  // special character: eighth note
+        (0, 0x14, 0x2F),  // EOC — the flip
+    ])
+
+    /// A field-2 access unit in which an XDS packet is interleaved with a live
+    /// roll-up caption: the packet opens, a caption control code interrupts it,
+    /// the packet resumes under its continuation class code and terminates.
+    ///
+    /// Without this seed a mutator reaches the XDS state machine only by
+    /// inventing a `0x01…0x0F` first byte at random, which almost never
+    /// survives the surrounding structure — and the branch that decides whether
+    /// a printable pair is a programme name or a caption would go unexplored.
+    package static let xdsAccessUnit: [UInt8] = captionAccessUnit([
+        (1, 0x01, 0x03),  // XDS: current class, programme-name type
+        (1, 0x4D, 0x4F),  // "MO" — payload, not caption text
+        (1, 0x14, 0x25),  // RU2 — a caption takes the field back
+        (1, 0x14, 0x60),  // PAC: row 15, column 0
+        (1, 0x48, 0x49),  // "HI"
+        (1, 0x02, 0x03),  // XDS resumes under the continuation class code
+        (1, 0x56, 0x49),  // "VI" — payload again
+        (1, 0x0F, 0x2A),  // XDS end, with its checksum
+    ])
+
+    /// An H.264 Annex-B access unit carrying `(cc_type, byte0, byte1)` triplets
+    /// as a complete A/53 caption SEI.
+    package static func captionAccessUnit(_ triplets: [(UInt8, UInt8, UInt8)]) -> [UInt8] {
+        // Odd parity, as the wire carries it.
+        func parity(_ byte: UInt8) -> UInt8 {
+            let value = byte & 0x7F
+            return value.nonzeroBitCount % 2 == 0 ? value | 0x80 : value
+        }
+        var userData: [UInt8] = [0xB5, 0x00, 0x31, 0x47, 0x41, 0x39, 0x34, 0x03]
+        userData.append(0x40 | UInt8(triplets.count & 0x1F))  // process_cc_data_flag, cc_count
+        userData.append(0xFF)                                 // em_data
+        for (type, byte0, byte1) in triplets {
+            userData += [0xF8 | 0x04 | (type & 0x03), parity(byte0), parity(byte1)]
+        }
+
+        let rbsp: [UInt8] = [0x04, UInt8(userData.count)] + userData + [0x80]
+        // Emulation prevention, so the seed is a bitstream and not merely a
+        // buffer that happens to parse.
+        var escaped: [UInt8] = []
+        var zeroRun = 0
+        for byte in rbsp {
+            if zeroRun >= 2 && byte <= 0x03 {
+                escaped.append(0x03)
+                zeroRun = 0
+            }
+            zeroRun = byte == 0 ? zeroRun + 1 : 0
+            escaped.append(byte)
+        }
+        // A slice NAL first: the SEI is not the first unit in a real access
+        // unit, and a walk that only ever sees it first is not being tested.
+        return [0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84]
+            + [0x00, 0x00, 0x01, 0x06] + escaped
+    }
 
     /// A `dec3` payload that declares the type-A extension — every field the
     /// parser walks, ending in `flag_ec3_extension_type_a = 1`, index 16.
@@ -147,8 +259,10 @@ package enum FuzzSeeds {
     Second
     """
 
+    /// Carries every override the translation reads: a `\pos` to normalize,
+    /// an `\an` to lift out, an italic toggle to turn into a tag.
     package static let assEvent =
-        "Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\\pos(4,5)}Hi\\Nthere"
+        "Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\\an8\\pos(4,5)}{\\i1}Hi{\\i0}\\Nthere"
 
     /// tx3g: 16-bit big-endian length, UTF-8 text, then a style box to ignore.
     package static let tx3gSample: [UInt8] = {

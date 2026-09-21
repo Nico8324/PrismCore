@@ -676,10 +676,14 @@ public enum SourceProbe {
         isBridgeable(codecID)
     }
 
-    public static func probe(url: URL, httpHeaders: [String: String] = [:]) throws -> SourceInfo {
+    public static func probe(
+        url: URL,
+        httpHeaders: [String: String] = [:],
+        input: PrismCoreInputFactory? = nil
+    ) throws -> SourceInfo {
         // The context is closed when the returned `ProbedSource` goes out of
         // scope here — this overload is for callers that only want the answer.
-        try open(url: url, httpHeaders: httpHeaders).info
+        try open(url: url, httpHeaders: httpHeaders, input: input).info
     }
 
     /// Probe a source and **keep the open context**, so a session over the same
@@ -719,13 +723,18 @@ public enum SourceProbe {
         url: URL,
         httpHeaders: [String: String] = [:],
         budget: Duration = SourceOpenTuning.probeBudget,
-        coordinatedHTTP: Bool = false
+        coordinatedHTTP: Bool = false,
+        input: PrismCoreInputFactory? = nil,
+        structure: SourceStructureExport = .none,
+        hints: SourceOpenHints? = nil
     ) async throws -> ProbedSource {
         try Task.checkCancellation()
         let outcome: Result<ProbedSource, any Error> = await withCheckedContinuation { continuation in
             let thread = ProducerThread(name: "cz.zmrhal.prismcore.probe") {
                 continuation.resume(returning: Result {
-                    try open(url: url, httpHeaders: httpHeaders, budget: budget, coordinatedHTTP: coordinatedHTTP)
+                    try open(url: url, httpHeaders: httpHeaders, budget: budget,
+                             coordinatedHTTP: coordinatedHTTP, input: input,
+                             structure: structure, hints: hints)
                 })
             }
             // Kept alive by its own closure until it exits; nothing to join.
@@ -739,11 +748,36 @@ public enum SourceProbe {
         return try outcome.get()
     }
 
+    /// - Parameter input: a host-supplied byte source (`PrismCoreInput`) for a
+    ///   transport libavformat cannot open itself. One instance is taken for
+    ///   this open; `url` is then only a naming hint for format probing, never
+    ///   fetched. `nil` (the default) keeps native FFmpeg I/O.
+    /// The `hints:`-first spelling of `open`, for callers that have a probe
+    /// document in hand and nothing else to say.
+    ///
+    /// `hints: nil` is `open(url:)` exactly — the same code, not a parallel
+    /// one. That property is what keeps the hinted path an addition to the
+    /// engine rather than a fork of it, and `SourceProbeHintsTests` pins it.
+    public static func open(_ url: URL, hints: SourceOpenHints?) throws -> ProbedSource {
+        try open(url: url, hints: hints)
+    }
+
+    /// - Parameter structure: how much of a byte-layout and index export to
+    ///   pay for. `.none` (the default) costs no I/O and reports
+    ///   `SourceStructure.unknown`; see `SourceStructureExport` for why the
+    ///   other two are opt-in.
+    /// - Parameter hints: what a caller already knows about this source. May
+    ///   make the open read *less*; may never make it read something else. A
+    ///   hint that turns out not to describe these bytes is recorded in
+    ///   `ProbedSource.hints` and otherwise ignored.
     public static func open(
         url: URL,
         httpHeaders: [String: String] = [:],
         budget: Duration = SourceOpenTuning.probeBudget,
-        coordinatedHTTP: Bool = false
+        coordinatedHTTP: Bool = false,
+        input inputFactory: PrismCoreInputFactory? = nil,
+        structure structureExport: SourceStructureExport = .none,
+        hints: SourceOpenHints? = nil
     ) throws -> ProbedSource {
         // The interrupt guard has to exist BEFORE the open — the blocking
         // reads check the URLContext's copy of the callback, taken at
@@ -752,8 +786,17 @@ public enum SourceProbe {
         // inherits this very context (see `ReadInterruptGuard`).
         let interruptGuard = ReadInterruptGuard()
         var input: UnsafeMutablePointer<AVFormatContext>? = interruptGuard.makeContext()
-        if coordinatedHTTP, ["http", "https"].contains(url.scheme?.lowercased() ?? ""), let input {
-            do { try interruptGuard.installHTTPInput(on: input, url: url, headers: httpHeaders) }
+        // A host-supplied input wins over the coordinated HTTP reader: the
+        // host asked to provide the bytes itself, and the two would otherwise
+        // both claim `pb`.
+        if let inputFactory, let input {
+            do { try interruptGuard.installCustomInput(on: input, factory: inputFactory) }
+            catch { avformat_free_context(input); throw error }
+        } else if coordinatedHTTP, ["http", "https"].contains(url.scheme?.lowercased() ?? ""), let input {
+            // The only place a sizing hint can still change anything: the
+            // reader has to be built with it, because the first read happens
+            // inside `avformat_open_input` below.
+            do { try interruptGuard.installHTTPInput(on: input, url: url, headers: httpHeaders, hints: hints) }
             catch { avformat_free_context(input); throw error }
         }
 
@@ -779,7 +822,10 @@ public enum SourceProbe {
                 "avformat_open_input"
             )
         } catch {
-            throw Failure.openFailed(error)
+            // `originFailure` first: over the coordinated reader the libav*
+            // code is always `-EIO`, and wrapping that is how a 403 used to
+            // reach a host as "Input/output error".
+            throw Failure.openFailed(interruptGuard.customInputFailure ?? interruptGuard.originFailure ?? error)
         }
         guard let input else { throw Failure.noStreams }
         let openedAt = clock.now
@@ -805,7 +851,7 @@ public enum SourceProbe {
                 avformat_find_stream_info(input, nil), "avformat_find_stream_info"
             )
         } catch {
-            throw closeAndThrow(error)
+            throw closeAndThrow(interruptGuard.customInputFailure ?? interruptGuard.originFailure ?? error)
         }
         // `find_stream_info` swallows aborted reads: cut off mid-analysis it
         // returns success with half-filled parameters, and a half-analysed
@@ -813,8 +859,16 @@ public enum SourceProbe {
         // The clock is the honest witness — still-armed and expired means the
         // analysis cannot be trusted, whatever it returned.
         if interruptGuard.shouldInterrupt {
+            // A transport that spent the whole budget failing gets named as
+            // the failure it was: the expiry is the symptom, the host's own
+            // error or the origin's 429 is the reason, and only the reason
+            // tells a host what to do next. Most specific first — the host's
+            // thrown error outranks the origin's classification, which
+            // outranks the expiry — as on every other exit from this open.
             throw closeAndThrow(Failure.openFailed(
-                FFmpegError(code: swift_AVERROR_EXIT(), operation: "probe budget exhausted")
+                interruptGuard.customInputFailure
+                    ?? interruptGuard.originFailure
+                    ?? FFmpegError(code: swift_AVERROR_EXIT(), operation: "probe budget exhausted")
             ))
         }
         let analyzedAt = clock.now
@@ -827,6 +881,24 @@ public enum SourceProbe {
         let info = describe(input: input, verifyingInterlace: true)
         let describedAt = clock.now
 
+        // Both after `describe`, and in this order. The structure export may
+        // move the read position (the index load is a seek to the tail and
+        // back), and `describe`'s interlace verification decodes packets from
+        // wherever the analysis left off — running the export first would
+        // change what those frames are. The hint evaluation reads the stream
+        // list and the transport's validator, neither of which the export
+        // touches.
+        let structure = SourceStructureReader.read(
+            input: input,
+            formatName: info.formatName,
+            videoStreamIndex: info.video.map { Int32($0.streamIndex) },
+            export: structureExport,
+            interruptGuard: interruptGuard
+        )
+        let hintOutcome = HintEvaluation.evaluate(
+            hints: hints, input: input, interruptGuard: interruptGuard
+        )
+
         // A budget that expired mid-verification latched AVERROR_EXIT in the
         // AVIOContext, and the adopting producer's first read would get it
         // verbatim. The verification itself degraded gracefully (an aborted
@@ -837,7 +909,8 @@ public enum SourceProbe {
         }
 
         return ProbedSource(
-            info: info, url: url, httpHeaders: httpHeaders,
+            info: info, structure: structure, hints: hintOutcome,
+            url: url, httpHeaders: httpHeaders, inputFactory: inputFactory,
             context: input, interruptGuard: interruptGuard,
             timing: ProbeTiming(
                 open: probeStart.duration(to: openedAt),

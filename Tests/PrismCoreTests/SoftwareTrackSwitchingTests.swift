@@ -72,6 +72,7 @@ struct SoftwareTrackSwitchingTests {
         try #require(tracks.count == 2)
         #expect(tracks[0].streamIndex == 1)
         #expect(tracks[0].language == "eng")
+        #expect(tracks[0].title == "English")
         #expect(tracks[0].channelCount == 2)
         #expect(tracks[1].streamIndex == 2)
         #expect(tracks[1].language == "ces")
@@ -178,6 +179,122 @@ struct SoftwareTrackSwitchingTests {
 
         #expect(!select(pipeline, streamIndex: 0), "stream 0 is the video track")
         #expect(!select(pipeline, streamIndex: 7), "out of range")
+        #expect(!select(pipeline, streamIndex: Int.max))
+        #expect(!select(pipeline, streamIndex: Int.min))
+        #expect(!select(pipeline, streamIndex: -1))
         #expect(pipeline.selectedAudioStreamIndex == 1)
+    }
+
+    @Test("A switch at a nonzero playhead preserves output delay and supports switching back",
+          arguments: [-0.5, 0.0, 0.5])
+    func switchesAtPresentationTime(delay: Double) throws {
+        let video = RecordingVideoSink()
+        let audio = RecordingAudioSink()
+        let timeline = RecordingTimeline()
+        let pipeline = SoftwarePlaybackPipeline(videoSink: video, audioSink: audio,
+            timeline: timeline, allowHardwareDecode: false, audioDelaySeconds: delay)
+        try pipeline.load(url: try fixture("h264_multi_audio.mkv"))
+        defer { pipeline.stop() }
+        pipeline.waitForFeedQueue()
+        for _ in 0..<4 { video.playOut(); audio.playOut() }
+        timeline.setRate(0, time: CMTime(seconds: 2, preferredTimescale: 1_000))
+        let changes = timeline.rateChanges.count
+        for index in [2, 1, 2] {
+            #expect(select(pipeline, streamIndex: index))
+            for _ in 0..<3 { video.playOut(); audio.playOut() }
+            try #require(!audio.enqueued.isEmpty)
+            #expect(audio.enqueued.allSatisfy {
+                CMSampleBufferGetPresentationTimeStamp($0) + CMSampleBufferGetDuration($0)
+                    > timeline.currentTime
+            })
+            let firstPTS = CMSampleBufferGetPresentationTimeStamp(audio.enqueued[0])
+            // AAC/AC-3 frame rounding may straddle the playhead, but a positive
+            // delay must not introduce an extra half-second hole after switching.
+            #expect(firstPTS <= timeline.currentTime + CMTime(seconds: 0.04, preferredTimescale: 1_000))
+            #expect(audio.enqueued.allSatisfy { channelCount(of: $0) == (index == 2 ? 6 : 2) })
+        }
+        #expect(timeline.rateChanges.count == changes)
+        #expect(video.flushes.isEmpty)
+    }
+
+    @Test("Switching cancels an EOF boundary, including a callback already queued")
+    func switchInvalidatesOldEndBoundary() throws {
+        let (pipeline, video, audio, timeline) = makePipeline()
+        try pipeline.load(url: try fixture("h264_multi_audio.mkv"))
+        defer { pipeline.stop() }
+        pipeline.waitForFeedQueue()
+        for _ in 0..<100 { video.playOut(); audio.playOut() }
+        let oldBoundary = try #require(timeline.pendingBoundary)
+        timeline.setRate(0, time: CMTime(seconds: 2, preferredTimescale: 1_000))
+        let gate = DispatchSemaphore(value: 0)
+        pipeline.blockFeedQueueForTesting(until: gate)
+        pipeline.selectAudioTrack(streamIndex: 2)
+        oldBoundary.fire()
+        gate.signal()
+        pipeline.waitForFeedQueue()
+        #expect(pipeline.state == .paused)
+        #expect(pipeline.selectedAudioStreamIndex == 2)
+        #expect(timeline.cancelledBoundaries > 0)
+        #expect(CMTimeGetSeconds(pipeline.currentTime) == 2)
+    }
+
+    @Test("A refused audio rewind at EOF preserves the audio-only end boundary")
+    func refusedRewindPreservesAudioOnlyEndBoundary() throws {
+        let audio = RecordingAudioSink()
+        let timeline = RecordingTimeline()
+        let seekRefused = LockedResult()
+        let pipeline = SoftwarePlaybackPipeline(
+            videoSink: RecordingVideoSink(), audioSink: audio, timeline: timeline,
+            allowHardwareDecode: false, demuxSeek: { _, _ in
+                seekRefused.set(true)
+                return -1
+            })
+        try pipeline.load(url: fixture("audio_only_multi.mka"))
+        defer { pipeline.stop() }
+        pipeline.waitForFeedQueue()
+        for _ in 0..<100 where timeline.pendingBoundary == nil { audio.playOut() }
+        let oldBoundary = try #require(timeline.pendingBoundary)
+        #expect(oldBoundary.time > timeline.currentTime)
+        #expect(!audio.queued.isEmpty)
+        seekRefused.set(false)
+
+        let gate = DispatchSemaphore(value: 0)
+        pipeline.blockFeedQueueForTesting(until: gate)
+        pipeline.selectAudioTrack(streamIndex: 1)
+        oldBoundary.fire()
+        gate.signal()
+        pipeline.waitForFeedQueue()
+
+        #expect(seekRefused.get() == true)
+        #expect(pipeline.selectedAudioStreamIndex == 1)
+        #expect(pipeline.state == .paused)
+        let replacementBoundary = try #require(timeline.pendingBoundary)
+        #expect(replacementBoundary.time == oldBoundary.time)
+        timeline.reachBoundary()
+        pipeline.waitForFeedQueue()
+        #expect(pipeline.state == .ended)
+        #expect(timeline.currentTime == oldBoundary.time)
+    }
+
+    @Test("Selection is refused before load and after stop")
+    func refusesSelectionOutsidePlayback() throws {
+        let (pipeline, _, _, _) = makePipeline()
+        #expect(!select(pipeline, streamIndex: 1))
+        try pipeline.load(url: try fixture("h264_multi_audio.mkv"))
+        pipeline.stop()
+        #expect(!select(pipeline, streamIndex: 2))
+        #expect(pipeline.selectedAudioStreamIndex == nil)
+    }
+
+    @Test("Stopping an adopted pipeline permanently cancels its seek/read guard")
+    func stopPermanentlyCancelsAdoptedReadGuard() throws {
+        let probed = try SourceProbe.open(url: fixture("h264_multi_audio.mkv"))
+        let (pipeline, _, _, _) = makePipeline()
+        try pipeline.load(probed: probed)
+        pipeline.stop()
+        let guardBox = probed.interruptGuard
+        guardBox.disarm()
+        guardBox.arm(budget: .seconds(60))
+        #expect(guardBox.shouldInterrupt)
     }
 }

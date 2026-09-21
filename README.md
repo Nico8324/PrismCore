@@ -47,8 +47,7 @@ MPEG-2, VC-1, interlaced H.264), there is a software path — libavcodec into
 - **[Aether](https://aetherplayer.com)** — a native media player for Apple
   platforms. PrismCore is the engine every non-Apple container routes through:
   ahead of libmpv, behind plain AVFoundation for the files it can already open.
-  Routing arrived in Aether 1.1.0 behind a developer toggle and is on by
-  default from 1.1.1.
+  The remux path is on by default there; the software path is opt-in.
 
 Shipping something on PrismCore? Open an issue and it gets listed here.
 
@@ -64,20 +63,23 @@ Shipping something on PrismCore? Open an issue and it gets listed here.
 | Dolby Atmos | EAC3+JOC **stream-copied**, and the `dec3` box's TS 103 420 type-A extension re-applied to the init segment — without it AVFoundation plays the same bitstream as plain DD+ |
 | Audio (copy) | AAC, AC3, EAC3, FLAC, ALAC — bit-for-bit |
 | Audio (bridge) | TrueHD / MLP / DTS / DTS-HD MA / MP3 / MP2 / Opus / Vorbis / PCM → EAC3 5.1, 128 kbps per channel. Needs an FFmpeg build with the **`eac3` encoder**; without it those sources take the software path instead, which decodes them itself |
-| Multi-audio | Every viable track becomes an HLS alternate rendition with its language, name and channel count, so AVPlayer gets a real `AVMediaSelectionGroup` to switch on. The software path switches too: `SoftwarePlaybackPipeline.selectAudioTrack(streamIndex:)` swaps the decoder mid-playback without touching the clock or the picture |
-| Dialogue boost | Opt-in (`dialogueBoost:` on the session): extra "Dialogue Boost" renditions derived from the default track — decoded, centre channel favoured (bed −6 dB / −12 dB), re-encoded to EAC3 — marked `public.accessibility.enhances-speech-intelligibility` so hosts find them by characteristic. Engine-side because AVFoundation ignores `audioMix`/audio taps on HLS items. The base track stays bit-for-bit (Atmos included). Needs the `eac3` encoder and a centre-channel source; stereo would need `dialoguenhance`, which current builds don't ship |
-| Subtitles (text) | SubRip / ASS / SSA / WebVTT / mov_text converted during the remux read into segmented WebVTT renditions, cut on the video's own boundaries — so text survives PiP and AirPlay instead of living in a host overlay. External `.srt` / `.vtt` register as first-class renditions |
+| Multi-audio | Every viable track becomes an HLS alternate rendition with its language, name and channel count, so AVPlayer gets a real `AVMediaSelectionGroup` to switch on. `preferredAudioLanguage:` decides which one is `DEFAULT`, so playback starts in the right language instead of switching visibly after it. The software path switches too: `SoftwarePlaybackPipeline.selectAudioTrack(streamIndex:)` swaps the decoder mid-playback without touching the clock or the picture |
+| Dialogue boost | Opt-in (`dialogueBoost:` on the session): extra "Dialogue Boost" renditions derived from the default track — which is the `preferredAudioLanguage:` track when one matched — decoded, centre channel favoured (bed −6 dB / −12 dB), re-encoded to EAC3 — marked `public.accessibility.enhances-speech-intelligibility` so hosts find them by characteristic. Engine-side because AVFoundation ignores `audioMix`/audio taps on HLS items. The base track stays bit-for-bit (Atmos included). Needs the `eac3` encoder and a centre-channel source; stereo would need `dialoguenhance`, which current builds don't ship |
+| Subtitles (text) | SubRip / ASS / SSA / WebVTT / mov_text converted during the remux read into segmented WebVTT renditions, cut on the video's own boundaries — so text survives PiP and AirPlay instead of living in a host overlay. ASS inline italics / bold / underline become WebVTT tags; `\an` / `\pos` placement and a WebVTT track's own cue settings ride the timing line, so a caption authored at the top of the frame stays there. External `.srt` / `.vtt` register as first-class renditions |
 | Subtitles (bitmap) | PGS / DVB / DVD read by on-device Vision OCR into the same rendition machinery. Lossy by design — typography dies, text survives — and the raw tracks stay surfaced for a host that wants to draw them pixel-accurately |
+| Closed captions (CEA-608) | Captions embedded in the **video** — A/53 `cc_data` in H.264 / HEVC SEI, the form US broadcast recordings, MPEG-TS captures and many disc rips carry — decoded during the remux read into the same WebVTT rendition machinery, so CC1…CC4 appear as real `AVMediaSelectionOption`s and survive PiP, AirPlay and external display. Pop-on, roll-up and paint-on, the full basic / special / extended character sets, labelled by channel and by the video track's language where it declares one. Caption bytes are reordered from decode to presentation order before decoding, which is what keeps them from drifting on any source with B-frames. A bounded packet scan before the first segment decides whether a source has captions at all — one that does not pays nothing in the copy loop. Styling (colour, italics, underline) and cell-accurate positioning are dropped on purpose, so the system caption renderer applies the viewer's own accessibility style |
+| Closed captions (CEA-708) | **Not decoded.** DTVCC packets are recognised in `cc_data` and skipped. A 708 service decode means the window model — eight windows with their own anchors, sizes, pen states and row locks — and a partial one puts text on screen in the wrong place while presenting itself as a caption track. Because effectively every 708 encoder also emits the 608 compatibility bytes, this costs nothing on real content; a stream that carries *only* 708 gets no caption rendition rather than a broken one |
 | Seek & cache | Keyframe-aligned segment plan published upfront, demand-driven production with re-anchoring, absolute-`tfdt` continuity across restarts, byte-budgeted retention (1 GiB default; an evicted segment is reproduced on demand, so the budget bounds disk, not seekability) |
 | Chapters | Matroska `Chapters` / MP4 chapter tracks reported as `SourceInfo.chapters` and `PrismCoreSession.chapters` (title + start/end seconds) — HLS cannot carry them, so they are the host's to draw as timeline markers and skip controls |
 | Display | tvOS HDMI handshake driven by the engine: `preferredDisplayCriteria` programmed and settled **before** the item is loaded, which is the only ordering tvOS accepts for HDR HLS |
 | Scrub previews | `SeekPreviewService` decodes the keyframe covering any position into a `CGImage` for a custom player HUD — its own context, CPU-only, cached per keyframe, and independent of which engine is playing. The trick-play answer for sources with no server-generated previews |
 | Streaming | HTTP headers ride the demux connection (a Plex token, a WebDAV authorization), reconnect on dropped connections |
+| Custom input | A host that holds the bytes itself — an SMB mount through its own client, a debrid/torrent session, an encrypted store, a file inside a disc image — implements `PrismCoreInput` (`read` / `seek` / `length`) and passes a factory as `input:` to the session, the probe or `SeekPreviewService`. One instance per open, so the probe, the producer and a scrub preview never share a cursor; host errors surface as `PrismCoreInputError`. An input with no `length` is refused (`.notSeekable`) rather than serving a plan it cannot honour. Omit it and the engine reads exactly as before |
 
 ## Quick start
 
 ```swift
-.package(url: "https://github.com/Wenzlik/PrismCore.git", from: "1.0.0")
+.package(url: "https://github.com/Wenzlik/PrismCore.git", from: "3.0.0")
 ```
 
 One call probes the source, picks the path and hands back something already
@@ -119,9 +121,136 @@ The URL is a **master** playlist when the source has audio (that is where the
 selectable renditions live) and a media playlist when it hasn't. Treat it as
 opaque: the shape is a property of the source, not of the API.
 
+### Watching startup happen
+
+`start()` can take seconds on a slow origin. Register **before** it and you get
+the stages as they land, each with the time since the call:
+
+```swift
+let session = try PrismCoreSession(url: mkvURL, display: .current())
+
+let checkpoints = try await session.startupCheckpoints()   // before start()
+Task {
+    for await mark in checkpoints {
+        switch mark.phase {
+        case .sourceOpened:                      status = "Opening…"
+        case .streamInfoResolved(let info):      status = info.video?.codecName ?? "…"
+        case .segmentPlanReady(let origin, _):   status = origin == .sequential
+                                                     ? "Indexing on first play…" : "Preparing…"
+        case .firstVideoSegmentWritten:          status = "Starting playback…"
+        case .playlistServable:                  break
+        }
+        log("\(mark.elapsed) \(mark.phase)")    // where the twenty seconds went
+    }
+    // The stream ends here — on success, on failure, and on stop().
+}
+
+let playlistURL = try await session.start()
+```
+
+There is no percentage, on purpose: nothing can know in advance how long a probe
+over a slow origin takes, and this engine does not report numbers it cannot
+measure. Stages with timestamps are things that happened.
+
 `PrismCoreEngine.decide(for:)` is exposed separately, so a host can ask which
 path a source would take — and unit-test its own routing — without standing up
 either engine.
+
+### Preferred audio and subtitle language
+
+A host that knows which language the viewer wants says so when it builds the
+session, and the served master starts in it:
+
+```swift
+let session = try PrismCoreSession(
+    url: mkvURL,
+    display: .current(),
+    preferredAudioLanguage: "cs",        // "cze", "ces", "cs-CZ" mean the same
+    preferredSubtitleLanguage: "cs"
+)
+```
+
+Without them the rendition that carries `DEFAULT` is whichever track the
+*source* listed first, so a viewer who wants Czech mounts the item, hears
+English, and switches — a visible wrong-language moment at every start, and on
+the remux path a switch also costs a rendition fetch.
+
+- **Audio.** The matching track becomes the master's `DEFAULT` rendition, above
+  every other signal the engine uses to guess (the container's *original* and
+  *default* flags, the demuxer's "best stream"). Because dialogue boost derives
+  from the default track, it derives from this one.
+- **Subtitles.** The matching rendition is the only one ever marked
+  `DEFAULT=YES,AUTOSELECT=YES`, which is what makes AVKit engage it at load
+  rather than starting with subtitles off. A full rendition wins the flag over
+  a forced one of the same language; `FORCED` itself is untouched. Don't pass
+  this together with `setTimedTextCueHandler` unless the host suppresses its
+  own overlay — otherwise AVKit and the host both draw the cues.
+- **Matching is tolerant.** ISO 639-2/B (`cze`), 639-2/T (`ces`) and 639-1
+  (`cs`) are one language; a bare tag matches a regioned one (`pt` ↔ `pt-BR`)
+  and an exact region wins over a bare one; `und` and an empty tag are not
+  languages and match nothing.
+- **A no-match is a no-op**, never an error and never an empty selection: the
+  source's own default stands. Nothing is ever dropped — every viable track is
+  still an alternate rendition — and no decode, bridge or stream-copy decision
+  changes. A preferred track this build can neither copy nor bridge is passed
+  over, because a rendition AVPlayer cannot play is worse than the wrong
+  language.
+
+### Software track menus and captions
+
+`SoftwarePlaybackPipeline` publishes the probe's metadata on the live player.
+Audio selection works while playing or paused; the decoder is opened before
+replacing the current one, the audio renderer is flushed, and the clock and
+video renderer stay in place. The bounded rewind uses the playhead and the
+configured audio delay. A refused rewind joins at the demux read position;
+network and decoder latency can leave an audible gap. No gapless claim is made.
+
+```swift
+let audioTracks = pipeline.selectableAudioTracks   // language, title, channelCount
+let subtitleTracks = pipeline.selectableSubtitleTracks // embedded text only
+let audioSelection = pipeline.selectedAudioStreamIndex
+let subtitleSelection = pipeline.selectedSubtitleStreamIndex // nil = Off
+
+if let track = audioTracks.first {
+    pipeline.selectAudioTrack(streamIndex: track.streamIndex) { accepted in
+        // Completion is on the feed queue. Dispatch UI work to the main queue.
+    }
+}
+pipeline.selectSubtitleTrack(streamIndex: subtitleTracks.first?.streamIndex)
+pipeline.selectSubtitleTrack(streamIndex: nil)     // Off
+
+// In the host's periodic UI update, replace the overlay with this snapshot.
+// An empty array means clear it; overlapping cues can produce several entries.
+let captions = pipeline.activeSubtitleCues
+```
+
+Use source **stream indices**, not positions in the menu array. Read the settled
+selection after completion. A same-track selection succeeds without a flush;
+invalid indices and calls outside paused/playing state are refused. An audio
+open failure preserves the current track. A later read/decode failure reports
+`false` and `.failed`; inspect `failureError`. Do not call synchronous `stop()`
+or `load()` from feed-queue callbacks.
+
+Text starts Off, including forced tracks: the host chooses its language policy.
+All supported text packets use the existing HLS text converter and are retained
+in a bounded look-ahead cache, so selecting an already-read caption (or Off)
+does not seek, flush A/V, or start a paused clock. `TimedTextCue` timestamps here
+use the **source axis**, matching `pipeline.currentTime`; remux cue callbacks
+use the origin-rebased AVPlayer axis. Cue payloads can contain WebVTT inline tags
+and entities; the host supplies rendering. `TimedTextCue.placement` carries the
+placement the source asked for (`TextCuePlacement`: a numpad alignment, plus an
+anchor point from `\pos` or a WebVTT `line:`/`position:` pair) — `nil` for the
+host's default, which is what nearly every cue wants. Polling clears expired
+cues even at EOF or while the demuxer is waiting for data.
+
+The cache holds at most 1,024 cues / 1 MiB of UTF-8 text across all tracks;
+expired cues are removed and excess incoming cues are dropped. Cues need valid
+PTS and positive duration. Seeking clears the cache and repopulates from the
+landing keyframe: a long caption whose packet precedes that keyframe may be
+missing until the next cue. Bitmap/OCR and external subtitle selection remain
+outside this software surface. ASS colours, fonts, karaoke and drawing overrides
+are not preserved by the text converter — only the inline styles and placement
+WebVTT has words for.
 
 ### Host setup on tvOS
 
@@ -158,6 +287,43 @@ Built-in panels (iPhone, iPad, Mac) engage HDR on demand and skip all of this.
 `PrismCoreSession.isMasterRejection(_:)` plus `makeMuxedFallbackSession()` stays
 as the backstop for the one state no API can prove: Match Content switched off on
 an HDR-capable panel.
+
+### Knowing why a session failed
+
+`PrismCoreError.classify(_:)` turns anything this engine (or the host's
+`AVPlayer`) threw into one machine-readable case, so a failure can be acted on
+rather than logged:
+
+```swift
+do {
+    let playlist = try await session.start()
+    …
+} catch {
+    switch PrismCoreError.classify(error) {
+    case .originRefused:                     await refreshToken()
+    case .originRateLimited(_, let after, _): await backOff(after ?? 5)
+    case .videoCodecNotRemuxable:            routeToSoftwarePath()
+    case .masterRejectedByPlayer:            try await session.makeMasterRejectionFallbackSession()
+    default:                                 show(error)
+    }
+}
+```
+
+The cases: `originRefused` (401/403/407), `originRateLimited` (429/503/509, with
+the origin's own `Retry-After`), `originUnreachable`, `noVideoStream`,
+`videoCodecNotRemuxable`, `videoCodecUnplayable`, `startupBudgetExpired`,
+`masterRejectedByPlayer`, `workDirectoryOutOfSpace`, `ffmpeg` (raw code and
+message, for the libav* failures with no honest mapping) and `unknown`.
+`retryability` is three-valued — `.retryable`, `.permanent`, `.unknown` — because
+for a startup budget or a full volume this engine genuinely cannot say, and a
+`Bool` would have to invent an answer. After startup, `session.remuxFailure` is
+the same classification of `session.remuxError`.
+
+Every case is something the engine observed. Where it cannot separate two
+situations they share one case: an origin that never answered and one that
+vanished mid-session are both `originUnreachable`, because the evidence at the
+failure site is identical — the host knows which it was from whether `start()`
+had returned.
 
 ## How it works
 
@@ -204,6 +370,64 @@ an idle timeout), `GET` + `HEAD`, and pipelined requests. Payloads come from a
 2 s — keeping response headers inside AVPlayer's ~3.5 s media watchdog window. A
 pending serve that ultimately fails aborts the connection (a truncated transfer
 makes AVPlayer retry) instead of framing a cacheable empty `200`.
+
+### AirPlay to an external receiver
+
+The server binds `127.0.0.1` by default, which is right for playback on the
+device and wrong for AirPlay: when the host routes to an Apple TV or an
+AirPlay 2 TV, the **receiver** fetches the playlist and every segment itself,
+and `127.0.0.1` resolves to the receiver. The master playlist — native WebVTT
+renditions, alternate audio, the lot — is simply unreachable.
+
+Opt in per session when, and only when, that is the route:
+
+```swift
+let session = try PrismCoreSession(
+    url: sourceURL,
+    display: .current(),
+    reachability: .localNetworkUnencryptedForAirPlay
+)
+let playlist = try await session.start()
+// http://10.0.0.7:51234/<32-char token>/master.m3u8
+```
+
+- **Interface** — `getifaddrs`, IPv4 only, up *and* running, no loopback and no
+  point-to-point links; tunnels (`utun`, `ipsec`, `ppp`), the peer-to-peer
+  radios (`awdl`, `llw`, `nan`), Apple silicon's internal `anpi` links and
+  self-assigned `169.254/16` addresses are excluded outright. A real `en`
+  interface wins, then anything unrecognized, and an Internet Sharing or VM
+  `bridge` last; ties break on the interface's own number, so the choice is
+  deterministic. The server binds that one address rather than `0.0.0.0`, so a
+  VPN or a shared-internet bridge is never exposed. No interface left →
+  `start()` throws `LoopbackHTTPServer.NoLocalNetworkInterface` instead of
+  publishing a URL nobody can reach.
+- **IPv6 is deliberately not supported.** A literal needs brackets in a URL, a
+  link-local one needs a `%zone` receivers handle inconsistently, and the
+  platform rotates temporary privacy addresses on its own schedule — which
+  would make "the address changed mid-session" routine. Every AirPlay receiver
+  on a home network is reachable over IPv4.
+- **Token** — 192 bits from the system CSPRNG, base64url, as the first path
+  component of every URL (`X-PrismCore-Token` is accepted too, for clients that
+  can set headers; an AirPlay receiver cannot). Everything without it is `404`,
+  ahead of the method check, and a wrong token is indistinguishable from a
+  wrong path so the server is not an oracle. The token buys the session's
+  namespace and nothing else: path traversal, the method restriction, the
+  request-line and header caps, the per-connection budget and the idle timeout
+  all behave exactly as on loopback.
+- **The address changing mid-session** (Wi-Fi to Ethernet, a DHCP change, the
+  radio dropping) is watched with `NWPathMonitor`. The server does **not**
+  re-bind — the URL is already baked into the `AVPlayerItem` and every segment
+  reference — it answers `503` and publishes `session.serviceAddress ==
+  .addressLost(…)`. A host that sees that should stop the session and start a
+  new one. An address that comes back resumes serving.
+
+**The residual risk, plainly: this is cleartext HTTP on the local network.**
+Anyone on that LAN who can observe the traffic sees the token, the playlist and
+the media bytes, and anyone holding the token can fetch the session's segments
+for as long as it runs. The token makes the server unguessable, not private.
+Enable the mode for the duration of an AirPlay route on a network the user
+trusts, and stop the session when the route ends. Sessions that never AirPlay
+should never enable it — the default is unchanged and unreachable off-device.
 
 ### Design notes
 
@@ -261,6 +485,57 @@ PrismCore writes cue times relative to the presentation origin and repeats
 interlaced around progressive frames, so the probe decodes a handful of frames before
 believing the flag. Evicting those from the native path would trade hardware decode
 and Atmos passthrough for deinterlacing nothing.
+
+### Probe hints: describing a source, and being told about one
+
+Two read-only additions for hosts whose media comes from a server that has
+already analysed the same file. Both are opt-in and both default to today's
+behaviour exactly.
+
+**Exporting.** `SourceProbe.open(url:structure:)` fills
+`ProbedSource.structure` with the container's byte layout and seek index —
+where the metadata region ends, where the first media element starts, whether
+the container's index lives at the head or the tail, and (at `.full`) the
+index itself with a verdict on whether it reaches the end of the file. The
+export is for an out-of-process probe reading a local descriptor: `.layout`
+re-reads the head and `.full` also pays an index-load seek, which is why
+`.none` is the default and a routing probe over a network pays neither.
+
+Nothing in it is inferred. Every field is optional or has an `unknown` case,
+and `IndexLocation.none` / `IndexCompleteness.absent` need positive evidence
+that a container declares no index — an empty index table at open is not that
+evidence. A consumer across a network cannot tell a measurement from a
+plausible guess, so this side does not make guesses.
+
+```swift
+let probed = try SourceProbe.open(url: url, structure: .full)
+probed.structure.firstClusterOffset   // Int64?  — where media begins
+probed.structure.indexLocation        // .head / .tail / .none / .unknown
+probed.structure.index?.completeness  // .complete / .partial / .absent / .unknown
+```
+
+**Consuming.** `SourceProbe.open(_:hints:)` takes what a caller already knows.
+`hints: nil` is the unhinted open, unchanged.
+
+```swift
+let probed = try SourceProbe.open(url, hints: SourceOpenHints(
+    headerBytes: 4312, firstClusterOffset: 5184, indexLocation: .tail
+))
+probed.hints.firstReadBytes   // what the first read was actually bounded to
+probed.hints.rejections       // why a hint was not used — never an error
+```
+
+A hint may make this engine do *less* work; it may never make it skip a check.
+`headerBytes` and `firstClusterOffset` size the first read and nothing else, so
+a stale value costs a read rather than a wrong parse. `expectedValidator` and
+`keyframes` exist and are validated in full — the transport's `ETag` is checked
+once before any byte is delivered, and a supplied map is checked against the
+stream, its exact time base, monotonicity, a cap and the container's bounds —
+but a surviving map is carried on `ProbedSource.hints`, not yet consumed by the
+planner, and is **never** written into the local keyframe sidecar. A map
+computed elsewhere and a map harvested by this machine's own read of the file
+are the same numbers with different provenance, and the disk must not lose the
+difference.
 
 ## Non-goals
 
@@ -337,7 +612,7 @@ not. Since 1.0.0 that contract is a promise: breaking changes bump the major,
 features the minor, fixes the patch — so the ordinary pin is the right one:
 
 ```swift
-.package(url: "https://github.com/Wenzlik/PrismCore.git", from: "1.0.0")
+.package(url: "https://github.com/Wenzlik/PrismCore.git", from: "3.0.0")
 ```
 
 Hosts that archive through Xcode Cloud (or any CI with automatic resolution
@@ -412,8 +687,10 @@ stand-ins, including the case where a stalled video renderer must not starve aud
 Audio track switching is proven the same way: the multi-audio fixture's tracks differ
 in channel count (AAC stereo vs AC-3 5.1), so the renderer-side buffers *show* which
 track is playing, and the video assertions show the switch never touched the picture.
-What no headless test can assert is that a frame reached a display. Still open there:
-subtitles (rendering and, with it, subtitle track selection) and frame-accurate seek.
+Text selection is tested against embedded full/forced subtitle tracks, including
+paused switching, Off, expiry and a backward seek. What no headless test can
+assert is that a frame reached a display or an audio switch was inaudible on a
+device. Caption rendering belongs to the host; frame-accurate seek remains open.
 
 ## Cache, audio diagnostics and HTTP policy
 
@@ -445,10 +722,45 @@ output during priming is normal. A terminal, completely drained silent bridge
 raises `AudioBridgeFailure.producedNoAudio` through the session error path.
 The software pipeline exposes `.decoded` only after its decoder opens.
 
-Audio delay is fixed at construction and preserved by fallback factories.
-Changing it during playback requires a replacement session and a host-managed
-handover at the current position. Both positive and negative offsets are bounded
-to two seconds; this does not add an AVPlayer transport controller to PrismCore.
+Audio delay is fixed at construction and carried by every clone. Changing it
+mid-title means a replacement session and a host-managed handover at the current
+position — see *Changing a setting mid-title* below. Both positive and negative
+offsets are bounded to two seconds; this does not add an AVPlayer transport
+controller to PrismCore.
+Audio delay can be changed while the title plays — it is a lip-sync control —
+and is preserved by fallback factories. Both positive and negative offsets are
+bounded to two seconds, and a non-finite value becomes zero. The two paths take
+a new value up differently, and each reports which:
+
+```swift
+switch session.setAudioDelaySeconds(0.2) {        // remux path
+case .pendingReanchor: break   // accepted; in force at the producer's re-anchor
+case .inForce: break           // only before start()
+case .unsupported: break       // no plan (live, or no usable index): unchanged
+case .sessionStopped: break
+}
+session.audioDelaySeconds          // what is being SERVED right now
+session.pendingAudioDelaySeconds   // a request not yet in force, else nil
+
+pipeline.setAudioDelaySeconds(0.2) // software path: in force when it has run
+```
+
+On the remux path the engine is serving fMP4 segments written with the previous
+offset, and the offset moves audio dts — which cannot step backwards inside a
+fragment the muxer is already writing. So the call asks the producer to
+re-anchor at the playhead; at that re-anchor the new offset goes in force and
+every segment written with the old one is discarded, so a later seek cannot
+serve audio at the offset the viewer corrected away from. The picture re-buffers
+while production catches up, and AVPlayer plays whatever it had already buffered
+at the old offset first — the host should say so in its UI. `audioDelaySeconds`
+names only what is in force.
+
+On the software path the offset is applied where a decoded buffer reaches the
+renderer: the call flushes the audio renderer and refills it from the source at
+the playhead, so the new value is in force as soon as the call has run. The cost
+is a gap of decode-to-playhead time, not a re-buffer. The clock, the picture and
+the subtitles are untouched on both paths; this does not add an AVPlayer
+transport controller to PrismCore.
 
 `coordinatedHTTP` is also available on `PrismCoreEngine.open`,
 `SourceProbe.open/openDetached`, `SeekPreviewService` and software `load(url:)`.
@@ -471,6 +783,50 @@ PRISMCORE_RENDERED_SEEK=1 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Develop
 The committed `seek_clock.mkv` has a reproducible generator beside it and runs
 through a throttled, Range-capable test origin. The check reads actual decoded
 frame numbers after seeks; it does not infer success from muxer timestamps.
+
+## Changing a setting mid-title
+
+A session is single-use: the served shape is decided before the first packet and
+the output layout follows from it. "Play this differently" — the viewer turns
+dialogue boost on, a smaller disk budget, a refused master — therefore means a
+new session over the same source. `makeSession(changing:)` mints one from what
+this session was built with, so the host does not have to restate it:
+
+```swift
+let boosted = try await session.makeSession { $0.dialogueBoost = [.medium] }
+let playlist = try await boosted.start()
+player.replaceCurrentItem(with: AVPlayerItem(url: playlist))
+await player.seek(to: resumeTime)
+await session.stop()                       // the caller's job
+```
+
+`PrismCoreSession.Options` carries everything the initializers take. Registered
+external subtitles and the timed-text cue handler are replayed onto the
+successor, and every option the closure leaves alone — the audio delay included
+— is carried verbatim. `sourceURL` and `httpHeaders` are read-only: the replay
+is what makes them part of a session's identity, and attaching one title's
+captions to another file is not a clone.
+
+Three rules, enforced rather than merely documented:
+
+- **Nothing is seamless.** The successor starts from zero. There is no shared
+  playhead and no continuity of playback; the host replaces its `AVPlayerItem`
+  and seeks to where it wants to resume.
+- **The caller still stops the predecessor.** Nothing is stopped for you — at
+  the moment of the call the player may still be drawing frames off it. Stop it
+  as soon as the successor's playlist is loaded: every live session carries a
+  producer reading the source, a server on its own port, and its own
+  `segmentCacheBytes` budget.
+- **A session mints one successor**; a second call throws
+  `SessionError.alreadySuperseded`. Clone the session you are playing, not the
+  one you left behind. The successor never inherits the predecessor's work
+  directory, which is what keeps two producers from writing the same segment
+  names — and keeps `stop()` from deleting a directory somebody is still
+  serving from.
+
+`makeMuxedFallbackSession()` and `makeMasterRejectionFallbackSession()` are the
+same mechanism with the option preset, and count as that session's one
+successor.
 
 ## Support
 

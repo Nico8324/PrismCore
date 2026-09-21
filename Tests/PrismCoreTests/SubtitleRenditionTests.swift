@@ -29,7 +29,7 @@ struct SubtitleRenditionTests {
     /// remux integration suite.
     private func waitForFinishedPlaylist(_ playlistURL: URL, timeout: Duration = .seconds(30)) async throws {
         var mediaURL = playlistURL
-        let (firstData, _) = try await URLSession.shared.data(from: playlistURL)
+        let (firstData, _) = try await URLSession.uncached.data(from: playlistURL)
         let first = String(decoding: firstData, as: UTF8.self)
         if first.contains("#EXT-X-STREAM-INF") {
             let variant = try #require(
@@ -40,7 +40,7 @@ struct SubtitleRenditionTests {
         }
         let deadline = ContinuousClock.now.advanced(by: timeout)
         while ContinuousClock.now < deadline {
-            let (data, _) = try await URLSession.shared.data(from: mediaURL)
+            let (data, _) = try await URLSession.uncached.data(from: mediaURL)
             if String(decoding: data, as: UTF8.self).contains("#EXT-X-ENDLIST") { return }
             try await Task.sleep(for: .milliseconds(200))
         }
@@ -49,7 +49,7 @@ struct SubtitleRenditionTests {
 
     /// Fetch over the loopback, returning body and `Content-Type`.
     private func fetch(_ url: URL) async throws -> (text: String, contentType: String?) {
-        let (data, response) = try await URLSession.shared.data(from: url)
+        let (data, response) = try await URLSession.uncached.data(from: url)
         let contentType = (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "Content-Type")
         return (String(decoding: data, as: UTF8.self), contentType)
     }
@@ -78,7 +78,9 @@ struct SubtitleRenditionTests {
         #expect(renditions.count == 1)
         #expect(rendition.uri == "subs0/index.m3u8")
         #expect(rendition.language == "ces")
-        #expect(rendition.name == "Czech")   // the container's title metadata
+        // The language in its own name, as Apple's playlists do; the container's title ("Czech")
+        // is dropped because it only repeats the language — see `renditionName`.
+        #expect(rendition.name == "Čeština")
 
         // The SERVED master — the one AVPlayer actually reads — carries the
         // rendition and points the variant at its group. Asserted against the
@@ -333,7 +335,7 @@ struct ForcedSubtitleRenditionTests {
         #expect(Set(renditions.map(\.name)).count == 2, "two renditions, two names")
         #expect(renditions.filter(\.isForced).count == 1)
 
-        let (data, _) = try await URLSession.shared.data(from: playlistURL)
+        let (data, _) = try await URLSession.uncached.data(from: playlistURL)
         let master = String(decoding: data, as: UTF8.self)
         #expect(master.contains("FORCED=YES"))
         for rendition in renditions {
@@ -353,7 +355,7 @@ struct ForcedSubtitleRenditionTests {
         try #require(renditions.count == 1)
         #expect(!renditions[0].isForced)
 
-        let (data, _) = try await URLSession.shared.data(from: playlistURL)
+        let (data, _) = try await URLSession.uncached.data(from: playlistURL)
         #expect(!String(decoding: data, as: UTF8.self).contains("FORCED=YES"))
     }
 
@@ -363,6 +365,15 @@ struct ForcedSubtitleRenditionTests {
         #expect(SubtitleRenditionSet.isForcedRendition(disposition: forced, sameLanguageTracks: 2))
         #expect(!SubtitleRenditionSet.isForcedRendition(disposition: forced, sameLanguageTracks: 1))
         #expect(!SubtitleRenditionSet.isForcedRendition(disposition: AV_DISPOSITION_DEFAULT, sameLanguageTracks: 2))
+    }
+
+    @Test("A rendition is named by its language, and a muxer title is noise unless it says the kind")
+    func renditionNames() {
+        #expect(SubtitleRenditionSet.renditionName(language: "eng", title: "English-SRT", ordinal: 0) == "English")
+        #expect(SubtitleRenditionSet.renditionName(language: "fra", title: nil, ordinal: 0) == "Français")
+        #expect(SubtitleRenditionSet.renditionName(language: "eng", title: "Signs & Songs", ordinal: 0) == "English (Signs & Songs)")
+        #expect(SubtitleRenditionSet.renditionName(language: nil, title: "Commentary", ordinal: 3) == "Commentary")
+        #expect(SubtitleRenditionSet.renditionName(language: nil, title: nil, ordinal: 3) == "Subtitles 4")
     }
 
     @Test("AVFoundation keeps both options, and knows which one is forced")

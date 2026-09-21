@@ -529,7 +529,11 @@ final class AudioRenditionWriter {
                 profileName: track.profileName
             )
         case .bridge, .boost:
-            return MasterPlaylistBuilder.audioCodecString(forCodecName: "eac3")
+            // Whichever encoder the bridge negotiated — EAC3 where the build
+            // has it, AAC otherwise — never assumed.
+            return MasterPlaylistBuilder.audioCodecString(
+                forCodecName: bridge?.outputCodecName ?? AudioBridge.defaultTargetCodecName
+            )
         }
     }
 

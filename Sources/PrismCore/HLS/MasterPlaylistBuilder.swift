@@ -92,11 +92,16 @@ public enum MasterPlaylistBuilder {
 
     /// One WebVTT subtitle rendition (phase 6).
     ///
-    /// `DEFAULT=NO,AUTOSELECT=NO` always, and deliberately not configurable:
-    /// with either set to `YES` AVKit engages the rendition by itself, which
-    /// double-draws against a host overlay and turns subtitles on for users who
-    /// never asked. The host selects the rendition programmatically through the
-    /// legible `AVMediaSelectionGroup` instead.
+    /// `DEFAULT=NO,AUTOSELECT=NO` unless the caller says otherwise, and that
+    /// default is load-bearing: with either set to `YES` AVKit engages the
+    /// rendition by itself, which double-draws against a host overlay and
+    /// turns subtitles on for users who never asked. The host normally selects
+    /// the rendition programmatically through the legible
+    /// `AVMediaSelectionGroup` instead.
+    ///
+    /// `isDefault` exists for the one case where "the user never asked" is
+    /// false: a session built with a `preferredSubtitleLanguage`, which is the
+    /// host relaying an explicit request. Nothing else may set it.
     public struct SubtitleRendition: Sendable, Equatable {
         public var groupID: String
         public var name: String
@@ -110,19 +115,24 @@ public enum MasterPlaylistBuilder {
         /// Emitted as `FORCED=YES` so the host can tell them apart in the
         /// selection group.
         public var isForced: Bool
+        /// `DEFAULT=YES,AUTOSELECT=YES` — see the type doc. At most one
+        /// rendition of a group may claim it.
+        public var isDefault: Bool
 
         public init(
             groupID: String = "subs",
             name: String,
             language: String? = nil,
             uri: String,
-            isForced: Bool = false
+            isForced: Bool = false,
+            isDefault: Bool = false
         ) {
             self.groupID = groupID
             self.name = name
             self.language = language
             self.uri = uri
             self.isForced = isForced
+            self.isDefault = isDefault
         }
     }
 
@@ -267,9 +277,12 @@ public enum MasterPlaylistBuilder {
         if let language = subtitle.language, !language.isEmpty {
             attributes.append("LANGUAGE=\(quoted(language))")
         }
-        // See `SubtitleRendition`: never YES, on purpose.
-        attributes.append("DEFAULT=NO")
-        attributes.append("AUTOSELECT=NO")
+        // See `SubtitleRendition`: NO unless the host explicitly asked for
+        // this language. AUTOSELECT follows DEFAULT rather than being its own
+        // knob — a DEFAULT=YES,AUTOSELECT=NO rendition is a rendition AVKit
+        // engages but will not re-engage after the user has touched the menu.
+        attributes.append("DEFAULT=\(subtitle.isDefault ? "YES" : "NO")")
+        attributes.append("AUTOSELECT=\(subtitle.isDefault ? "YES" : "NO")")
         if subtitle.isForced {
             attributes.append("FORCED=YES")
         }

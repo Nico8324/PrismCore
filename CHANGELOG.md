@@ -8,6 +8,55 @@ source-compatible.)
 
 ## [Unreleased]
 
+## [3.2.1] — 2026-09-22
+
+A housekeeping release: no engine behaviour changes. Two build warnings are
+gone, and the third route of #52 is now measured rather than assumed.
+
+### Fixed
+
+- **Two `let` bindings that bound nothing, warned on every build** (#100).
+  `AudioBridge.convertIntoFIFO` only needs the encoder to exist and never
+  reads its context, so the binding is now an existence check; the Dolby
+  Vision walk in `HLSRemuxer` works from `packet` itself after checking it has
+  a payload, so the bound `data` was unused. Both sites keep exactly the same
+  conditions — no behaviour change, just a clean build log.
+
+### Added
+
+- **`ListenerFreePlaybackTests` — the third #52 route, measured** (#101).
+  #52 settled two ways of feeding AVPlayer without a listening socket and left
+  the third unasked. Measured on macOS 26: playlists served by an
+  `AVAssetResourceLoader` delegate work, HLS segments that are not HTTP fail
+  (`CoreMediaErrorDomain -12881`) whether they are `file://` or on a custom
+  scheme — and the delegate *is* offered those requests, so the ban is
+  enforced on the response, not by withholding the request. A reading of the
+  header that expects the delegate never to be asked would send someone
+  chasing a policy as if it were a bug. The control, the same delegate
+  playlists with HTTP segments, plays.
+
+  What does work with no socket anywhere: **a progressive fragmented MP4
+  through the delegate plays and seeks by byte offset.** The delegate trickles
+  32 KiB at a time so the seek lands where nothing has been delivered, and
+  AVFoundation cancels the read it no longer wants and asks for a new offset —
+  so the result is not an artefact of a fixture small enough to answer in one
+  range. The muxed shape's output already is one fMP4 in pieces.
+
+  Recorded with its costs and its limits: that shape carries one audio track
+  and no subtitle renditions, since those live in a master playlist this route
+  does not have. Still unmeasured — DV/Atmos signalling read from sample
+  entries rather than the master's `SUPPLEMENTAL-CODECS`, and whether a
+  demand-produced source can answer a seek into output it has not produced.
+
+  Separately measured for the entitlement question underneath #52: the macOS
+  sandbox denies the `bind()` even for loopback. Ad-hoc signed three ways,
+  `app-sandbox` + `network.client` alone gives EPERM on a raw `bind()` to
+  127.0.0.1, on an `NWListener` pinned to `.loopback`, and on an unconstrained
+  one; adding `network.server` makes all three succeed. `bind()` fails before
+  `listen()` is reached, so there is no narrower listener the sandbox permits.
+
+  Tests only — no source file changed.
+
 ## [3.2.0] — 2026-09-20
 
 ### Added
@@ -2191,7 +2240,9 @@ HTTP server, with:
 - **Software path** — libavcodec into `AVSampleBufferDisplayLayer` for the video
   AVPlayer cannot decode at all.
 
-[Unreleased]: https://github.com/Wenzlik/PrismCore/compare/2.3.0...HEAD
+[Unreleased]: https://github.com/Wenzlik/PrismCore/compare/3.2.1...HEAD
+[3.2.1]: https://github.com/Wenzlik/PrismCore/compare/3.2.0...3.2.1
+[3.2.0]: https://github.com/Wenzlik/PrismCore/compare/3.1.1...3.2.0
 [3.1.1]: https://github.com/Wenzlik/PrismCore/compare/3.1.0...3.1.1
 [3.1.0]: https://github.com/Wenzlik/PrismCore/compare/3.0.1...3.1.0
 [3.0.1]: https://github.com/Wenzlik/PrismCore/compare/3.0.0...3.0.1

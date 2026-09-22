@@ -608,7 +608,8 @@ final class AudioBridge {
     /// Resample one frame (or `nil` to drain the delay line) and append the
     /// result to the FIFO.
     private func convertIntoFIFO(frame: UnsafeMutablePointer<AVFrame>?) throws {
-        guard let encoderCtx, let swr = swrCtx, let fifo else { return }
+        // The encoder only has to exist — its context is not read on this path.
+        guard encoderCtx != nil, let swr = swrCtx, let fifo else { return }
 
         let inSamples = frame?.pointee.nb_samples ?? 0
         // Ask the resampler how much it may produce: rate conversion and its

@@ -42,6 +42,11 @@ public enum SourceOpenTuning {
     /// sources that were not going to answer.
     public static let probeBudget: Duration = .seconds(10)
 
+    /// How long one blocking read may wait for bytes before it fails and the
+    /// connection is reopened — the same 15 s the coordinated reader gives a
+    /// request (`HTTPRangeInput`).
+    public static let readTimeoutMicroseconds = 15_000_000
+
     /// The options every open should carry: the caller's HTTP headers, the
     /// reconnect policy the demux side needs, and the caps above.
     ///
@@ -55,6 +60,11 @@ public enum SourceOpenTuning {
         // Reconnect on dropped HTTP connections — the demuxer read side.
         av_dict_set(&options, "reconnect", "1", 0)
         av_dict_set(&options, "reconnect_streamed", "1", 0)
+        // A read that gets nothing for this long fails, and the reconnect
+        // above takes it from there. FFmpeg's default is to wait forever, so
+        // an origin that goes silent without closing the socket (a debrid CDN
+        // under load does) left playback stalled with nothing to recover it.
+        av_dict_set(&options, "rw_timeout", String(readTimeoutMicroseconds), 0)
         // Deliberately NOT `multiple_requests=1` (HTTP keep-alive). Measured
         // 2026-08-26 against a Range-capable loopback server, one session
         // start over a 30 s MKV: without it 4 requests on 4 connections;

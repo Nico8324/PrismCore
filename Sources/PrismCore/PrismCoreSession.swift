@@ -964,6 +964,11 @@ public actor PrismCoreSession {
     public func start(startupTimeout: Duration = .seconds(20)) async throws -> URL {
         precondition(!started, "PrismCoreSession is single-use — make a new one per load")
         started = true
+        // A host that gave up while the session was still being built — the
+        // viewer closed the player during loading — can reach `stop()` first.
+        // Nothing below checks for it: the producer would run and the listener
+        // would serve, both for good, with `stop()` already spent.
+        guard !stopped else { throw CancellationError() }
         let reference = ContinuousClock.now
         startupReference = reference
         // Every exit finishes the stream — the success path below emits
@@ -1108,6 +1113,22 @@ public actor PrismCoreSession {
                 await producer.join()
                 try? FileManager.default.removeItem(at: directory)
             }
+        }
+    }
+
+    /// A host that drops a started session without `stop()` would otherwise
+    /// leave its producer muxing, its listener serving and its segments on
+    /// disk for the life of the process — nothing else holds a way back to
+    /// them. The same teardown as `stop()`, unawaited.
+    deinit {
+        guard started, !stopped else { return }
+        PrismCoreLog.notice("PrismCoreSession released without stop(); tearing it down")
+        remuxer.cancel()
+        let server = server, producer = producer, directory = workDirectory
+        Task.detached(priority: .utility) {
+            await server.stop()
+            await producer?.join()
+            try? FileManager.default.removeItem(at: directory)
         }
     }
 

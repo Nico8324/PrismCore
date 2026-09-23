@@ -8,6 +8,21 @@ source-compatible.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **`LANGUAGE` in the master is an RFC 5646 tag.** Containers carry ISO
+  639-2/B (`fre`, `cze`), which RFC 8216 does not accept; AVFoundation then
+  could not tell a rendition's language, so automatic selection and the menu
+  missed it. The tag now goes through `LanguageMatch.canonical` (`fre` → `fr`),
+  and `und` or empty writes no attribute.
+- **A silent origin no longer stalls playback forever.** Native HTTP opens set
+  `rw_timeout` (15 s, like the coordinated reader), so a read that gets
+  nothing fails and the existing reconnect reopens the connection.
+- **A session stopped before `start()` refuses to start** (`CancellationError`)
+  instead of running its producer and listener for good, and **a started
+  session released without `stop()` tears itself down** — producer cancelled,
+  listener stopped, work directory removed.
+
 ## [3.2.1] — 2026-09-22
 
 A housekeeping release: no engine behaviour changes. Two build warnings are

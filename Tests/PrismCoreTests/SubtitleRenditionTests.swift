@@ -399,3 +399,15 @@ struct ForcedSubtitleRenditionTests {
         #expect(selectable.count == 1)
     }
 }
+
+@Suite("Bitmap OCR beside text tracks (Cinema fork)")
+struct BitmapOCRLanguageTests {
+    @Test("A bitmap track is read when no text track carries its language")
+    func missingLanguageIsRead() {
+        let text: Set<String> = ["en"]
+        #expect(SubtitleRenditionSet.isLanguageMissing("fre", from: text))
+        #expect(!SubtitleRenditionSet.isLanguageMissing("eng", from: text))
+        #expect(!SubtitleRenditionSet.isLanguageMissing(nil, from: text))
+        #expect(!SubtitleRenditionSet.isLanguageMissing("und", from: text))
+    }
+}

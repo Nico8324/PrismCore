@@ -253,6 +253,14 @@ final class SubtitleRenditionSet: @unchecked Sendable {
 
     // MARK: - Setup
 
+    /// A bitmap track whose language no text track carries — the only
+    /// subtitles in that language, so worth reading. Unlabelled counts as
+    /// covered: nothing says it isn't the text track's dialogue again.
+    static func isLanguageMissing(_ language: String?, from textLanguages: Set<String>) -> Bool {
+        guard let language = LanguageMatch.canonical(language) else { return false }
+        return !textLanguages.contains(language)
+    }
+
     /// Create a rendition per convertible source: embedded text streams first
     /// (in stream order), then the closed-caption services the scout found in
     /// the video, then registered external files. Returns the set of input
@@ -271,12 +279,18 @@ final class SubtitleRenditionSet: @unchecked Sendable {
         // whether a forced track has a full sibling before it may be hidden as forced.
         var languageCounts: [String: Int] = [:]
         var hasTextTrack = false
+        var textLanguages: Set<String> = []
         for index in 0..<Int32(input.pointee.nb_streams) {
             guard let stream = input.pointee.streams[Int(index)],
                   stream.pointee.codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE
             else { continue }
             languageCounts[avMetadataValue(stream.pointee.metadata, "language") ?? "", default: 0] += 1
-            if Self.kind(for: stream.pointee.codecpar.pointee.codec_id) != nil { hasTextTrack = true }
+            if Self.kind(for: stream.pointee.codecpar.pointee.codec_id) != nil {
+                hasTextTrack = true
+                if let language = LanguageMatch.canonical(avMetadataValue(stream.pointee.metadata, "language")) {
+                    textLanguages.insert(language)
+                }
+            }
         }
 
         for index in 0..<Int32(input.pointee.nb_streams) {
@@ -288,7 +302,9 @@ final class SubtitleRenditionSet: @unchecked Sendable {
             let converter: Track.Converter
             if let kind = Self.kind(for: par.codec_id) {
                 converter = .text(kind, playResolution: Self.playResolution(of: stream.pointee.codecpar, kind: kind))
-            } else if Self.ocrCodecs.contains(par.codec_id), !hasTextTrack, SubtitleOCR.isAvailable,
+            } else if Self.ocrCodecs.contains(par.codec_id),
+                      !hasTextTrack || Self.isLanguageMissing(language, from: textLanguages),
+                      SubtitleOCR.isAvailable,
                       let decoder = try? BitmapSubtitleDecoder(
                         codecpar: stream.pointee.codecpar, timeBase: stream.pointee.time_base
                       ) {
@@ -299,6 +315,8 @@ final class SubtitleRenditionSet: @unchecked Sendable {
                 // SRT, four unlabelled OCR readings of the same dialogue are
                 // menu noise that hides the one worth choosing (a Vision Pro
                 // menu of "English-SRT, Subtitles 2, 3, 4, 5" — 2026-09-06).
+                // (Cinema fork) …unless no text track speaks this one's
+                // language: English SRT beside French PGS still gets French.
                 // A build without Vision, or a decoder this build lacks,
                 // leaves the track host-only exactly as before.
                 converter = .bitmap(BitmapRenditionTrack(decoder: decoder, language: language))

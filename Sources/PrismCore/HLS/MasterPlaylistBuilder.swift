@@ -243,7 +243,10 @@ public enum MasterPlaylistBuilder {
             "GROUP-ID=\(quoted(audio.groupID))",
             "NAME=\(quoted(audio.name))",
         ]
-        if let language = audio.language, !language.isEmpty {
+        // RFC 8216 wants an RFC 5646 tag, and containers carry ISO 639-2/B
+        // ("fre", "cze"), which is not one: AVFoundation then can't tell the
+        // rendition's language, so automatic selection and the menu miss it.
+        if let language = LanguageMatch.canonical(audio.language) {
             attributes.append("LANGUAGE=\(quoted(language))")
         }
         attributes.append("DEFAULT=\(audio.isDefault ? "YES" : "NO")")
@@ -274,7 +277,10 @@ public enum MasterPlaylistBuilder {
             "GROUP-ID=\(quoted(subtitle.groupID))",
             "NAME=\(quoted(subtitle.name))",
         ]
-        if let language = subtitle.language, !language.isEmpty {
+        // RFC 8216 wants an RFC 5646 tag, and containers carry ISO 639-2/B
+        // ("fre", "cze"), which is not one: AVFoundation then can't tell the
+        // rendition's language, so automatic selection and the menu miss it.
+        if let language = LanguageMatch.canonical(subtitle.language) {
             attributes.append("LANGUAGE=\(quoted(language))")
         }
         // See `SubtitleRendition`: NO unless the host explicitly asked for

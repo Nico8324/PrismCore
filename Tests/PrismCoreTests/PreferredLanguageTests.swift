@@ -183,8 +183,8 @@ struct PreferredAudioLanguageTests {
         let audioLines = master.split(separator: "\n")
             .filter { $0.hasPrefix("#EXT-X-MEDIA:TYPE=AUDIO") }
         #expect(audioLines.count == 2)
-        let czech = try #require(audioLines.first { $0.contains("LANGUAGE=\"cze\"") })
-        let english = try #require(audioLines.first { $0.contains("LANGUAGE=\"eng\"") })
+        let czech = try #require(audioLines.first { $0.contains("LANGUAGE=\"cs\"") })
+        let english = try #require(audioLines.first { $0.contains("LANGUAGE=\"en\"") })
         #expect(czech.contains("DEFAULT=YES"))
         #expect(english.contains("DEFAULT=NO"))
         // AUTOSELECT stays YES on every audio rendition, default or not: it is
@@ -222,7 +222,7 @@ struct PreferredSubtitleLanguageTests {
         let lines = master.split(separator: "\n")
             .filter { $0.hasPrefix("#EXT-X-MEDIA:TYPE=SUBTITLES") }
         #expect(lines.count == 3)
-        let czech = try #require(lines.first { $0.contains("LANGUAGE=\"cze\"") })
+        let czech = try #require(lines.first { $0.contains("LANGUAGE=\"cs\"") })
         #expect(czech.contains("DEFAULT=YES"))
         #expect(czech.contains("AUTOSELECT=YES"))
         #expect(lines.filter { $0.contains("DEFAULT=YES") }.count == 1)

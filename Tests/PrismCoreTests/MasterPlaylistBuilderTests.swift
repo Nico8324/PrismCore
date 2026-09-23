@@ -435,6 +435,19 @@ struct MasterPlaylistBuilderTests {
         #expect(line.contains("CODECS=\"hvc1.2.4.L153.B0\""))
     }
 
+    @Test("LANGUAGE is an RFC 5646 tag, not the container's ISO 639-2/B code")
+    func languageTagsAreCanonical() throws {
+        let playlist = try MasterPlaylistBuilder.build(try variant(range: .sdr, audio: [
+            .init(name: "Français", language: "fre", codecString: "mp4a.40.2",
+                  channels: "2", uri: "audio0/index.m3u8", isDefault: true),
+            .init(name: "Unknown", language: "und", codecString: "mp4a.40.2",
+                  channels: "2", uri: "audio1/index.m3u8", isDefault: false),
+        ]))
+        let media = playlist.split(separator: "\n").filter { $0.hasPrefix("#EXT-X-MEDIA:") }
+        #expect(media[0].contains("LANGUAGE=\"fr\""))
+        #expect(!media[1].contains("LANGUAGE="))
+    }
+
     @Test("N audio tracks become N renditions of one group, one of them DEFAULT")
     func multipleRenditions() throws {
         let playlist = try MasterPlaylistBuilder.build(try variant(range: .sdr, audio: [
@@ -454,7 +467,7 @@ struct MasterPlaylistBuilderTests {
         // Every rendition is selectable, default or not — otherwise the
         // alternates can't be reached by a language preference.
         #expect(media.allSatisfy { $0.contains("AUTOSELECT=YES") })
-        #expect(media[1].contains("LANGUAGE=\"ces\""))
+        #expect(media[1].contains("LANGUAGE=\"cs\""))
 
         // CODECS names the DEFAULT rendition's codec only: an over-claim gets
         // the whole variant filtered at parse time.

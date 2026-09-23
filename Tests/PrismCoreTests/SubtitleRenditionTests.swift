@@ -88,7 +88,7 @@ struct SubtitleRenditionTests {
         // once produced but never declared, and a manual build can't regress.
         let (master, _) = try await fetch(playlist)
         #expect(master.contains("#EXT-X-MEDIA:TYPE=SUBTITLES"))
-        #expect(master.contains("LANGUAGE=\"ces\""))
+        #expect(master.contains("LANGUAGE=\"cs\""))
         #expect(master.contains("URI=\"subs0/index.m3u8\""))
         #expect(master.contains("SUBTITLES=\"subs\""))
 

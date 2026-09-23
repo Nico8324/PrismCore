@@ -205,8 +205,8 @@ struct RemuxIntegrationTests {
 
         // Languages travel from the container's stream metadata, and both
         // renditions are selectable (AUTOSELECT) while exactly one is DEFAULT.
-        #expect(renditions.contains { $0.contains("LANGUAGE=\"eng\"") })
-        #expect(renditions.contains { $0.contains("LANGUAGE=\"ces\"") })
+        #expect(renditions.contains { $0.contains("LANGUAGE=\"en\"") })
+        #expect(renditions.contains { $0.contains("LANGUAGE=\"cs\"") })
         #expect(renditions.allSatisfy { $0.contains("AUTOSELECT=YES") })
         #expect(renditions.filter { $0.contains("DEFAULT=YES") }.count == 1)
         // Each rendition is its own presentation, not a track inside the video.
@@ -231,7 +231,7 @@ struct RemuxIntegrationTests {
         // Each rendition's own fMP4 carries its language too, so the served
         // media is self-describing and not only the manifest.
         let languages = Set(info.audioTracks.compactMap(\.language))
-        #expect(languages == ["eng", "ces"], "probed: \(languages)")
+        #expect(languages == ["en", "cs"], "probed: \(languages)")
     }
 
     @Test("Renditions are segmented on the video's boundaries, not their own")
